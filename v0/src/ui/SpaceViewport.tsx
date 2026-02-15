@@ -101,7 +101,7 @@ const _raycaster = new Raycaster();
 
 function ScrubberPlane(props: ScrubberPlaneProps): React.JSX.Element | null {
   const { layerCount, selectedLayerIndex, onPreviewLayer, onCommitLayer } = props;
-  const { camera } = useThree();
+  const { camera, controls } = useThree();
   const dragging = useRef(false);
   const startY = useRef(0);
   const startLayerY = useRef(0);
@@ -116,16 +116,17 @@ function ScrubberPlane(props: ScrubberPlaneProps): React.JSX.Element | null {
       target.setPointerCapture(e.pointerId);
       dragging.current = true;
 
+      // Disable OrbitControls while dragging
+      if (controls) (controls as unknown as { enabled: boolean }).enabled = false;
+
       // Set up a drag plane perpendicular to camera forward through the mesh position
       const camDir = new Vector3();
       camera.getWorldDirection(camDir);
-      // Use a horizontal drag plane (normal = camera direction projected to XZ, then use Y drag)
-      // Simpler: use a plane facing the camera at the mesh's Z position
       _dragPlane.setFromNormalAndCoplanarPoint(camDir, e.point);
       startY.current = e.point.y;
       startLayerY.current = layerY(currentIndex, layerCount);
     },
-    [camera, currentIndex, layerCount],
+    [camera, controls, currentIndex, layerCount],
   );
 
   const handlePointerMove = useCallback(
@@ -152,6 +153,9 @@ function ScrubberPlane(props: ScrubberPlaneProps): React.JSX.Element | null {
       e.stopPropagation();
       dragging.current = false;
 
+      // Re-enable OrbitControls
+      if (controls) (controls as unknown as { enabled: boolean }).enabled = true;
+
       // Final snap
       _raycaster.setFromCamera(e.pointer, camera);
       let finalIndex = currentIndex;
@@ -165,26 +169,37 @@ function ScrubberPlane(props: ScrubberPlaneProps): React.JSX.Element | null {
       onPreviewLayer(null);
       onCommitLayer(finalIndex);
     },
-    [camera, layerCount, currentIndex, onPreviewLayer, onCommitLayer],
+    [camera, controls, layerCount, currentIndex, onPreviewLayer, onCommitLayer],
   );
 
   return (
-    <mesh
-      position={[0, y, 0]}
-      rotation={[Math.PI / 2, 0, 0]}
-      onPointerDown={handlePointerDown}
-      onPointerMove={handlePointerMove}
-      onPointerUp={handlePointerUp}
-    >
-      <planeGeometry args={[PRISM_W * 0.5, PRISM_D * 0.5]} />
-      <meshBasicMaterial
-        transparent
-        opacity={0.18}
-        color="#7ec8e3"
-        depthWrite={false}
-        side={DoubleSide}
-      />
-    </mesh>
+    <group position={[0, y, 0]} rotation={[Math.PI / 2, 0, 0]}>
+      {/* Visible scrubber indicator — thin line across the prism */}
+      <mesh>
+        <planeGeometry args={[PRISM_W * 0.98, PRISM_D * 0.02]} />
+        <meshBasicMaterial
+          transparent
+          opacity={0.6}
+          color="#7ec8e3"
+          depthWrite={false}
+          side={DoubleSide}
+        />
+      </mesh>
+      {/* Invisible wide grab area for easy dragging */}
+      <mesh
+        onPointerDown={handlePointerDown}
+        onPointerMove={handlePointerMove}
+        onPointerUp={handlePointerUp}
+      >
+        <planeGeometry args={[PRISM_W * 0.5, PRISM_D * 0.5]} />
+        <meshBasicMaterial
+          transparent
+          opacity={0}
+          depthWrite={false}
+          side={DoubleSide}
+        />
+      </mesh>
+    </group>
   );
 }
 

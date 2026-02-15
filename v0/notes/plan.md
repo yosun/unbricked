@@ -379,9 +379,40 @@ Core-only (vitest):
 
   * [ ] Extend `applyPatch.test.ts` for props annotation create/update/clear
   * [ ] Add selector tests for parse + defaults
-* [ ] Final:
-
  
+
+### **Slice 4 — R3F Scrubber Plane** for Unbricked.
+
+Context:
+
+* App uses canonical `ProjectState`.
+* Selection is persisted as Annotation:
+
+  * schema: "ui.selection.layerIndex"
+  * target: { kind:"Space", id: spaceId }
+  * data: { layerIndex: "<int string>" }
+* Selection commits must happen via **GraphPatch → applyPatch**.
+* Preview states must remain ephemeral (no patches until commit).
+* HUD (DOM overlay) already exists; scrubber must be **inside R3F**, not a DOM <input>.
+
+Task:
+
+1. Create a `ScrubberPlane` R3F component (mesh plane + translucent material) that sits inside the prism stack.
+2. Plane position is derived from `effectiveSelectedIndex = previewLayerIndex ?? persistedLayerIndex`.
+3. Add drag interaction:
+
+   * onPointerDown: start dragging; capture pointer; temporarily disable OrbitControls if needed.
+   * onPointerMove while dragging: compute drag position along stack axis (z), map to a floating index, update `previewLayerIndex` continuously (no GraphPatch).
+   * onPointerUp: snap to nearest integer in [0..layerCount-1], emit exactly **one** GraphPatch to persist selection, clear preview.
+4. Ensure scrubber remains usable even with solo/hide (scrubber should not be hidden by layer props).
+5. No TS hard-coded colors; styling via CSS vars only if needed.
+
+Acceptance:
+
+* Drag updates selection live; release snaps and commits one patch.
+* No patch spam during dragging.
+* TypeScript strict passes; lint/test pass.
+
 
 
 ### Final
