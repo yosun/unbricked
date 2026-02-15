@@ -2,6 +2,10 @@ import React, { useCallback, useEffect, useMemo, useState } from "react";
 import {
   applyPatch,
   findLayerSelection,
+  findLayerProps,
+  isHidden,
+  opacityMultiplier,
+  soloIndex,
   makeId,
   newPatch,
   putOp,
@@ -15,6 +19,7 @@ import type { AnimPhase } from "./ui/CameraRig";
 export default function App(): React.JSX.Element {
   const [state, setState] = useState<ProjectState>(sampleProject.state);
   const [previewLayerIndex, setPreviewLayerIndex] = useState<number | null>(null);
+  const [previewOpacity, setPreviewOpacity] = useState<number | null>(null);
   const [animPhase, setAnimPhase] = useState<AnimPhase>("intro");
   const [isTopDown, setIsTopDown] = useState(false);
 
@@ -44,6 +49,109 @@ export default function App(): React.JSX.Element {
   );
 
   const effectiveSelectedIndex = previewLayerIndex ?? selection?.index ?? null;
+
+  const layerProps = useMemo(
+    () => findLayerProps(state, rootSpaceId),
+    [state, rootSpaceId],
+  );
+
+  // Build per-layer visibility/opacity for SpaceViewport
+  const layerCount = rootSpace?.layerCount ?? 1;
+  const solo = soloIndex(layerProps);
+  const layerVisibility = useMemo(() => {
+    const result: Array<{ visible: boolean; opacity: number }> = [];
+    for (let i = 0; i < layerCount; i++) {
+      let visible = true;
+      if (solo !== null) {
+        visible = i === solo;
+      } else if (isHidden(layerProps, i)) {
+        visible = false;
+      }
+
+      const selected = i === effectiveSelectedIndex;
+      const baseOpacity = selected ? 0.30 : 0.10;
+      let mult = opacityMultiplier(layerProps, i);
+      // Use preview opacity for the selected layer while dragging
+      if (selected && previewOpacity !== null) {
+        mult = previewOpacity;
+      }
+      const finalOpacity = baseOpacity * mult;
+
+      result.push({ visible, opacity: finalOpacity });
+    }
+    return result;
+  }, [layerCount, solo, layerProps, effectiveSelectedIndex, previewOpacity]);
+
+  /* ── Layer props helpers ──────────────────────── */
+
+  const emitPropsUpdate = useCallback(
+    (updater: (data: Record<string, string>) => Record<string, string>) => {
+      setState((prev) => {
+        const existing = findLayerProps(prev, rootSpaceId);
+        const annId: AnnotationId = existing
+          ? existing.annotationId
+          : makeId("annotation");
+        const currentData = existing ? { ...existing.annotation.data } : {};
+        const newData = updater(currentData);
+
+        const annotationValue: JsonObject = {
+          id: annId,
+          kind: "Annotation",
+          target: { kind: "Space", id: rootSpaceId },
+          schema: "ui.layers.props",
+          data: newData,
+          createdAt: new Date().toISOString(),
+        };
+
+        const patch = newPatch({
+          baseRevision: prev.revision,
+          ops: [putOp("Annotation", annId, annotationValue)],
+        });
+
+        return applyPatch(prev, patch);
+      });
+    },
+    [rootSpaceId],
+  );
+
+  const handleToggleHidden = useCallback(
+    (index: number) => {
+      emitPropsUpdate((data) => {
+        const key = `hidden.${String(index)}`;
+        if (data[key] === "true") {
+          return Object.fromEntries(Object.entries(data).filter(([k]) => k !== key));
+        }
+        return { ...data, [key]: "true" };
+      });
+    },
+    [emitPropsUpdate],
+  );
+
+  const handleToggleSolo = useCallback(
+    (index: number) => {
+      emitPropsUpdate((data) => {
+        if (data["solo"] === String(index)) {
+          return Object.fromEntries(Object.entries(data).filter(([k]) => k !== "solo"));
+        }
+        return { ...data, solo: String(index) };
+      });
+    },
+    [emitPropsUpdate],
+  );
+
+  const handleCommitOpacity = useCallback(
+    (index: number, value: number) => {
+      setPreviewOpacity(null);
+      emitPropsUpdate((data) => {
+        const key = `opacity.${String(index)}`;
+        if (Math.abs(value - 1.0) < 0.01) {
+          return Object.fromEntries(Object.entries(data).filter(([k]) => k !== key));
+        }
+        return { ...data, [key]: String(value) };
+      });
+    },
+    [emitPropsUpdate],
+  );
 
   const handleSelectLayer = useCallback(
     (index: number) => {
@@ -150,10 +258,17 @@ export default function App(): React.JSX.Element {
         </button>
       </header>
       <SpaceViewport
-        layerCount={rootSpace?.layerCount ?? 1}
+        layerCount={layerCount}
         selectedLayerIndex={effectiveSelectedIndex}
         onSelectLayer={handleSelectLayer}
         onPreviewLayer={setPreviewLayerIndex}
+        layerVisibility={layerVisibility}
+        soloIndex={solo}
+        onToggleHidden={handleToggleHidden}
+        onToggleSolo={handleToggleSolo}
+        onPreviewOpacity={setPreviewOpacity}
+        onCommitOpacity={handleCommitOpacity}
+        persistedOpacity={effectiveSelectedIndex !== null ? opacityMultiplier(layerProps, effectiveSelectedIndex) : 1.0}
         animPhase={animPhase}
         onAnimDone={handleAnimDone}
       />

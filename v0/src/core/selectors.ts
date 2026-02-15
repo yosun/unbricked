@@ -1,4 +1,4 @@
-import type { AnnotationId, ProjectState, SpaceId } from "./types";
+import type { Annotation, AnnotationId, ProjectState, SpaceId } from "./types";
 
 export function findLayerSelection(
   state: ProjectState,
@@ -27,4 +27,50 @@ export function findLayerSelection(
   if (idx >= space.layerCount) return null;
 
   return { annotationId: ann.id, index: idx };
+}
+
+/* ── Layer props ─────────────────────────────────── */
+
+export interface LayerProps {
+  annotationId: AnnotationId;
+  annotation: Annotation;
+}
+
+export function findLayerProps(
+  state: ProjectState,
+  spaceId: SpaceId,
+): LayerProps | null {
+  const ann = Object.values(state.annotations).find(
+    (a) =>
+      a.target.kind === "Space" &&
+      a.target.id === spaceId &&
+      a.schema === "ui.layers.props",
+  );
+  if (!ann) return null;
+  return { annotationId: ann.id, annotation: ann };
+}
+
+export function isHidden(props: LayerProps | null, index: number): boolean {
+  if (!props) return false;
+  return props.annotation.data[`hidden.${String(index)}`] === "true";
+}
+
+export function opacityMultiplier(props: LayerProps | null, index: number): number {
+  if (!props) return 1.0;
+  const raw = props.annotation.data[`opacity.${String(index)}`];
+  if (raw === undefined) return 1.0;
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return 1.0;
+  return Math.max(0, Math.min(1, n));
+}
+
+export function soloIndex(props: LayerProps | null): number | null {
+  if (!props) return null;
+  const raw = props.annotation.data["solo"];
+  if (raw === undefined) return null;
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return null;
+  const idx = Math.trunc(n);
+  if (idx < 0) return null;
+  return idx;
 }

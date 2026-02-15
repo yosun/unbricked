@@ -3,17 +3,24 @@ import { Canvas } from "@react-three/fiber";
 import { OrbitControls } from "@react-three/drei";
 import { DoubleSide } from "three";
 import LayerScrubber from "./LayerScrubber";
+import LayerControlsHUD from "./LayerControlsHUD";
 import CameraRig from "./CameraRig";
 import type { AnimPhase } from "./CameraRig";
+
+interface LayerVis {
+  visible: boolean;
+  opacity: number;
+}
 
 interface SpacePrismProps {
   layerCount: number;
   selectedLayerIndex: number | null;
+  layerVisibility: LayerVis[];
   onSelectLayer: (index: number) => void;
 }
 
 function SpacePrism(props: SpacePrismProps): React.JSX.Element {
-  const { layerCount, selectedLayerIndex, onSelectLayer } = props;
+  const { layerCount, selectedLayerIndex, layerVisibility, onSelectLayer } = props;
 
   const w = 4;
   const h = 2.5;
@@ -28,12 +35,16 @@ function SpacePrism(props: SpacePrismProps): React.JSX.Element {
       </mesh>
 
       {layers.map((i) => {
+        const vis = layerVisibility[i];
+        if (vis && !vis.visible) return null;
+
         const t = layerCount <= 1 ? 0.5 : i / (layerCount - 1);
         const y = -h / 2 + t * h;
         const selected = i === selectedLayerIndex;
         const scale: [number, number, number] = selected
           ? [1.02, 1.02, 1.02]
           : [1, 1, 1];
+        const opacity = vis ? vis.opacity : (selected ? 0.30 : 0.10);
         return (
           <mesh
             key={i}
@@ -48,7 +59,7 @@ function SpacePrism(props: SpacePrismProps): React.JSX.Element {
             <planeGeometry args={[w * 0.96, d * 0.96]} />
             <meshBasicMaterial
               transparent
-              opacity={selected ? 0.35 : 0.12}
+              opacity={opacity}
               color={selected ? "#7ec8e3" : "#ccccdd"}
               depthWrite={false}
               side={DoubleSide}
@@ -65,6 +76,13 @@ interface SpaceViewportProps {
   selectedLayerIndex: number | null;
   onSelectLayer: (index: number) => void;
   onPreviewLayer: (index: number | null) => void;
+  layerVisibility: LayerVis[];
+  soloIndex: number | null;
+  onToggleHidden: (index: number) => void;
+  onToggleSolo: (index: number) => void;
+  onPreviewOpacity: (value: number | null) => void;
+  onCommitOpacity: (index: number, value: number) => void;
+  persistedOpacity: number;
   animPhase: AnimPhase;
   onAnimDone: () => void;
 }
@@ -75,10 +93,22 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
     selectedLayerIndex,
     onSelectLayer,
     onPreviewLayer,
+    layerVisibility,
+    soloIndex,
+    onToggleHidden,
+    onToggleSolo,
+    onPreviewOpacity,
+    onCommitOpacity,
+    persistedOpacity,
     animPhase,
     onAnimDone,
   } = props;
   const animating = animPhase !== "idle";
+
+  const selectedVis = selectedLayerIndex !== null ? layerVisibility[selectedLayerIndex] : null;
+  const selectedIsHidden = selectedVis ? !selectedVis.visible : false;
+  const selectedIsSolo = selectedLayerIndex !== null && soloIndex === selectedLayerIndex;
+
   return (
     <div style={{ position: "relative", width: "100%", height: "100%" }}>
       <Canvas camera={{ position: [0, 10, 0.01], fov: 50 }} style={{ background: "#1a1a2e" }}>
@@ -87,6 +117,7 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
         <SpacePrism
           layerCount={layerCount}
           selectedLayerIndex={selectedLayerIndex}
+          layerVisibility={layerVisibility}
           onSelectLayer={onSelectLayer}
         />
         <CameraRig animPhase={animPhase} onAnimDone={onAnimDone} />
@@ -108,6 +139,18 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
         onPreview={onPreviewLayer}
         onCommit={onSelectLayer}
       />
+      {selectedLayerIndex !== null && (
+        <LayerControlsHUD
+          layerIndex={selectedLayerIndex}
+          isHidden={selectedIsHidden}
+          isSolo={selectedIsSolo}
+          opacity={persistedOpacity}
+          onToggleHidden={onToggleHidden}
+          onToggleSolo={onToggleSolo}
+          onPreviewOpacity={onPreviewOpacity}
+          onCommitOpacity={onCommitOpacity}
+        />
+      )}
     </div>
   );
 }
