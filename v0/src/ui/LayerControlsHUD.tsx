@@ -11,6 +11,10 @@ interface LayerControlsHUDProps {
   onCommitOpacity: (index: number, value: number) => void;
 }
 
+function clamp01(v: number): number {
+  return Math.max(0, Math.min(1, v));
+}
+
 export default function LayerControlsHUD(props: LayerControlsHUDProps): React.JSX.Element {
   const {
     layerIndex,
@@ -23,42 +27,47 @@ export default function LayerControlsHUD(props: LayerControlsHUDProps): React.JS
     onCommitOpacity,
   } = props;
 
-  const [localOpacity, setLocalOpacity] = useState(opacity);
+  // Local drag value: null when not dragging (use props instead)
+  const [dragValue, setDragValue] = useState<number | null>(null);
   const dragging = useRef(false);
-  // Snapshot the value at drag-start so commit always has a valid number
-  const localRef = useRef(localOpacity);
+  const commitRef = useRef(0);
 
-  // Sync local opacity when layerIndex or persisted value changes (and not dragging)
-  const prevLayerRef = useRef(layerIndex);
-  const prevOpacityRef = useRef(opacity);
-  if (prevLayerRef.current !== layerIndex || (!dragging.current && prevOpacityRef.current !== opacity)) {
-    prevLayerRef.current = layerIndex;
-    prevOpacityRef.current = opacity;
-    setLocalOpacity(opacity);
-    localRef.current = opacity;
-  }
+  // Reset drag state when selected layer changes
+  useEffect(() => {
+    setDragValue(null);
+    dragging.current = false;
+  }, [layerIndex]);
 
-  const handleOpacityInput = useCallback(
+  // effectiveOpacity: drag value while dragging, persisted prop otherwise.
+  // Guard against NaN/undefined leaking from upstream — fall back to 100%.
+  const rawOpacity = dragValue ?? opacity;
+  const effectiveOpacity = Number.isFinite(rawOpacity) ? clamp01(rawOpacity) : 1;
+  const displayPct = Math.round(effectiveOpacity * 100);
+
+  const handleChange = useCallback(
     (e: React.ChangeEvent<HTMLInputElement>) => {
-      const val = Number(e.target.value);
-      setLocalOpacity(val);
-      localRef.current = val;
-      onPreviewOpacity(val);
+      const v = clamp01(Number(e.target.value) / 100);
+      setDragValue(v);
+      commitRef.current = v;
+      onPreviewOpacity(v);
     },
     [onPreviewOpacity],
   );
 
   const handlePointerDown = useCallback(() => {
     dragging.current = true;
-  }, []);
+    commitRef.current = effectiveOpacity;
+  }, [effectiveOpacity]);
 
   // Window-level pointerup so commit fires even if pointer leaves the slider
   useEffect(() => {
     const handlePointerUp = (): void => {
       if (!dragging.current) return;
       dragging.current = false;
+      const val = commitRef.current;
+      setDragValue(null);
       onPreviewOpacity(null);
-      onCommitOpacity(layerIndex, localRef.current);
+      onCommitOpacity(layerIndex, val);
     };
     window.addEventListener("pointerup", handlePointerUp);
     return () => {
@@ -78,9 +87,9 @@ export default function LayerControlsHUD(props: LayerControlsHUDProps): React.JS
         gap: 6,
         padding: "6px 10px",
         borderRadius: 6,
-        background: "var(--hud-bg, rgba(22, 22, 42, 0.85))",
-        border: "1px solid var(--hud-border, rgba(255,255,255,0.1))",
-        color: "var(--hud-text, #ccc)",
+        background: "var(--hud-bg)",
+        border: "1px solid var(--hud-border)",
+        color: "var(--hud-text)",
         fontSize: 13,
         pointerEvents: "auto",
         zIndex: 10,
@@ -96,8 +105,8 @@ export default function LayerControlsHUD(props: LayerControlsHUDProps): React.JS
         title={isHidden ? "Show layer" : "Hide layer"}
         style={{
           background: "none",
-          border: "1px solid var(--hud-border, rgba(255,255,255,0.15))",
-          color: isHidden ? "var(--hud-muted, #666)" : "var(--hud-text, #ccc)",
+          border: "1px solid var(--hud-border-btn)",
+          color: isHidden ? "var(--hud-muted)" : "var(--hud-text)",
           borderRadius: 4,
           padding: "2px 7px",
           cursor: "pointer",
@@ -113,9 +122,9 @@ export default function LayerControlsHUD(props: LayerControlsHUDProps): React.JS
         onClick={() => { onToggleSolo(layerIndex); }}
         title={isSolo ? "Unsolo" : "Solo this layer"}
         style={{
-          background: isSolo ? "var(--hud-active, rgba(126,200,227,0.25))" : "none",
-          border: "1px solid var(--hud-border, rgba(255,255,255,0.15))",
-          color: isSolo ? "var(--scrubber-active, #7ec8e3)" : "var(--hud-text, #ccc)",
+          background: isSolo ? "var(--hud-active)" : "none",
+          border: "1px solid var(--hud-border-btn)",
+          color: isSolo ? "var(--scrubber-active)" : "var(--hud-text)",
           borderRadius: 4,
           padding: "2px 7px",
           cursor: "pointer",
@@ -125,24 +134,24 @@ export default function LayerControlsHUD(props: LayerControlsHUDProps): React.JS
         S
       </button>
 
-      {/* Opacity slider */}
+      {/* Opacity slider — 0..100 integer scale */}
       <input
         type="range"
         min={0}
-        max={1}
-        step={0.01}
-        value={localOpacity}
-        onChange={handleOpacityInput}
+        max={100}
+        step={1}
+        value={displayPct}
+        onChange={handleChange}
         onPointerDown={handlePointerDown}
         style={{
           width: 80,
-          accentColor: "var(--scrubber-active, #7ec8e3)",
+          accentColor: "var(--scrubber-active)",
           cursor: "pointer",
         }}
-        title={`Opacity: ${String(Math.round(localOpacity * 100))}%`}
+        title={`Opacity: ${String(displayPct)}%`}
       />
       <span style={{ opacity: 0.5, minWidth: 30, textAlign: "right" }}>
-        {Math.round(localOpacity * 100)}%
+        {displayPct}%
       </span>
     </div>
   );

@@ -1,11 +1,31 @@
-import React from "react";
-import { Canvas } from "@react-three/fiber";
+import React, { useCallback, useRef } from "react";
+import { Canvas, useThree } from "@react-three/fiber";
 import { OrbitControls } from "@react-three/drei";
-import { DoubleSide } from "three";
+import { DoubleSide, Plane, Raycaster, Vector3 } from "three";
+import type { ThreeEvent } from "@react-three/fiber";
 import LayerScrubber from "./LayerScrubber";
 import LayerControlsHUD from "./LayerControlsHUD";
 import CameraRig from "./CameraRig";
 import type { AnimPhase } from "./CameraRig";
+
+/* ── Shared prism dimensions ──────────────────────── */
+const PRISM_W = 4;
+const PRISM_H = 2.5;
+const PRISM_D = 3;
+
+function layerY(index: number, layerCount: number): number {
+  const t = layerCount <= 1 ? 0.5 : index / (layerCount - 1);
+  return -PRISM_H / 2 + t * PRISM_H;
+}
+
+function yToLayerContinuous(y: number, layerCount: number): number {
+  const t = (y + PRISM_H / 2) / PRISM_H;
+  return t * (layerCount - 1);
+}
+
+function clampLayerIndex(raw: number, layerCount: number): number {
+  return Math.max(0, Math.min(layerCount - 1, Math.round(raw)));
+}
 
 interface LayerVis {
   visible: boolean;
@@ -22,15 +42,11 @@ interface SpacePrismProps {
 function SpacePrism(props: SpacePrismProps): React.JSX.Element {
   const { layerCount, selectedLayerIndex, layerVisibility, onSelectLayer } = props;
 
-  const w = 4;
-  const h = 2.5;
-  const d = 3;
-
   const layers = Array.from({ length: layerCount }, (_, i) => i);
   return (
     <group>
       <mesh>
-        <boxGeometry args={[w, h, d]} />
+        <boxGeometry args={[PRISM_W, PRISM_H, PRISM_D]} />
         <meshBasicMaterial wireframe transparent opacity={0.4} color="#8888aa" />
       </mesh>
 
@@ -38,8 +54,7 @@ function SpacePrism(props: SpacePrismProps): React.JSX.Element {
         const vis = layerVisibility[i];
         if (vis && !vis.visible) return null;
 
-        const t = layerCount <= 1 ? 0.5 : i / (layerCount - 1);
-        const y = -h / 2 + t * h;
+        const y = layerY(i, layerCount);
         const selected = i === selectedLayerIndex;
         const scale: [number, number, number] = selected
           ? [1.02, 1.02, 1.02]
@@ -56,7 +71,7 @@ function SpacePrism(props: SpacePrismProps): React.JSX.Element {
               onSelectLayer(i);
             }}
           >
-            <planeGeometry args={[w * 0.96, d * 0.96]} />
+            <planeGeometry args={[PRISM_W * 0.96, PRISM_D * 0.96]} />
             <meshBasicMaterial
               transparent
               opacity={opacity}
@@ -68,6 +83,108 @@ function SpacePrism(props: SpacePrismProps): React.JSX.Element {
         );
       })}
     </group>
+  );
+}
+
+/* ── Scrubber Plane (draggable in-scene) ──────────── */
+
+interface ScrubberPlaneProps {
+  layerCount: number;
+  selectedLayerIndex: number | null;
+  onPreviewLayer: (index: number | null) => void;
+  onCommitLayer: (index: number) => void;
+}
+
+const _dragPlane = new Plane(new Vector3(0, 0, 1), 0);
+const _intersection = new Vector3();
+const _raycaster = new Raycaster();
+
+function ScrubberPlane(props: ScrubberPlaneProps): React.JSX.Element | null {
+  const { layerCount, selectedLayerIndex, onPreviewLayer, onCommitLayer } = props;
+  const { camera } = useThree();
+  const dragging = useRef(false);
+  const startY = useRef(0);
+  const startLayerY = useRef(0);
+
+  const currentIndex = selectedLayerIndex ?? 0;
+  const y = layerY(currentIndex, layerCount);
+
+  const handlePointerDown = useCallback(
+    (e: ThreeEvent<PointerEvent>) => {
+      e.stopPropagation();
+      const target = e.eventObject as unknown as { setPointerCapture: (id: number) => void };
+      target.setPointerCapture(e.pointerId);
+      dragging.current = true;
+
+      // Set up a drag plane perpendicular to camera forward through the mesh position
+      const camDir = new Vector3();
+      camera.getWorldDirection(camDir);
+      // Use a horizontal drag plane (normal = camera direction projected to XZ, then use Y drag)
+      // Simpler: use a plane facing the camera at the mesh's Z position
+      _dragPlane.setFromNormalAndCoplanarPoint(camDir, e.point);
+      startY.current = e.point.y;
+      startLayerY.current = layerY(currentIndex, layerCount);
+    },
+    [camera, currentIndex, layerCount],
+  );
+
+  const handlePointerMove = useCallback(
+    (e: ThreeEvent<PointerEvent>) => {
+      if (!dragging.current) return;
+      e.stopPropagation();
+
+      // Raycast against the drag plane
+      _raycaster.setFromCamera(e.pointer, camera);
+      if (_raycaster.ray.intersectPlane(_dragPlane, _intersection)) {
+        const deltaY = _intersection.y - startY.current;
+        const newY = startLayerY.current + deltaY;
+        const continuous = yToLayerContinuous(newY, layerCount);
+        const snapped = clampLayerIndex(continuous, layerCount);
+        onPreviewLayer(snapped);
+      }
+    },
+    [camera, layerCount, onPreviewLayer],
+  );
+
+  const handlePointerUp = useCallback(
+    (e: ThreeEvent<PointerEvent>) => {
+      if (!dragging.current) return;
+      e.stopPropagation();
+      dragging.current = false;
+
+      // Final snap
+      _raycaster.setFromCamera(e.pointer, camera);
+      let finalIndex = currentIndex;
+      if (_raycaster.ray.intersectPlane(_dragPlane, _intersection)) {
+        const deltaY = _intersection.y - startY.current;
+        const newY = startLayerY.current + deltaY;
+        const continuous = yToLayerContinuous(newY, layerCount);
+        finalIndex = clampLayerIndex(continuous, layerCount);
+      }
+
+      onPreviewLayer(null);
+      onCommitLayer(finalIndex);
+    },
+    [camera, layerCount, currentIndex, onPreviewLayer, onCommitLayer],
+  );
+
+  return (
+    <mesh
+      position={[0, y, 0]}
+      rotation={[Math.PI / 2, 0, 0]}
+      onPointerDown={handlePointerDown}
+      onPointerMove={handlePointerMove}
+      onPointerUp={handlePointerUp}
+    >
+      <planeGeometry args={[PRISM_W * 0.5, PRISM_D * 0.5]} />
+      <meshBasicMaterial
+        transparent
+        opacity={0.18}
+        color="#7ec8e3"
+        depthWrite={false}
+        side={DoubleSide}
+      />
+    </mesh>
   );
 }
 
@@ -119,6 +236,12 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
           selectedLayerIndex={selectedLayerIndex}
           layerVisibility={layerVisibility}
           onSelectLayer={onSelectLayer}
+        />
+        <ScrubberPlane
+          layerCount={layerCount}
+          selectedLayerIndex={selectedLayerIndex}
+          onPreviewLayer={onPreviewLayer}
+          onCommitLayer={onSelectLayer}
         />
         <CameraRig animPhase={animPhase} onAnimDone={onAnimDone} />
         <OrbitControls
