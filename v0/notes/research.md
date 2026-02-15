@@ -90,3 +90,14 @@ Proceed with the single thin slice:
 - Escape to clear selection
 
 This proves the Unbricked essence (spatial layers + audit spine) without building a layer panel or a graph UI.
+---
+
+## Addendum (BrickUI next slices)
+
+Based on observed iteration friction:
+- Without a background token, the prism can appear invisible on white pages.
+- OrbitControls benefits from explicit `target` and polar clamping to avoid pole-flip/pivot confusion.
+- The BrickUI affordances discussed (scrubber + solo/opacity/reorder) should be layered on top of the **persisted selection spine**:
+  - Slice 1: selection → Annotation → GraphPatch (plus Escape clear)
+  - Slice 2: depth scrubber that writes the same selection annotation (preview vs commit to avoid patch spam)
+  - Slice 2b: camera intro/reset animation (skippable on interaction)

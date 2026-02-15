@@ -1,165 +1,209 @@
-# Plan — Slice Selection via Annotation (v2)
+# Plan — BrickUI Slice 1 + Slice 2 + Intro Camera (v3)
 
-**Do not implement until approved.** Human says **"implement it all"** to proceed.
+**Do not implement until approved.** Implementation begins only when the human says **"implement it all"**.
 
-## Goal
+This plan intentionally prioritizes **meaning first** (selection + persistence + patches) and only then adds BrickUI affordances (scrubber) and onboarding lens (camera animation).
 
-Click a prism slice to select it. The selected slice is visually emphasized. Selection is persisted as an **Annotation** with schema `"ui.selection.layerIndex"` targeting the Space, round-tripped through the **GraphPatch** pipeline.
+---
 
-This slice should prove:
-- **3D-first spatial selection** (no panel-first UX)
-- **audit spine** wiring (UI → GraphPatch → applyPatch → state)
+## Core essence (constraints)
 
-## Non-goals
+- **Everything is a Space you can enter.**
+- **3D is primary.** 2D is a projection.
+- Layers are **spatial slices in a translucent prism** (not panel-first).
+- **Graph power without graph UX.**
+- Canonical spine remains coherent + Zod-validated:
+  **Space, Edge, Payload, Annotation, OperatorRun, GraphPatch, Manifest**
+- **No hard-coded colors** in TS. If styling is needed, use **CSS variables** / swappable stylesheet tokens.
 
-- Hover preview / highlight (can add later).
-- Multi-select (single layer selection only).
-- Deselect by clicking the background.
-- Changing `Annotation.data` from `Record<string, string>` to a richer type.
-- Adding zustand or any new dependency.
-- Color theming system (we avoid hard-coded colors for MVP; rely on opacity/scale only).
+---
 
-## Approach
+## Shared conventions
 
-### State management: `useState` in App, prop-drilled
+### Selection persistence (single source of truth)
 
-- `App.tsx` holds `ProjectState` in `useState`.
-- `SpaceViewport` is a pure view: it receives `selectedLayerIndex` and emits `onSelectLayer(index)`.
+We represent “currently selected slice” as exactly one annotation per Space:
 
-### Annotation convention (persist selection)
+- `schema`: `"ui.selection.layerIndex"`
+- `target`: `{ kind: "Space", id: spaceId }`
+- `data`: `{ layerIndex: "<0-based integer as string>" }`
 
-We store selection as exactly one annotation per Space:
+### Stable Annotation ID strategy
 
-```ts
-// schema
-"ui.selection.layerIndex"
+- If a selection annotation already exists for the Space (`schema` + `target` match), **reuse its ID** and overwrite its `data`.
+- If none exists, create a new `annotation_*` id once.
+- Clearing selection deletes that one annotation if present.
 
-// target
-{ kind: "Space", id: spaceId }
+### Robust parsing + bounds checks
 
-// data (string values, per Record<string, string>)
-{ layerIndex: "3" } // 0-based
-```
+- Missing/NaN/out-of-range `layerIndex` → treat as **no selection** (return `null`).
+- Do **not** silently clamp; invalid persisted state should be ignored.
 
-**Stable ID strategy (answers “3) ?”):**
-- On each selection change, **reuse the same Annotation ID** if a selection annotation already exists for that Space (same `target.id` + `schema`).
-- If none exists, create a new `annotation_*` id once, then keep overwriting it on subsequent selections.
-- For clearing selection (Escape), delete that one annotation if present.
+---
 
-This avoids accumulation and survives reloads because we can re-discover the selection annotation by schema+target.
+## Slice 0 — Scene hygiene (fast, only if needed)
 
-### Visual emphasis (no hard-coded colors)
+**Goal:** Make the prism always visible and the orbit pivot stable so BrickUI iteration is not painful.
 
-Selected slice gets:
-- Higher opacity (e.g. **0.30** vs **0.10** unselected)
-- Slight scale bump (1.0 → **1.02**) for a subtle “lift”
+- Ensure canvas fills viewport.
+- Ensure background is non-white via CSS variables (swappable).
+- OrbitControls: set `target={[0,0,0]}`, clamp polar angles to prevent pole-flip, enable damping.
 
-No hard-coded color. (If we add theming later, do it via swappable tokens in a single theme module / CSS variables + a bridge—not inlined literals.)
+This is not “animation polish”—just baseline usability.
 
-### Helper: selection lookup + bounds checks
+---
 
-We need **robust parsing** (fix #1): missing/NaN/out-of-range values should produce `null`. Also clamp is acceptable, but for selection it’s usually better to **reject** invalid persisted state rather than silently clamping.
+## Slice 1 — Spatial click selection → persisted Annotation via GraphPatch
 
-Create a helper in core (pure, testable):
+### Goal
 
-```ts
-// src/core/selectors.ts
-export function findLayerSelection(
-  state: ProjectState,
-  spaceId: SpaceId,
-): { annotationId: AnnotationId; index: number } | null {
-  const ann = Object.values(state.annotations).find(
-    (a) => a.target.kind === "Space" && a.target.id === spaceId && a.schema === "ui.selection.layerIndex",
-  );
-  if (!ann) return null;
+Click a prism slice to select it. The selected slice is visually emphasized (opacity/scale only). Selection is persisted via `GraphPatch` and stored as an `Annotation`.
 
-  const raw = ann.data.layerIndex;
-  if (raw === undefined) return null;
+### UI behavior
 
-  const n = Number(raw);
-  if (!Number.isFinite(n)) return null;
+- Click slice `i`:
+  - emit patch that `put`-writes the selection annotation with `{ layerIndex: String(i) }`
+  - visually emphasize slice `i` (opacity + slight scale)
+- Press **Escape**:
+  - if selection annotation exists, emit patch with `del` op for that annotation id
+  - UI returns to no selection
 
-  const idx = Math.trunc(n);
-  if (idx < 0) return null;
+### Critical typing fix (must do)
 
-  const space = state.spaces[spaceId];
-  if (!space) return null;
+`applyPatch` must accept `GraphPatch` as input type (not `JsonValue`), otherwise the UI cannot call it without TS errors.
 
-  if (idx >= space.layerCount) return null;
+---
 
-  return { annotationId: ann.id, index: idx };
-}
-```
+## Slice 2 — Depth scrubber (slider) for layer selection
 
-(We intentionally require the Space to exist and the index to be within `layerCount`.)
+### Goal
 
-### Patch plumbing type fix (important)
+Add a minimal “depth scrubber” that selects the same layer index as clicking, but via a vertical rail/slider overlay. It updates selection **without** introducing a heavy panel.
 
-Currently `applyPatch` accepts `JsonValue`, but `newPatch()` returns a `GraphPatch` type that is **not assignable** to `JsonValue` due to TypeScript index-signature rules. This will block the feature at compile-time.
+### UX decisions
 
-**Fix:** change `applyPatch` signature to accept `GraphPatch`:
+- The scrubber is a thin overlay rail on the right edge of the viewport.
+- **Snap** to integer indices.
+- **Preview vs commit** to avoid patch spam:
+  - While dragging: update local `previewLayerIndex` (fast feedback; no GraphPatch).
+  - On pointer up: emit **one** GraphPatch to persist the final index.
+- Click on the rail commits immediately (one patch).
 
-- `src/core/applyPatch.ts`: `applyPatch(state: ProjectState, patchInput: GraphPatch): ProjectState`
+### State behavior
 
-Zod validation still happens inside `applyPatch` via `GraphPatchSchema.parse(...)`.
+- App keeps `previewLayerIndex: number | null`.
+- Effective selection shown in prism:
+  - `effectiveSelected = previewLayerIndex ?? persistedSelected`
+- `previewLayerIndex` clears on commit/cancel.
+
+### Accessibility / fallback
+
+- Optional: support mouse wheel over the scrubber to increment/decrement by 1 (can defer).
+
+---
+
+## Slice 2b — Intro camera animation (top-down → iso) + reset reverse
+
+### Goal
+
+On load (or on “Reset view”), animate from a top-down 2D-ish view into the isometric view to reveal the slice prism. Reverse the animation on reset.
+
+### Non-negotiables
+
+- **Skippable:** any manual user interaction (pointer down / wheel) cancels the animation immediately and gives full control to OrbitControls.
+- Avoid “gimbal” feel: do not lerp Euler rotations. Interpolate **spherical coordinates** (radius, polar, azimuth) or position vectors and `lookAt`.
+
+### Implementation approach
+
+- Add `CameraRig` component that:
+  - owns an `animPhase` state (`"idle" | "intro" | "reset"`)
+  - on mount, starts `"intro"`
+  - on reset action, starts `"reset"`
+  - uses `useFrame()` to ease camera position toward the target preset
+  - while animating, optionally disables OrbitControls (`enabled={false}`) OR leaves enabled but cancels animation on interaction
+
+### Presets
+
+- `TopDown` (2D-ish): camera above origin, slight offset to avoid singularity.
+- `Iso`: camera at `[6, 5, 6]`, target `[0,0,0]`.
+
+Keep these as named constants in `CameraRig.tsx` (not “magic numbers” scattered).
+
+---
 
 ## Files to change / add
 
-| File | Action | Details |
-|------|--------|---------|
-| `src/core/applyPatch.ts` | **Modify** | Change `patchInput` type to `GraphPatch` (import from `types.ts`). |
-| `src/core/selectors.ts` | **Create** | `findLayerSelection(...)` helper (pure, tested). Export from `src/core/index.ts`. |
-| `src/App.tsx` | **Modify** | Hold `ProjectState` in `useState`. Use `findLayerSelection`. Implement `handleSelectLayer` + `handleClearSelection`. Wire Escape key. Pass props to `SpaceViewport`. |
-| `src/ui/SpaceViewport.tsx` | **Modify** | Accept `selectedLayerIndex: number \| null` + `onSelectLayer: (index: number) => void`. Add `onClick` to each slice. Apply emphasis via opacity/scale only. |
-| `src/core/applyPatch.test.ts` | **Create** | Unit tests: put selection annotation (create), update selection annotation (overwrite), clear selection (del). |
+| File | Action | Notes |
+|------|--------|------|
+| `src/core/applyPatch.ts` | **Modify** | Change patch input type to `GraphPatch`. Keep Zod parse. |
+| `src/core/selectors.ts` | **Create** | `findLayerSelection(state, spaceId)` → `{annotationId,index} | null` (robust bounds). |
+| `src/core/index.ts` | **Modify** | Export selectors. |
+| `src/core/applyPatch.test.ts` | **Create** | Test selection annotation create/update/clear via patches. |
+| `src/App.tsx` | **Modify** | Hold `ProjectState` in state, derive persisted selection, manage preview selection, wire Escape + reset. |
+| `src/ui/SpaceViewport.tsx` | **Modify** | Accept `selectedLayerIndex`, `onSelectLayer`, and render overlays + CameraRig + stable OrbitControls. |
+| `src/ui/LayerScrubber.tsx` | **Create** | Overlay rail/slider: pointer drag, snapping, preview + commit. |
+| `src/ui/CameraRig.tsx` | **Create** | Camera intro/reset animation + cancel-on-interaction. |
+| `src/styles.css` | **Modify (optional)** | Add CSS variables for background/borders to avoid “white on white”. |
 
-## API / Types / Schemas
+---
 
-- No schema shape changes are required: `AnnotationSchema` already supports this use case.
-- We **do** change one function signature:
-  - `applyPatch(state, patchInput)` input type becomes `GraphPatch` (still JSON-safe; still validated by Zod).
-- No changes to `Annotation.data` type.
+## Tests
 
-## UI behavior
+Core-only (vitest):
 
-1. **Initial state**: No slice selected (no selection annotation). All slices render at default opacity (e.g. 0.10).
-2. **User clicks slice #3**:
-   - `onSelectLayer(3)` fires.
-   - App determines current selection annotation id:
-     - if exists: reuse its `annotationId`
-     - else: create new `annotation_*` id
-   - App creates a `GraphPatch` with a single `put` op for the Annotation value.
-   - App calls `applyPatch` and updates `ProjectState`.
-   - SpaceViewport re-renders: slice 3 gets opacity bump + slight scale.
-3. **User clicks slice #5**:
-   - Same flow; the annotation is overwritten with `{ layerIndex: "5" }` (same annotation id).
-4. **User presses Escape** (fix #4):
-   - If selection annotation exists: App emits `GraphPatch` with a single `del` op for that annotation id.
-   - UI returns to “no selection”.
-5. **OrbitControls**:
-   - Click selection should not fight with drag. (R3F `onClick` only fires if pointer didn’t move significantly; fine for MVP.)
+- applyPatch:
+  - create selection annotation (put)
+  - update selection annotation (put same id overwrites)
+  - clear selection annotation (del)
+- selectors:
+  - missing annotation → null
+  - invalid values (`"NaN"`, `"-1"`, out-of-range) → null
+  - valid in-range value → returns index + annotationId
 
-## Tradeoffs
+(UI tests deferred for MVP.)
 
-| Decision | Chosen | Alternative | Why |
-|----------|--------|-------------|-----|
-| State management | `useState` in App | zustand store | Simplest; no deps; good for MVP. |
-| Selection persistence | Annotation + GraphPatch | ephemeral UI state | Spec requires persistence; also aligns with audit spine. |
-| Annotation ID reuse | reuse existing | new id per click | Prevents annotation accumulation; survives reloads via lookup by schema+target. |
-| Visual emphasis | opacity + scale only | color/glow/shaders | Avoids hard-coded colors; no shaders/deps; minimal. |
-| Invalid persisted index | treat as null | clamp | Safer: don’t hide bad state; keeps invariants crisp. |
+---
 
-## TODO
+## TODO checklist
 
-- [x] 1. **core/applyPatch.ts**: change signature to accept `GraphPatch` (import type). Also fixed pre-existing branded-ID type mismatches and `exactOptionalPropertyTypes` issues.
-- [x] 2. **core/selectors.ts**: implement `findLayerSelection` helper.
-- [x] 3. **core/index.ts**: export selectors.
-- [x] 4. **App.tsx**: lift `ProjectState` into `useState`, initialized from `sampleProject.state`.
-- [x] 5. **App.tsx**: use `findLayerSelection` to derive `{ selectedLayerIndex, selectionAnnotationId }`.
-- [x] 6. **App.tsx**: implement `handleSelectLayer(index)` with bounds-check, annotation ID reuse, GraphPatch round-trip.
-- [x] 7. **App.tsx**: implement `handleClearSelection()` (del op if selection exists).
-- [x] 8. **App.tsx**: add `keydown` listener; Escape calls `handleClearSelection`.
-- [x] 9. **SpaceViewport.tsx**: update props; add `onClick={() => onSelectLayer(i)}` on each slice with `e.stopPropagation()`.
-- [x] 10. **SpaceViewport.tsx**: apply emphasis (opacity 0.3 vs 0.1, scale 1.02 vs 1) based on `selectedLayerIndex`.
-- [x] 11. **applyPatch.test.ts**: 5 tests — create, overwrite, clear, out-of-range rejection, negative rejection.
-- [x] 12. `pnpm typecheck` ✓, `pnpm test` ✓ (5/5), `pnpm lint` ✓ (0 new errors; 11 pre-existing).
+### Slice 0 (optional hygiene)
+- [ ] Ensure `SpaceViewport` canvas fills container (width/height 100%).
+- [ ] Add CSS vars for background/border in `styles.css` (swappable).
+- [ ] OrbitControls: explicit `target={[0,0,0]}`, damping, polar clamp to prevent flip.
+
+### Slice 1 (selection spine)
+- [ ] Change `applyPatch(state, patchInput)` input type to `GraphPatch`.
+- [ ] Create `src/core/selectors.ts` with `findLayerSelection(...)` (robust parsing + bounds).
+- [ ] Export selectors in `src/core/index.ts`.
+- [ ] In `App.tsx`:
+  - [ ] Hold `ProjectState` in `useState`.
+  - [ ] Derive persisted selection via `findLayerSelection`.
+  - [ ] Implement `handleSelectLayer(index)` that reuses selection annotation id when present and emits a patch.
+  - [ ] Implement `handleClearSelection()` on Escape (del op).
+- [ ] In `SpaceViewport.tsx`:
+  - [ ] Add `onClick` on slice meshes → calls `onSelectLayer(i)`, with `stopPropagation()`.
+  - [ ] Emphasize selected slice via opacity + slight scale only.
+- [ ] Add `applyPatch.test.ts` tests for create/update/clear.
+
+### Slice 2 (depth scrubber)
+- [ ] Add `previewLayerIndex: number | null` in `App.tsx`.
+- [ ] Pass `effectiveSelectedIndex = preview ?? persisted` to `SpaceViewport`.
+- [ ] Add `src/ui/LayerScrubber.tsx`:
+  - [ ] render rail + thumb
+  - [ ] pointer drag: `onPreview(snappedIndex)`
+  - [ ] pointer up: `onCommit(snappedIndex)`; clear preview
+  - [ ] click rail: commit immediately
+- [ ] Render `LayerScrubber` overlay inside `SpaceViewport` container.
+- [ ] Ensure no patch spam: only commit emits GraphPatch.
+
+### Slice 2b (intro camera animation)
+- [ ] Add `src/ui/CameraRig.tsx` with presets + easing via `useFrame`.
+- [ ] Start intro animation on mount; provide a `resetView()` trigger from App/UI.
+- [ ] Cancel animation on any user input (pointer down / wheel) and hand control to OrbitControls.
+- [ ] Add a simple “Reset view” button in header (text-only) that triggers reverse animation (optional).
+
+### Final
+- [ ] Run `pnpm typecheck`
+- [ ] Run `pnpm test`
+- [ ] Run `pnpm lint`
+- [ ] Fix failures immediately.

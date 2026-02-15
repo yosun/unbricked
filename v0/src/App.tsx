@@ -13,6 +13,7 @@ import SpaceViewport from "./ui/SpaceViewport";
 
 export default function App(): React.JSX.Element {
   const [state, setState] = useState<ProjectState>(sampleProject.state);
+  const [previewLayerIndex, setPreviewLayerIndex] = useState<number | null>(null);
   const rootSpaceId = state.manifest.rootSpaceId;
   const rootSpace = state.spaces[rootSpaceId];
 
@@ -20,6 +21,8 @@ export default function App(): React.JSX.Element {
     () => findLayerSelection(state, rootSpaceId),
     [state, rootSpaceId],
   );
+
+  const effectiveSelectedIndex = previewLayerIndex ?? selection?.index ?? null;
 
   const handleSelectLayer = useCallback(
     (index: number) => {
@@ -93,8 +96,9 @@ export default function App(): React.JSX.Element {
       </header>
       <SpaceViewport
         layerCount={rootSpace?.layerCount ?? 1}
-        selectedLayerIndex={selection?.index ?? null}
+        selectedLayerIndex={effectiveSelectedIndex}
         onSelectLayer={handleSelectLayer}
+        onPreviewLayer={setPreviewLayerIndex}
       />
     </div>
   );
