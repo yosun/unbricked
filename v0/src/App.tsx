@@ -20,7 +20,9 @@ import {
 } from "./core";
 import type { AnnotationId, GraphPatch, JsonObject, ProjectState } from "./core";
 import SpaceViewport from "./ui/SpaceViewport";
+import ViewModeSwitcher from "./ui/ViewModeSwitcher";
 import type { AnimPhase } from "./ui/CameraRig";
+import type { ViewMode } from "./ui/ViewMode";
 
 const MAX_UNDO = 100;
 
@@ -37,6 +39,9 @@ export default function App(): React.JSX.Element {
   const [previewOrder, setPreviewOrder] = useState<number[] | null>(null);
   const [animPhase, setAnimPhase] = useState<AnimPhase>("intro");
   const [isTopDown, setIsTopDown] = useState(false);
+  const [viewMode, setViewMode] = useState<ViewMode>("universal");
+  const [peekLayers, setPeekLayers] = useState(false);
+  const [peekRail, setPeekRail] = useState(false);
 
   /** Central commit: applies a patch, pushes to undo stack, clears redo, persists. */
   const commitPatch = useCallback(
@@ -108,6 +113,14 @@ export default function App(): React.JSX.Element {
   const handleToggleView = useCallback(() => {
     setAnimPhase(isTopDown ? "toIso" : "toTopDown");
   }, [isTopDown]);
+
+  /** Switch view mode, clearing all transient preview state so views don't conflict. */
+  const handleSetViewMode = useCallback((mode: ViewMode) => {
+    setPreviewLayerIndex(null);
+    setPreviewOpacity(null);
+    setPreviewOrder(null);
+    setViewMode(mode);
+  }, []);
 
   const rootSpaceId = state.manifest.rootSpaceId;
   const rootSpace = state.spaces[rootSpaceId];
@@ -310,8 +323,33 @@ export default function App(): React.JSX.Element {
     });
   }, [rootSpaceId, commitPatch]);
 
+  // Helper functions for LayersPanel (needs layerProps + layerCount)
+  const isHiddenFn = useCallback(
+    (index: number) => isHidden(layerProps, index, layerCount),
+    [layerProps, layerCount],
+  );
+
+  const persistedOpacityFn = useCallback(
+    (index: number) => opacityMultiplier(layerProps, index, layerCount),
+    [layerProps, layerCount],
+  );
+
+  // Layer stepping with [ / ]
+  const handleStepLayer = useCallback(
+    (direction: -1 | 1) => {
+      const current = effectiveSelectedIndex ?? 0;
+      const next = Math.max(0, Math.min(layerCount - 1, current + direction));
+      handleSelectLayer(next);
+    },
+    [effectiveSelectedIndex, layerCount, handleSelectLayer],
+  );
+
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
+      // Don't intercept if typing in an input
+      const tag = (e.target as HTMLElement).tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+
       if (e.key === "Escape") {
         handleClearSelection();
         return;
@@ -327,12 +365,44 @@ export default function App(): React.JSX.Element {
         e.preventDefault();
         handleRedo();
       }
+
+      // View mode switching: 1 / 2 / 3
+      if (!mod && e.key === "1") { handleSetViewMode("universal"); return; }
+      if (!mod && e.key === "2") { handleSetViewMode("layers"); return; }
+      if (!mod && e.key === "3") { handleSetViewMode("minimalist"); return; }
+
+      // Layer stepping: [ / ]
+      if (e.key === "[") { handleStepLayer(-1); return; }
+      if (e.key === "]") { handleStepLayer(1); return; }
+
+      // Peek overlays: hold Tab = layers, hold Shift = rail
+      if (e.key === "Tab" && !mod) {
+        e.preventDefault();
+        setPeekLayers(true);
+        return;
+      }
+      if (e.key === "Shift" && !e.repeat) {
+        setPeekRail(true);
+        return;
+      }
     };
+
+    const onKeyUp = (e: KeyboardEvent) => {
+      if (e.key === "Tab") {
+        setPeekLayers(false);
+      }
+      if (e.key === "Shift") {
+        setPeekRail(false);
+      }
+    };
+
     window.addEventListener("keydown", onKeyDown);
+    window.addEventListener("keyup", onKeyUp);
     return () => {
       window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("keyup", onKeyUp);
     };
-  }, [handleClearSelection, handleUndo, handleRedo]);
+  }, [handleClearSelection, handleUndo, handleRedo, handleStepLayer, handleSetViewMode]);
 
   return (
     <div style={{ height: "100%", display: "grid", gridTemplateRows: "48px 1fr" }}>
@@ -347,7 +417,9 @@ export default function App(): React.JSX.Element {
         }}
       >
         <strong style={{ color: "#eee" }}>Unbricked</strong>
-        <span style={{ marginLeft: 10, opacity: 0.5 }}>MVP — 3D-first layerspace</span>
+        <span style={{ marginLeft: 10 }}>
+          <ViewModeSwitcher current={viewMode} onChange={handleSetViewMode} />
+        </span>
         <button
           type="button"
           onClick={handleUndo}
@@ -458,11 +530,17 @@ export default function App(): React.JSX.Element {
         onPreviewOpacity={setPreviewOpacity}
         onCommitOpacity={handleCommitOpacity}
         persistedOpacity={effectiveSelectedIndex !== null ? opacityMultiplier(layerProps, effectiveSelectedIndex, layerCount) : 1.0}
+        persistedOpacityFn={persistedOpacityFn}
+        isHiddenFn={isHiddenFn}
         layerOrder={effectiveOrder}
         onPreviewOrder={setPreviewOrder}
         onCommitOrder={handleCommitOrder}
         animPhase={animPhase}
         onAnimDone={handleAnimDone}
+        viewMode={viewMode}
+        peekLayers={peekLayers}
+        peekRail={peekRail}
+        onClearSelection={handleClearSelection}
       />
     </div>
   );

@@ -608,6 +608,200 @@ For now, do MVP overlay.
 
 ---
 
+---
+
+## Slice 8 — fal.ai Image-to-Image (via drop-in proxy) (NEXT)
+
+### Goal
+
+Make the selected layer *actually editable* with AI:
+
+- Provide an **Import Image** action for the selected layer (so we have a real input).
+- Provide an **AI Edit (img2img)** action that sends the selected layer’s image through the **fal.ai drop-in proxy**.
+- On success, commit a single GraphPatch that:
+  - creates a new `Payload` for the output image
+  - creates an `OperatorRun` capturing operator/provenance (inputs/outputs/params)
+  - updates the selected layer to **display** the new payload (non-destructive “projection switch”)
+
+### Non-goals (later)
+
+- image→3D / mesh / splats
+- mixing slices into 3D scene
+- segmentation operators
+- persistence-to-disk / cloud storage
+
+---
+
+## Data model (persistent)
+
+### A) Layer “render payload” mapping (single source of truth)
+
+We represent “which payload is displayed on layer i” as one annotation per Space:
+
+- `schema`: `"ui.layers.render"`
+- `target`: `{ kind: "Space", id: spaceId }`
+- `data`: `Record<string,string>`
+  - `payload.<i> = "<payloadId>"`
+
+Rules:
+- If missing, that layer renders “blank” (no texture) until an image is imported/generated.
+- Keys must be removed (not set to `"null"`) when clearing.
+
+### B) Operator provenance
+
+Every successful AI edit creates an `OperatorRun`:
+
+- `operator`: `"fal.img2img"` (or more specific if you prefer, e.g. `"fal.<model>.img2img"`)
+- `status`: `"succeeded"`
+- `inputs`: `[ { kind:"Payload", id: <inputPayloadId> } ]`
+- `outputs`: `[ { kind:"Payload", id: <outputPayloadId> } ]`
+- `params`: string record of:
+  - `prompt`
+  - `model` (if applicable)
+  - `strength` / `guidance` / `seed` etc (as strings)
+  - `proxyRoute` (optional, for debugging: which proxy endpoint was used)
+
+(If the request fails: show error in UI; optionally create a failed OperatorRun later, but MVP can keep failures ephemeral.)
+
+### C) Payload requirements (must be correct)
+
+`PayloadSchema` requires non-empty `sha256` and `bytes`.
+
+For any imported/generated/AI-returned image:
+- compute bytes from Blob size
+- compute sha256 from Blob bytes using WebCrypto
+- store:
+  - `mediaType` (e.g. `"image/png"` / `"image/jpeg"`)
+  - `uri` (see below)
+  - `sha256` (hex)
+  - `bytes` (int)
+
+URI strategy (MVP):
+- Prefer `data:` URLs for imported/returned images (self-contained, easy display).
+- If proxy returns a stable URL, you may store that URL directly as `uri` **only if** it’s accessible from the browser and stable.
+- The key is: the plane renderer must be able to `fetch` / `loadTexture` from the `uri`.
+
+---
+
+## Proxy contract (Phase 1 research)
+
+We have a drop-in fal.ai proxy. Do NOT guess endpoints.
+
+Document (in `notes/research.md`):
+- base URL (env var)
+- route path for img2img
+- request format (JSON vs multipart)
+- response shape (url vs base64 vs dataUrl)
+
+Implementation must follow that contract exactly and Zod-validate it.
+
+---
+
+## UI / Interaction (MVP)
+
+In the selected-layer HUD:
+
+1) **Import Image**
+- Opens file picker.
+- Converts selected file → (Blob) → compute sha256/bytes → create Payload.
+- Commits one patch that:
+  - `put Payload(inputPayload)`
+  - `put/overwrite ui.layers.render payload.<i> = inputPayload.id`
+
+2) **AI Edit (img2img)**
+- Opens a small prompt + params UI (keep it minimal):
+  - prompt (required)
+  - strength (optional)
+  - seed (optional)
+- While running:
+  - show “running” state (ephemeral)
+  - disable the AI button
+- On success:
+  - build output Payload + OperatorRun
+  - commit **one** GraphPatch that:
+    - `put Payload(outputPayload)`
+    - `put OperatorRun(oprun)`
+    - update `ui.layers.render payload.<i> = outputPayload.id`
+- No patch spam while typing or while request is in-flight.
+
+Rendering:
+- If a layer has `ui.layers.render payload.<i>`, load that payload URI as a texture and map it onto that slice plane.
+- (If solo/hide is active, still obey those rules; render mapping only affects visible slices.)
+
+---
+
+## Patch spam policy
+
+- Import: 1 patch per import.
+- AI run: 1 patch per success (and 0 patches while running).
+- Any sliders for params:
+  - preview in UI only
+  - commit only when user presses “Run” (not during drag).
+
+---
+
+## Files to change / add
+
+| File | Action | Notes |
+|------|--------|------|
+| `src/core/selectors.ts` | Modify | Add `findLayerRenderPayload(state, spaceId, layerIndex) → PayloadId | null` and `findRenderAnnotationId(...)`. |
+| `src/core/types.ts` | No change | Keep core stable; store operator params as string record. |
+| `src/core/schema.ts` | No change | Zod already supports Payload/OperatorRun. Add separate Zod schema for proxy response (not in core). |
+| `src/core/crypto.ts` | Create | `sha256Hex(bytes: ArrayBuffer) → string` using `crypto.subtle.digest`. |
+| `src/services/falProxy.ts` | Create | Typed `runImg2Img(...)` calling the drop-in proxy + Zod-validated response. No `any/unknown`. |
+| `src/ui/LayerControlsHUD.tsx` | Modify | Add Import + AI Edit UI, prompt input, run button, running/error display. |
+| `src/ui/SpaceViewport.tsx` | Modify | When rendering slice plane, if payload exists, load texture from payload.uri (drei/useTexture or manual TextureLoader). |
+| `src/core/applyPatch.test.ts` | Modify | Tests: render mapping annotation put/update; payload creation + mapping; operatorRun creation + mapping. |
+
+---
+
+## Tests (vitest)
+
+- Selector defaults:
+  - no render annotation → null payload for all layers
+- Import flow (core-only):
+  - patch adds Payload + updates render mapping
+- AI success flow (core-only):
+  - patch adds output Payload + OperatorRun + updates render mapping
+- Response parsing (service):
+  - Zod validates proxy response shape (at least one happy-path sample)
+
+(Mock fetch for service tests.)
+
+---
+
+## Acceptance criteria
+
+- Importing an image onto selected layer shows it on that slice plane.
+- AI Edit returns an edited image and swaps that layer’s render payload to the new output.
+- An `OperatorRun` is created for each successful AI edit with correct input/output references.
+- Payload objects have correct `sha256` and `bytes`.
+- No patch spam: only commit on import and on successful run.
+- `pnpm typecheck && pnpm test && pnpm lint` pass.
+
+---
+
+## TODO checklist
+
+### Phase 1: research (write into notes/research.md)
+- [ ] Document proxy base URL + endpoint path for img2img
+- [ ] Document request format + required fields
+- [ ] Document response schema (url vs base64/dataUrl)
+- [ ] Confirm whether proxy expects multipart upload or accepts data URLs
+
+### Phase 2: implement
+- [ ] Add render payload selector + annotation id reuse strategy
+- [ ] Add `crypto.ts` sha256 helper
+- [ ] Add `falProxy.ts` with strict request/response typing + Zod parse
+- [ ] Add Import Image flow (file picker → Payload → render mapping patch)
+- [ ] Add AI Edit flow (prompt → proxy call → Payload+OperatorRun+render mapping patch)
+- [ ] Texture rendering on planes from payload.uri
+- [ ] Add tests for render mapping + operator run objects
+- [ ] Run `pnpm typecheck && pnpm test && pnpm lint`
+
+---
+
+
 
 
 ### Final

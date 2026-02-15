@@ -1,3 +1,13 @@
 {
-	"folders": []
+	"folders": [
+		{
+			"path": "."
+		}
+	],
+	"settings": {
+		"chat.tools.terminal.autoApprove": {
+			"pnpm": true,
+			"q": true
+		}
+	}
 }

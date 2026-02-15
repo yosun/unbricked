@@ -80,8 +80,9 @@ export default function LayerControlsHUD(props: LayerControlsHUDProps): React.JS
       className="layer-controls-hud"
       style={{
         position: "absolute",
-        left: 12,
+        left: "50%",
         bottom: 12,
+        transform: "translateX(-50%)",
         display: "flex",
         alignItems: "center",
         gap: 6,
