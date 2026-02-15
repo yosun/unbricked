@@ -136,6 +136,7 @@ export default function LayerControlsHUD(props: LayerControlsHUDProps): React.JS
 
       {/* Opacity slider — 0..100 integer scale */}
       <input
+        data-testid="opacity-slider"
         type="range"
         min={0}
         max={100}

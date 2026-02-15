@@ -413,6 +413,84 @@ Acceptance:
 * No patch spam during dragging.
 * TypeScript strict passes; lint/test pass.
 
+---
+
+## Slice 5 — Undo / Redo (editor-grade spine) (NEXT)
+
+### Goal
+
+Add undo/redo so every committed change (selection commit, props commit, scrubber commit) is reversible.
+This makes the “GraphPatch spine” feel like an editor, not a demo.
+
+### Non-goals
+
+- Cross-session history persistence.
+- Patch inversion math (we can do that later).
+- Time travel UI beyond undo/redo.
+
+### Approach (MVP, robust)
+
+Use immutable **ProjectState snapshots** (not inverse patches) for now.
+
+State model in `App.tsx`:
+- `past: ProjectState[]`
+- `present: ProjectState`
+- `future: ProjectState[]`
+
+On every *committed* patch:
+- `past.push(present)`
+- `present = applyPatch(present, patch)`
+- `future = []`
+
+Undo:
+- if `past.length > 0`:
+  - `future.unshift(present)`
+  - `present = past.pop()`
+
+Redo:
+- if `future.length > 0`:
+  - `past.push(present)`
+  - `present = future.shift()`
+
+This is safe if we treat `ProjectState` as immutable (applyPatch returns new maps/objects).
+
+### UX
+
+- Header buttons: **Undo** / **Redo** (disabled when unavailable).
+- Keyboard:
+  - `Cmd/Ctrl+Z` → Undo
+  - `Cmd/Ctrl+Shift+Z` (and/or `Cmd/Ctrl+Y`) → Redo
+
+### Important: “commit” vs “preview”
+
+Only committed actions affect history:
+- Selection click commit ✅
+- Scrubber release commit ✅
+- Opacity release commit ✅
+Preview states (dragging) do **not** push history.
+
+### Files to change / add
+
+| File | Action | Notes |
+|------|--------|------|
+| `src/App.tsx` | Modify | Introduce `past/present/future`. Route all commit handlers through `commitPatch(patch)`. Add keyboard + buttons. |
+| `src/ui/HeaderBar.tsx` (optional) | Create | If header is getting crowded; otherwise keep inline in App. |
+| `src/core/history.test.ts` (optional) | Create | Tiny unit test for undo/redo reducer (nice-to-have). |
+
+### Acceptance criteria
+
+- Any committed selection/props/scrub change can be undone/redone.
+- Undo/redo restores both visuals and persisted annotations (because present state changes).
+- After undo, committing a new patch clears redo stack.
+- Typecheck/lint/tests pass.
+
+### TODO
+
+- [ ] Create `commitPatch(patch: GraphPatch)` helper in `App.tsx` that updates `past/present/future`.
+- [ ] Refactor existing commit paths to call `commitPatch` (selection commit, scrubber commit, props commit).
+- [ ] Add Undo/Redo buttons to header.
+- [ ] Add keyboard shortcuts (Cmd/Ctrl+Z, Cmd/Ctrl+Shift+Z, Cmd/Ctrl+Y).
+- [ ] (Optional) Add a small `history`
 
 
 ### Final
