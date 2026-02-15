@@ -16,14 +16,25 @@ export default function App(): React.JSX.Element {
   const [state, setState] = useState<ProjectState>(sampleProject.state);
   const [previewLayerIndex, setPreviewLayerIndex] = useState<number | null>(null);
   const [animPhase, setAnimPhase] = useState<AnimPhase>("intro");
+  const [isTopDown, setIsTopDown] = useState(false);
 
   const handleAnimDone = useCallback(() => {
-    setAnimPhase("idle");
+    setAnimPhase((prev) => {
+      if (prev === "toTopDown") setIsTopDown(true);
+      else if (prev === "toIso" || prev === "intro") setIsTopDown(false);
+      // reset ends at iso
+      else if (prev === "reset") setIsTopDown(false);
+      return "idle";
+    });
   }, []);
 
   const handleResetView = useCallback(() => {
     setAnimPhase("reset");
   }, []);
+
+  const handleToggleView = useCallback(() => {
+    setAnimPhase(isTopDown ? "toIso" : "toTopDown");
+  }, [isTopDown]);
   const rootSpaceId = state.manifest.rootSpaceId;
   const rootSpace = state.spaces[rootSpaceId];
 
@@ -105,9 +116,27 @@ export default function App(): React.JSX.Element {
         <span style={{ marginLeft: 10, opacity: 0.5 }}>MVP — 3D-first layerspace</span>
         <button
           type="button"
-          onClick={handleResetView}
+          onClick={handleToggleView}
+          disabled={animPhase !== "idle"}
           style={{
             marginLeft: "auto",
+            background: "none",
+            border: "1px solid rgba(255,255,255,0.15)",
+            color: "#aaa",
+            padding: "4px 10px",
+            borderRadius: 4,
+            cursor: "pointer",
+            fontSize: 13,
+          }}
+        >
+          {isTopDown ? "3D view" : "Top-down"}
+        </button>
+        <button
+          type="button"
+          onClick={handleResetView}
+          disabled={animPhase !== "idle"}
+          style={{
+            marginLeft: 6,
             background: "none",
             border: "1px solid rgba(255,255,255,0.15)",
             color: "#aaa",

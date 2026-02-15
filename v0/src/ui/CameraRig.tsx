@@ -20,7 +20,7 @@ const DONE_THRESHOLD = 0.02; // distance at which animation is "done"
 
 /* ── Types ───────────────────────────────────────── */
 
-export type AnimPhase = "idle" | "intro" | "reset";
+export type AnimPhase = "idle" | "intro" | "reset" | "toTopDown" | "toIso";
 
 interface CameraRigProps {
   animPhase: AnimPhase;
@@ -59,6 +59,12 @@ export default function CameraRig(props: CameraRigProps): null {
       // First animate toward top-down, then back to iso.
       targetPos.current.copy(TOP_DOWN);
       targetUp.current.copy(TOP_DOWN_UP);
+    } else if (animPhase === "toTopDown") {
+      targetPos.current.copy(TOP_DOWN);
+      targetUp.current.copy(TOP_DOWN_UP);
+    } else if (animPhase === "toIso") {
+      targetPos.current.copy(ISO);
+      targetUp.current.copy(DEFAULT_UP);
     }
   }, [animPhase, camera]);
 
@@ -92,10 +98,17 @@ export default function CameraRig(props: CameraRigProps): null {
 
     const dist = camera.position.distanceTo(targetPos.current);
 
-    if (animPhase === "intro") {
+    if (animPhase === "intro" || animPhase === "toIso") {
       if (dist < DONE_THRESHOLD) {
         camera.position.copy(ISO);
         camera.up.copy(DEFAULT_UP);
+        camera.lookAt(0, 0, 0);
+        onAnimDone();
+      }
+    } else if (animPhase === "toTopDown") {
+      if (dist < DONE_THRESHOLD) {
+        camera.position.copy(TOP_DOWN);
+        camera.up.copy(TOP_DOWN_UP);
         camera.lookAt(0, 0, 0);
         onAnimDone();
       }
