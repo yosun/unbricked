@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   applyPatch,
   findLayerSelection,
@@ -15,18 +15,77 @@ import {
   saveProjectState,
   clearProjectState,
 } from "./core";
-import type { AnnotationId, JsonObject, ProjectState } from "./core";
+import type { AnnotationId, GraphPatch, JsonObject, ProjectState } from "./core";
 import SpaceViewport from "./ui/SpaceViewport";
 import type { AnimPhase } from "./ui/CameraRig";
+
+const MAX_UNDO = 100;
 
 export default function App(): React.JSX.Element {
   const [state, setState] = useState<ProjectState>(
     () => loadProjectState() ?? sampleProject.state,
   );
+  const pastRef = useRef<ProjectState[]>([]);
+  const futureRef = useRef<ProjectState[]>([]);
+  const [undoCount, setUndoCount] = useState(0);
+  const [redoCount, setRedoCount] = useState(0);
   const [previewLayerIndex, setPreviewLayerIndex] = useState<number | null>(null);
   const [previewOpacity, setPreviewOpacity] = useState<number | null>(null);
   const [animPhase, setAnimPhase] = useState<AnimPhase>("intro");
   const [isTopDown, setIsTopDown] = useState(false);
+
+  /** Central commit: applies a patch, pushes to undo stack, clears redo, persists. */
+  const commitPatch = useCallback(
+    (patchBuilder: (current: ProjectState) => GraphPatch | null) => {
+      setState((prev) => {
+        const patch = patchBuilder(prev);
+        if (!patch) return prev;
+        const next = applyPatch(prev, patch);
+        pastRef.current = [...pastRef.current.slice(-(MAX_UNDO - 1)), prev];
+        futureRef.current = [];
+        saveProjectState(next);
+        // Schedule counter updates outside of setState
+        queueMicrotask(() => {
+          setUndoCount(pastRef.current.length);
+          setRedoCount(0);
+        });
+        return next;
+      });
+    },
+    [],
+  );
+
+  const handleUndo = useCallback(() => {
+    setState((prev) => {
+      const past = pastRef.current;
+      const restored = past[past.length - 1];
+      if (!restored) return prev;
+      pastRef.current = past.slice(0, -1);
+      futureRef.current = [prev, ...futureRef.current];
+      saveProjectState(restored);
+      queueMicrotask(() => {
+        setUndoCount(pastRef.current.length);
+        setRedoCount(futureRef.current.length);
+      });
+      return restored;
+    });
+  }, []);
+
+  const handleRedo = useCallback(() => {
+    setState((prev) => {
+      const future = futureRef.current;
+      const restored = future[0];
+      if (!restored) return prev;
+      futureRef.current = future.slice(1);
+      pastRef.current = [...pastRef.current, prev];
+      saveProjectState(restored);
+      queueMicrotask(() => {
+        setUndoCount(pastRef.current.length);
+        setRedoCount(futureRef.current.length);
+      });
+      return restored;
+    });
+  }, []);
 
   const handleAnimDone = useCallback(() => {
     setAnimPhase((prev) => {
@@ -92,7 +151,7 @@ export default function App(): React.JSX.Element {
 
   const emitPropsUpdate = useCallback(
     (updater: (data: Record<string, string>) => Record<string, string>) => {
-      setState((prev) => {
+      commitPatch((prev) => {
         const existing = findLayerProps(prev, rootSpaceId);
         const annId: AnnotationId = existing
           ? existing.annotationId
@@ -100,15 +159,12 @@ export default function App(): React.JSX.Element {
         const currentData = existing ? { ...existing.annotation.data } : {};
         const newData = updater(currentData);
 
-        // Option B: if no keys remain, delete the annotation entirely
+        // If no keys remain, delete the annotation entirely
         if (Object.keys(newData).length === 0 && existing) {
-          const patch = newPatch({
+          return newPatch({
             baseRevision: prev.revision,
             ops: [delOp("Annotation", annId)],
           });
-          const next = applyPatch(prev, patch);
-          saveProjectState(next);
-          return next;
         }
 
         const annotationValue: JsonObject = {
@@ -120,17 +176,13 @@ export default function App(): React.JSX.Element {
           createdAt: new Date().toISOString(),
         };
 
-        const patch = newPatch({
+        return newPatch({
           baseRevision: prev.revision,
           ops: [putOp("Annotation", annId, annotationValue)],
         });
-
-        const next = applyPatch(prev, patch);
-        saveProjectState(next);
-        return next;
       });
     },
-    [rootSpaceId],
+    [rootSpaceId, commitPatch],
   );
 
   const handleToggleHidden = useCallback(
@@ -175,9 +227,9 @@ export default function App(): React.JSX.Element {
   const handleSelectLayer = useCallback(
     (index: number) => {
       setPreviewOpacity(null);
-      setState((prev) => {
+      commitPatch((prev) => {
         const space = prev.spaces[rootSpaceId];
-        if (!space || index < 0 || index >= space.layerCount) return prev;
+        if (!space || index < 0 || index >= space.layerCount) return null;
 
         const existing = findLayerSelection(prev, rootSpaceId);
         const annId: AnnotationId = existing
@@ -193,45 +245,51 @@ export default function App(): React.JSX.Element {
           createdAt: new Date().toISOString(),
         };
 
-        const patch = newPatch({
+        return newPatch({
           baseRevision: prev.revision,
           ops: [putOp("Annotation", annId, annotationValue)],
         });
-
-        const next = applyPatch(prev, patch);
-        saveProjectState(next);
-        return next;
       });
     },
-    [rootSpaceId],
+    [rootSpaceId, commitPatch],
   );
 
   const handleClearSelection = useCallback(() => {
     setPreviewOpacity(null);
-    setState((prev) => {
+    commitPatch((prev) => {
       const existing = findLayerSelection(prev, rootSpaceId);
-      if (!existing) return prev;
+      if (!existing) return null;
 
-      const patch = newPatch({
+      return newPatch({
         baseRevision: prev.revision,
         ops: [delOp("Annotation", existing.annotationId)],
       });
-
-      const next = applyPatch(prev, patch);
-      saveProjectState(next);
-      return next;
     });
-  }, [rootSpaceId]);
+  }, [rootSpaceId, commitPatch]);
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape") handleClearSelection();
+      if (e.key === "Escape") {
+        handleClearSelection();
+        return;
+      }
+      const mod = e.metaKey || e.ctrlKey;
+      if (mod && e.key === "z" && !e.shiftKey) {
+        e.preventDefault();
+        handleUndo();
+      } else if (mod && e.key === "z" && e.shiftKey) {
+        e.preventDefault();
+        handleRedo();
+      } else if (mod && e.key === "y") {
+        e.preventDefault();
+        handleRedo();
+      }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => {
       window.removeEventListener("keydown", onKeyDown);
     };
-  }, [handleClearSelection]);
+  }, [handleClearSelection, handleUndo, handleRedo]);
 
   return (
     <div style={{ height: "100%", display: "grid", gridTemplateRows: "48px 1fr" }}>
@@ -249,10 +307,44 @@ export default function App(): React.JSX.Element {
         <span style={{ marginLeft: 10, opacity: 0.5 }}>MVP — 3D-first layerspace</span>
         <button
           type="button"
+          onClick={handleUndo}
+          disabled={undoCount === 0}
+          style={{
+            marginLeft: "auto",
+            background: "none",
+            border: "1px solid rgba(255,255,255,0.15)",
+            color: undoCount === 0 ? "#555" : "#aaa",
+            padding: "4px 10px",
+            borderRadius: 4,
+            cursor: undoCount === 0 ? "default" : "pointer",
+            fontSize: 13,
+          }}
+        >
+          Undo
+        </button>
+        <button
+          type="button"
+          onClick={handleRedo}
+          disabled={redoCount === 0}
+          style={{
+            marginLeft: 6,
+            background: "none",
+            border: "1px solid rgba(255,255,255,0.15)",
+            color: redoCount === 0 ? "#555" : "#aaa",
+            padding: "4px 10px",
+            borderRadius: 4,
+            cursor: redoCount === 0 ? "default" : "pointer",
+            fontSize: 13,
+          }}
+        >
+          Redo
+        </button>
+        <button
+          type="button"
           onClick={handleToggleView}
           disabled={animPhase !== "idle"}
           style={{
-            marginLeft: "auto",
+            marginLeft: 6,
             background: "none",
             border: "1px solid rgba(255,255,255,0.15)",
             color: "#aaa",
@@ -287,6 +379,10 @@ export default function App(): React.JSX.Element {
             onClick={() => {
               clearProjectState();
               setState(sampleProject.state);
+              pastRef.current = [];
+              futureRef.current = [];
+              setUndoCount(0);
+              setRedoCount(0);
               setPreviewLayerIndex(null);
               setPreviewOpacity(null);
             }}
