@@ -3,6 +3,8 @@ import { Canvas } from "@react-three/fiber";
 import { OrbitControls } from "@react-three/drei";
 import { DoubleSide } from "three";
 import LayerScrubber from "./LayerScrubber";
+import CameraRig from "./CameraRig";
+import type { AnimPhase } from "./CameraRig";
 
 interface SpacePrismProps {
   layerCount: number;
@@ -63,10 +65,20 @@ interface SpaceViewportProps {
   selectedLayerIndex: number | null;
   onSelectLayer: (index: number) => void;
   onPreviewLayer: (index: number | null) => void;
+  animPhase: AnimPhase;
+  onAnimDone: () => void;
 }
 
 export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Element {
-  const { layerCount, selectedLayerIndex, onSelectLayer, onPreviewLayer } = props;
+  const {
+    layerCount,
+    selectedLayerIndex,
+    onSelectLayer,
+    onPreviewLayer,
+    animPhase,
+    onAnimDone,
+  } = props;
+  const animating = animPhase !== "idle";
   return (
     <div style={{ position: "relative", width: "100%", height: "100%" }}>
       <Canvas camera={{ position: [0, 10, 0.01], fov: 50 }} style={{ background: "#1a1a2e" }}>
@@ -77,8 +89,10 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
           selectedLayerIndex={selectedLayerIndex}
           onSelectLayer={onSelectLayer}
         />
+        <CameraRig animPhase={animPhase} onAnimDone={onAnimDone} />
         <OrbitControls
           makeDefault
+          enabled={!animating}
           target={[0, 0, 0]}
           enableDamping
           dampingFactor={0.12}
