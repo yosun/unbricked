@@ -113,6 +113,9 @@ describe("applyPatch — selection annotation", () => {
 describe("applyPatch — layer props annotation", () => {
   const baseState = sampleProject.state;
   const rootSpaceId = baseState.manifest.rootSpaceId;
+  const rootSpace = baseState.spaces[rootSpaceId];
+  if (!rootSpace) throw new Error("root space missing");
+  const layerCount = rootSpace.layerCount;
 
   function makePropsAnnotation(annId: string, data: Record<string, string>): JsonObject {
     return {
@@ -137,8 +140,8 @@ describe("applyPatch — layer props annotation", () => {
     expect(props).not.toBeNull();
     if (!props) throw new Error("props missing");
     expect(props.annotationId).toBe(annId);
-    expect(isHidden(props, 2)).toBe(true);
-    expect(isHidden(props, 0)).toBe(false);
+    expect(isHidden(props, 2, layerCount)).toBe(true);
+    expect(isHidden(props, 0, layerCount)).toBe(false);
   });
 
   it("overwrites props annotation with same id", () => {
@@ -159,9 +162,9 @@ describe("applyPatch — layer props annotation", () => {
     const props = findLayerProps(state2, rootSpaceId);
     expect(props).not.toBeNull();
     // hidden.1 should be gone (key not present after overwrite)
-    expect(isHidden(props, 1)).toBe(false);
-    expect(isHidden(props, 3)).toBe(true);
-    expect(opacityMultiplier(props, 1)).toBeCloseTo(0.5);
+    expect(isHidden(props, 1, layerCount)).toBe(false);
+    expect(isHidden(props, 3, layerCount)).toBe(true);
+    expect(opacityMultiplier(props, 1, layerCount)).toBeCloseTo(0.5);
   });
 
   it("clears props annotation via del", () => {
@@ -192,8 +195,8 @@ describe("applyPatch — layer props annotation", () => {
     const state1 = applyPatch(baseState, patch1);
 
     const props1 = findLayerProps(state1, rootSpaceId);
-    expect(isHidden(props1, 0)).toBe(true);
-    expect(soloIndex(props1)).toBe(3);
+    expect(isHidden(props1, 0, layerCount)).toBe(true);
+    expect(soloIndex(props1, layerCount)).toBe(3);
 
     // Rewrite without those keys
     const patch2 = newPatch({
@@ -204,22 +207,25 @@ describe("applyPatch — layer props annotation", () => {
 
     const props2 = findLayerProps(state2, rootSpaceId);
     expect(props2).not.toBeNull();
-    expect(isHidden(props2, 0)).toBe(false);
-    expect(soloIndex(props2)).toBeNull();
+    expect(isHidden(props2, 0, layerCount)).toBe(false);
+    expect(soloIndex(props2, layerCount)).toBeNull();
   });
 });
 
 describe("selectors — layer props parsing", () => {
   const baseState = sampleProject.state;
   const rootSpaceId = baseState.manifest.rootSpaceId;
+  const rootSpace = baseState.spaces[rootSpaceId];
+  if (!rootSpace) throw new Error("root space missing");
+  const layerCount = rootSpace.layerCount;
 
   it("missing props annotation → defaults", () => {
     const props = findLayerProps(baseState, rootSpaceId);
     expect(props).toBeNull();
     // With null props, helpers return defaults
-    expect(isHidden(null, 0)).toBe(false);
-    expect(opacityMultiplier(null, 0)).toBe(1.0);
-    expect(soloIndex(null)).toBeNull();
+    expect(isHidden(null, 0, layerCount)).toBe(false);
+    expect(opacityMultiplier(null, 0, layerCount)).toBe(1.0);
+    expect(soloIndex(null, layerCount)).toBeNull();
   });
 
   it("invalid solo value → ignored", () => {
@@ -237,7 +243,7 @@ describe("selectors — layer props parsing", () => {
     });
     const next = applyPatch(baseState, patch);
     const props = findLayerProps(next, rootSpaceId);
-    expect(soloIndex(props)).toBeNull();
+    expect(soloIndex(props, layerCount)).toBeNull();
   });
 
   it("invalid opacity value → defaults to 1.0", () => {
@@ -255,7 +261,7 @@ describe("selectors — layer props parsing", () => {
     });
     const next = applyPatch(baseState, patch);
     const props = findLayerProps(next, rootSpaceId);
-    expect(opacityMultiplier(props, 2)).toBe(1.0);
+    expect(opacityMultiplier(props, 2, layerCount)).toBe(1.0);
   });
 
   it("opacity clamped to [0,1] for rendering", () => {
@@ -273,8 +279,8 @@ describe("selectors — layer props parsing", () => {
     });
     const next = applyPatch(baseState, patch);
     const props = findLayerProps(next, rootSpaceId);
-    expect(opacityMultiplier(props, 0)).toBe(1.0);
-    expect(opacityMultiplier(props, 1)).toBe(0);
+    expect(opacityMultiplier(props, 0, layerCount)).toBe(1.0);
+    expect(opacityMultiplier(props, 1, layerCount)).toBe(0);
   });
 
   it("negative solo → ignored", () => {
@@ -292,7 +298,7 @@ describe("selectors — layer props parsing", () => {
     });
     const next = applyPatch(baseState, patch);
     const props = findLayerProps(next, rootSpaceId);
-    expect(soloIndex(props)).toBeNull();
+    expect(soloIndex(props, layerCount)).toBeNull();
   });
 
   it("valid keys parse correctly", () => {
@@ -311,10 +317,51 @@ describe("selectors — layer props parsing", () => {
     const next = applyPatch(baseState, patch);
     const props = findLayerProps(next, rootSpaceId);
     expect(props).not.toBeNull();
-    expect(isHidden(props, 3)).toBe(true);
-    expect(isHidden(props, 0)).toBe(false);
-    expect(opacityMultiplier(props, 4)).toBeCloseTo(0.7);
-    expect(opacityMultiplier(props, 0)).toBe(1.0);
-    expect(soloIndex(props)).toBe(2);
+    expect(isHidden(props, 3, layerCount)).toBe(true);
+    expect(isHidden(props, 0, layerCount)).toBe(false);
+    expect(opacityMultiplier(props, 4, layerCount)).toBeCloseTo(0.7);
+    expect(opacityMultiplier(props, 0, layerCount)).toBe(1.0);
+    expect(soloIndex(props, layerCount)).toBe(2);
+  });
+
+  it("out-of-range solo → ignored (behaves as no solo)", () => {
+    const annId = makeId("annotation");
+    const patch = newPatch({
+      baseRevision: baseState.revision,
+      ops: [putOp("Annotation", annId, {
+        id: annId,
+        kind: "Annotation",
+        target: { kind: "Space", id: rootSpaceId },
+        schema: "ui.layers.props",
+        data: { solo: "99" },
+        createdAt: new Date().toISOString(),
+      })],
+    });
+    const next = applyPatch(baseState, patch);
+    const props = findLayerProps(next, rootSpaceId);
+    expect(props).not.toBeNull();
+    // solo=99 is out of range for layerCount=7 → ignored
+    expect(soloIndex(props, layerCount)).toBeNull();
+  });
+
+  it("out-of-range hidden index → ignored", () => {
+    const annId = makeId("annotation");
+    const patch = newPatch({
+      baseRevision: baseState.revision,
+      ops: [putOp("Annotation", annId, {
+        id: annId,
+        kind: "Annotation",
+        target: { kind: "Space", id: rootSpaceId },
+        schema: "ui.layers.props",
+        data: { "hidden.99": "true" },
+        createdAt: new Date().toISOString(),
+      })],
+    });
+    const next = applyPatch(baseState, patch);
+    const props = findLayerProps(next, rootSpaceId);
+    // index 99 is out of range → isHidden returns false
+    expect(isHidden(props, 99, layerCount)).toBe(false);
+    // valid indices still report not-hidden
+    expect(isHidden(props, 0, layerCount)).toBe(false);
   });
 });

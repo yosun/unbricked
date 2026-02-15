@@ -57,20 +57,20 @@ export default function App(): React.JSX.Element {
 
   // Build per-layer visibility/opacity for SpaceViewport
   const layerCount = rootSpace?.layerCount ?? 1;
-  const solo = soloIndex(layerProps);
+  const solo = soloIndex(layerProps, layerCount);
   const layerVisibility = useMemo(() => {
     const result: Array<{ visible: boolean; opacity: number }> = [];
     for (let i = 0; i < layerCount; i++) {
       let visible = true;
       if (solo !== null) {
         visible = i === solo;
-      } else if (isHidden(layerProps, i)) {
+      } else if (isHidden(layerProps, i, layerCount)) {
         visible = false;
       }
 
       const selected = i === effectiveSelectedIndex;
       const baseOpacity = selected ? 0.30 : 0.10;
-      let mult = opacityMultiplier(layerProps, i);
+      let mult = opacityMultiplier(layerProps, i, layerCount);
       // Use preview opacity for the selected layer while dragging
       if (selected && previewOpacity !== null) {
         mult = previewOpacity;
@@ -93,6 +93,15 @@ export default function App(): React.JSX.Element {
           : makeId("annotation");
         const currentData = existing ? { ...existing.annotation.data } : {};
         const newData = updater(currentData);
+
+        // Option B: if no keys remain, delete the annotation entirely
+        if (Object.keys(newData).length === 0 && existing) {
+          const patch = newPatch({
+            baseRevision: prev.revision,
+            ops: [delOp("Annotation", annId)],
+          });
+          return applyPatch(prev, patch);
+        }
 
         const annotationValue: JsonObject = {
           id: annId,
@@ -155,6 +164,7 @@ export default function App(): React.JSX.Element {
 
   const handleSelectLayer = useCallback(
     (index: number) => {
+      setPreviewOpacity(null);
       setState((prev) => {
         const space = prev.spaces[rootSpaceId];
         if (!space || index < 0 || index >= space.layerCount) return prev;
@@ -185,6 +195,7 @@ export default function App(): React.JSX.Element {
   );
 
   const handleClearSelection = useCallback(() => {
+    setPreviewOpacity(null);
     setState((prev) => {
       const existing = findLayerSelection(prev, rootSpaceId);
       if (!existing) return prev;
@@ -268,7 +279,7 @@ export default function App(): React.JSX.Element {
         onToggleSolo={handleToggleSolo}
         onPreviewOpacity={setPreviewOpacity}
         onCommitOpacity={handleCommitOpacity}
-        persistedOpacity={effectiveSelectedIndex !== null ? opacityMultiplier(layerProps, effectiveSelectedIndex) : 1.0}
+        persistedOpacity={effectiveSelectedIndex !== null ? opacityMultiplier(layerProps, effectiveSelectedIndex, layerCount) : 1.0}
         animPhase={animPhase}
         onAnimDone={handleAnimDone}
       />
