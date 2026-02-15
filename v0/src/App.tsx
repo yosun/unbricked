@@ -11,13 +11,18 @@ import {
   putOp,
   delOp,
   sampleProject,
+  loadProjectState,
+  saveProjectState,
+  clearProjectState,
 } from "./core";
 import type { AnnotationId, JsonObject, ProjectState } from "./core";
 import SpaceViewport from "./ui/SpaceViewport";
 import type { AnimPhase } from "./ui/CameraRig";
 
 export default function App(): React.JSX.Element {
-  const [state, setState] = useState<ProjectState>(sampleProject.state);
+  const [state, setState] = useState<ProjectState>(
+    () => loadProjectState() ?? sampleProject.state,
+  );
   const [previewLayerIndex, setPreviewLayerIndex] = useState<number | null>(null);
   const [previewOpacity, setPreviewOpacity] = useState<number | null>(null);
   const [animPhase, setAnimPhase] = useState<AnimPhase>("intro");
@@ -40,6 +45,7 @@ export default function App(): React.JSX.Element {
   const handleToggleView = useCallback(() => {
     setAnimPhase(isTopDown ? "toIso" : "toTopDown");
   }, [isTopDown]);
+
   const rootSpaceId = state.manifest.rootSpaceId;
   const rootSpace = state.spaces[rootSpaceId];
 
@@ -100,7 +106,9 @@ export default function App(): React.JSX.Element {
             baseRevision: prev.revision,
             ops: [delOp("Annotation", annId)],
           });
-          return applyPatch(prev, patch);
+          const next = applyPatch(prev, patch);
+          saveProjectState(next);
+          return next;
         }
 
         const annotationValue: JsonObject = {
@@ -117,7 +125,9 @@ export default function App(): React.JSX.Element {
           ops: [putOp("Annotation", annId, annotationValue)],
         });
 
-        return applyPatch(prev, patch);
+        const next = applyPatch(prev, patch);
+        saveProjectState(next);
+        return next;
       });
     },
     [rootSpaceId],
@@ -188,7 +198,9 @@ export default function App(): React.JSX.Element {
           ops: [putOp("Annotation", annId, annotationValue)],
         });
 
-        return applyPatch(prev, patch);
+        const next = applyPatch(prev, patch);
+        saveProjectState(next);
+        return next;
       });
     },
     [rootSpaceId],
@@ -205,7 +217,9 @@ export default function App(): React.JSX.Element {
         ops: [delOp("Annotation", existing.annotationId)],
       });
 
-      return applyPatch(prev, patch);
+      const next = applyPatch(prev, patch);
+      saveProjectState(next);
+      return next;
     });
   }, [rootSpaceId]);
 
@@ -267,6 +281,30 @@ export default function App(): React.JSX.Element {
         >
           Reset view
         </button>
+        {import.meta.env.DEV && (
+          <button
+            type="button"
+            onClick={() => {
+              clearProjectState();
+              setState(sampleProject.state);
+              setPreviewLayerIndex(null);
+              setPreviewOpacity(null);
+            }}
+            style={{
+              marginLeft: 6,
+              background: "none",
+              border: "1px solid rgba(255,255,255,0.15)",
+              color: "#aaa",
+              padding: "4px 10px",
+              borderRadius: 4,
+              cursor: "pointer",
+              fontSize: 13,
+              opacity: 0.6,
+            }}
+          >
+            Reset project
+          </button>
+        )}
       </header>
       <SpaceViewport
         layerCount={layerCount}

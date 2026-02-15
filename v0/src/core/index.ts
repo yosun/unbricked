@@ -4,4 +4,5 @@ export * from "./ids";
 export * from "./graphPatch";
 export * from "./applyPatch";
 export * from "./selectors";
+export * from "./persistProjectState";
 export * from "./sampleProject";
