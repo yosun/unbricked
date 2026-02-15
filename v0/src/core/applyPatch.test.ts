@@ -4,7 +4,7 @@ import { newPatch, putOp, delOp } from "./graphPatch";
 import { makeId } from "./ids";
 import { findLayerSelection, findLayerProps, isHidden, opacityMultiplier, soloIndex } from "./selectors";
 import { sampleProject } from "./sampleProject";
-import type { JsonObject } from "./types";
+import type { AnnotationId, JsonObject } from "./types";
 
 describe("applyPatch — selection annotation", () => {
   const baseState = sampleProject.state;
@@ -363,5 +363,152 @@ describe("selectors — layer props parsing", () => {
     expect(isHidden(props, 99, layerCount)).toBe(false);
     // valid indices still report not-hidden
     expect(isHidden(props, 0, layerCount)).toBe(false);
+  });
+});
+
+describe("applyPatch — snapshot isolation (undo/redo safety)", () => {
+  const baseState = sampleProject.state;
+  const rootSpaceId = baseState.manifest.rootSpaceId;
+
+  function makeSelectionAnnotation(annId: string, layerIndex: number): JsonObject {
+    return {
+      id: annId,
+      kind: "Annotation",
+      target: { kind: "Space", id: rootSpaceId },
+      schema: "ui.selection.layerIndex",
+      data: { layerIndex: String(layerIndex) },
+      createdAt: new Date().toISOString(),
+    };
+  }
+
+  it("mutating returned state does not affect the original", () => {
+    const annId = makeId("annotation");
+    const patch = newPatch({
+      baseRevision: baseState.revision,
+      ops: [putOp("Annotation", annId, makeSelectionAnnotation(annId, 2))],
+    });
+
+    const next = applyPatch(baseState, patch);
+
+    // Mutate the returned state's annotations map
+    const bogusId = makeId("annotation");
+    next.annotations[bogusId as AnnotationId] = {
+      id: bogusId as AnnotationId,
+      kind: "Annotation",
+      target: { kind: "Space", id: rootSpaceId },
+      schema: "bogus",
+      data: {},
+      createdAt: new Date().toISOString(),
+    };
+
+    // Original must be untouched
+    expect(baseState.annotations[bogusId as AnnotationId]).toBeUndefined();
+    expect(Object.keys(baseState.annotations)).toHaveLength(0);
+  });
+
+  it("mutating the original state after patch does not affect the returned state", () => {
+    const annId = makeId("annotation");
+    const patch = newPatch({
+      baseRevision: baseState.revision,
+      ops: [putOp("Annotation", annId, makeSelectionAnnotation(annId, 3))],
+    });
+
+    const next = applyPatch(baseState, patch);
+    const annotationCountBefore = Object.keys(next.annotations).length;
+
+    // Mutate the original's spaces map (shallow copy should protect next)
+    const bogusSpaceId = makeId("space");
+    (baseState.spaces as Record<string, unknown>)[bogusSpaceId] = { fake: true };
+
+    // next.spaces must not contain the bogus entry
+    expect((next.spaces as Record<string, unknown>)[bogusSpaceId]).toBeUndefined();
+    expect(Object.keys(next.annotations)).toHaveLength(annotationCountBefore);
+
+    // Cleanup: remove the bogus entry we added to baseState
+    // eslint-disable-next-line @typescript-eslint/no-dynamic-delete
+    delete (baseState.spaces as Record<string, unknown>)[bogusSpaceId];
+  });
+
+  it("chained patches produce independent snapshots (undo stack simulation)", () => {
+    const annId = makeId("annotation");
+
+    // Simulate: commit 1 → select layer 0
+    const patch1 = newPatch({
+      baseRevision: baseState.revision,
+      ops: [putOp("Annotation", annId, makeSelectionAnnotation(annId, 0))],
+    });
+    const state1 = applyPatch(baseState, patch1);
+
+    // Simulate: commit 2 → select layer 3
+    const patch2 = newPatch({
+      baseRevision: state1.revision,
+      ops: [putOp("Annotation", annId, makeSelectionAnnotation(annId, 3))],
+    });
+    const state2 = applyPatch(state1, patch2);
+
+    // Simulate: commit 3 → select layer 5
+    const patch3 = newPatch({
+      baseRevision: state2.revision,
+      ops: [putOp("Annotation", annId, makeSelectionAnnotation(annId, 5))],
+    });
+    const state3 = applyPatch(state2, patch3);
+
+    // All three snapshots should be independent
+    const sel1 = findLayerSelection(state1, rootSpaceId);
+    const sel2 = findLayerSelection(state2, rootSpaceId);
+    const sel3 = findLayerSelection(state3, rootSpaceId);
+
+    expect(sel1?.index).toBe(0);
+    expect(sel2?.index).toBe(3);
+    expect(sel3?.index).toBe(5);
+
+    // Mutate state3's annotation data directly
+    state3.annotations[annId as AnnotationId].data["layerIndex"] = "999";
+
+    // state1 and state2 must be unaffected
+    expect(findLayerSelection(state1, rootSpaceId)?.index).toBe(0);
+    expect(findLayerSelection(state2, rootSpaceId)?.index).toBe(3);
+  });
+
+  it("deleting from one snapshot does not affect another", () => {
+    const annId = makeId("annotation");
+
+    const patch1 = newPatch({
+      baseRevision: baseState.revision,
+      ops: [putOp("Annotation", annId, makeSelectionAnnotation(annId, 4))],
+    });
+    const state1 = applyPatch(baseState, patch1);
+
+    // Delete from state1's annotations
+    const patch2 = newPatch({
+      baseRevision: state1.revision,
+      ops: [delOp("Annotation", annId)],
+    });
+    const state2 = applyPatch(state1, patch2);
+
+    // state1 should still have the annotation (undo target)
+    expect(findLayerSelection(state1, rootSpaceId)?.index).toBe(4);
+    // state2 should not
+    expect(findLayerSelection(state2, rootSpaceId)).toBeNull();
+  });
+
+  it("space mutations in one snapshot do not leak to another", () => {
+    const annId = makeId("annotation");
+
+    const patch = newPatch({
+      baseRevision: baseState.revision,
+      ops: [putOp("Annotation", annId, makeSelectionAnnotation(annId, 1))],
+    });
+    const next = applyPatch(baseState, patch);
+
+    // Both share the same rootSpaceId, but the spaces maps are different objects
+    expect(next.spaces).not.toBe(baseState.spaces);
+
+    // Mutate next.spaces
+    const rootSpace = next.spaces[rootSpaceId];
+    next.spaces[rootSpaceId] = { ...rootSpace, name: "mutated" };
+
+    // baseState must be unaffected
+    expect(baseState.spaces[rootSpaceId].name).toBe("Root Space");
   });
 });

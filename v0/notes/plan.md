@@ -492,6 +492,123 @@ Preview states (dragging) do **not** push history.
 - [ ] Add keyboard shortcuts (Cmd/Ctrl+Z, Cmd/Ctrl+Shift+Z, Cmd/Ctrl+Y).
 - [ ] (Optional) Add a small `history`
 
+---
+
+## Slice 6 — Layer Reorder (order mapping) (NEXT AFTER UNDO/REDO)
+
+### Goal
+
+Enable reordering of layers (slices) in BrickUI:
+- The prism should render slices in the current order.
+- Selection should follow the same logical layer identity after reorder.
+- Reorder must be persisted via **Annotation + GraphPatch**.
+- Reorder must be undo/redo-able (via Slice 5 history).
+
+This is the first step toward “Photoshop layers” beyond selection/visibility/opacity/solo.
+
+### Non-goals
+
+- Layer groups.
+- Multi-select reorder.
+- Dragging multiple slices at once.
+- Timeline/keyframes.
+
+### Key decision: Represent order without new core types
+
+We keep the existing `Space.layerCount` as the number of logical layers (indices `0..layerCount-1`).
+We introduce a mapping annotation that defines the display/stack order.
+
+### Data representation (single annotation per Space)
+
+- `schema`: `"ui.layers.order"`
+- `target`: `{ kind: "Space", id: spaceId }`
+- `data`: `Record<string, string>`
+
+Encoding:
+- `order = "0,1,2,3,4"` (comma-separated list of unique ints of length `layerCount`)
+
+Parsing rules:
+- If missing/invalid: default order is `[0..layerCount-1]`
+- Valid order must:
+  - parse to ints
+  - contain exactly `layerCount` items
+  - be a permutation of `0..layerCount-1`
+- If invalid → ignore and fallback to default.
+
+### Render rules (authoritative)
+
+Replace “render slice i at position from i” with:
+- Determine `order[]`.
+- For visual stack position `p` in `0..layerCount-1`:
+  - let `layerIndex = order[p]`
+  - render that layer at position corresponding to `p` (stack axis position)
+  - apply props (hidden/opacity/solo) based on `layerIndex` (logical identity)
+
+This makes reorder purely a *mapping from visual stack positions → logical layer indices*.
+
+### Selection behavior across reorder (important)
+
+Selection is stored as logical index:
+- `"ui.selection.layerIndex" = "<layerIndex>"`
+
+After reorder:
+- The selected logical layer remains selected (same index).
+- It simply appears at a different visual position (wherever `order` places it).
+
+### UX options (pick MVP)
+
+**MVP (recommended):** reorder via a minimal overlay “layer strip” with draggable handles.
+- A vertical list of small “ticks” or labels for each layer index.
+- Dragging a tick changes the order.
+- Commit reorder only on pointer up (preview while dragging).
+
+(We avoid panel-first UI but give a reorder affordance that doesn’t require precision dragging in 3D space.)
+
+**Alternate (later):** reorder by dragging a slice in 3D along stack axis and swapping when it crosses neighbors.
+
+For now, do MVP overlay.
+
+### Patch spam policy
+
+- While dragging: keep `previewOrder: number[] | null` in App state (no patches).
+- On pointer up: emit **one** GraphPatch to persist `"ui.layers.order"` with `order="..."`.
+- If preview results in default order, optionally delete the order annotation.
+
+### Files to change / add
+
+| File | Action | Notes |
+|------|--------|------|
+| `src/core/selectors.ts` | Modify | Add `findLayerOrder(state, spaceId)` + `serializeOrder(order)` + validation helpers. |
+| `src/App.tsx` | Modify | Add `previewOrder: number[] | null`. Provide `onReorderPreview(order)` + `onReorderCommit(order)`. Persist via GraphPatch. |
+| `src/ui/SpaceViewport.tsx` | Modify | Render layers by `effectiveOrder = previewOrder ?? persistedOrder`. Positions use visual index `p`, props use logical `layerIndex`. |
+| `src/ui/LayerReorderHUD.tsx` | Create | Minimal overlay reorder UI (ticks/list). Preview + commit. No TS hard-coded colors. |
+| `src/core/applyPatch.test.ts` | Modify | Add tests: order annotation create/update/invalid fallback parsing. |
+
+### Acceptance criteria
+
+- You can reorder layers via HUD drag.
+- Reorder previews live (visual positions update while dragging).
+- On release, exactly one patch is committed.
+- Reorder persists across refresh.
+- Selection + solo/hidden/opacity continue to apply to the same logical layer index after reorder.
+- Undo/redo works (via Slice 5).
+- Typecheck/lint/tests pass.
+
+### TODO
+
+- [ ] Add `findLayerOrder` selector with strict validation + default fallback.
+- [ ] Add `previewOrder` + commit handler in App.
+- [ ] Update SpaceViewport rendering to use `effectiveOrder`.
+- [ ] Implement `LayerReorderHUD` overlay:
+  - [ ] show layer “ticks” in current order
+  - [ ] drag to reorder (preview)
+  - [ ] commit on pointer up
+- [ ] Extend tests for order annotation parsing + persistence.
+- [ ] Run `pnpm typecheck && pnpm test && pnpm lint`.
+
+---
+
+
 
 ### Final
 - [ ] Run `pnpm typecheck`
