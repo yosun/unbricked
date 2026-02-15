@@ -1,10 +1,11 @@
 import React, { useCallback, useRef } from "react";
 import { Canvas, useThree } from "@react-three/fiber";
-import { OrbitControls } from "@react-three/drei";
+import { OrbitControls, Text } from "@react-three/drei";
 import { DoubleSide, Plane, Raycaster, Vector3 } from "three";
 import type { ThreeEvent } from "@react-three/fiber";
 import LayerScrubber from "./LayerScrubber";
 import LayerControlsHUD from "./LayerControlsHUD";
+import LayerReorderHUD from "./LayerReorderHUD";
 import CameraRig from "./CameraRig";
 import type { AnimPhase } from "./CameraRig";
 
@@ -12,6 +13,12 @@ import type { AnimPhase } from "./CameraRig";
 const PRISM_W = 4;
 const PRISM_H = 2.5;
 const PRISM_D = 3;
+
+/** Distinct hue per logical layer index (evenly spaced around the wheel). */
+function layerHue(layerIdx: number, layerCount: number): string {
+  const hue = Math.round((layerIdx / Math.max(layerCount, 1)) * 360);
+  return `hsl(${String(hue)}, 55%, 65%)`;
+}
 
 function layerY(index: number, layerCount: number): number {
   const t = layerCount <= 1 ? 0.5 : index / (layerCount - 1);
@@ -36,13 +43,13 @@ interface SpacePrismProps {
   layerCount: number;
   selectedLayerIndex: number | null;
   layerVisibility: LayerVis[];
+  layerOrder: number[];
   onSelectLayer: (index: number) => void;
 }
 
 function SpacePrism(props: SpacePrismProps): React.JSX.Element {
-  const { layerCount, selectedLayerIndex, layerVisibility, onSelectLayer } = props;
+  const { layerCount, selectedLayerIndex, layerVisibility, layerOrder, onSelectLayer } = props;
 
-  const layers = Array.from({ length: layerCount }, (_, i) => i);
   return (
     <group>
       <mesh>
@@ -50,36 +57,49 @@ function SpacePrism(props: SpacePrismProps): React.JSX.Element {
         <meshBasicMaterial wireframe transparent opacity={0.4} color="#8888aa" />
       </mesh>
 
-      {layers.map((i) => {
-        const vis = layerVisibility[i];
+      {layerOrder.map((layerIdx, posIdx) => {
+        const vis = layerVisibility[layerIdx];
         if (vis && !vis.visible) return null;
 
-        const y = layerY(i, layerCount);
-        const selected = i === selectedLayerIndex;
+        // posIdx determines visual stack position; layerIdx is the logical identity
+        const y = layerY(posIdx, layerCount);
+        const selected = layerIdx === selectedLayerIndex;
         const scale: [number, number, number] = selected
           ? [1.02, 1.02, 1.02]
           : [1, 1, 1];
         const opacity = vis ? vis.opacity : (selected ? 0.30 : 0.10);
+        const color = selected ? "#7ec8e3" : layerHue(layerIdx, layerCount);
         return (
-          <mesh
-            key={i}
-            position={[0, y, 0]}
-            rotation={[Math.PI / 2, 0, 0]}
-            scale={scale}
-            onClick={(e) => {
-              e.stopPropagation();
-              onSelectLayer(i);
-            }}
-          >
-            <planeGeometry args={[PRISM_W * 0.96, PRISM_D * 0.96]} />
-            <meshBasicMaterial
-              transparent
-              opacity={opacity}
-              color={selected ? "#7ec8e3" : "#ccccdd"}
-              depthWrite={false}
-              side={DoubleSide}
-            />
-          </mesh>
+          <group key={layerIdx} position={[0, y, 0]}>
+            <mesh
+              rotation={[Math.PI / 2, 0, 0]}
+              scale={scale}
+              onClick={(e) => {
+                e.stopPropagation();
+                onSelectLayer(layerIdx);
+              }}
+            >
+              <planeGeometry args={[PRISM_W * 0.96, PRISM_D * 0.96]} />
+              <meshBasicMaterial
+                transparent
+                opacity={opacity}
+                color={color}
+                depthWrite={false}
+                side={DoubleSide}
+              />
+            </mesh>
+            <Text
+              position={[0, 0.01, 0]}
+              rotation={[-Math.PI / 2, 0, 0]}
+              fontSize={0.5}
+              color={color}
+              anchorX="center"
+              anchorY="middle"
+              fillOpacity={Math.min(1, opacity * 3)}
+            >
+              {String(layerIdx)}
+            </Text>
+          </group>
         );
       })}
     </group>
@@ -91,6 +111,7 @@ function SpacePrism(props: SpacePrismProps): React.JSX.Element {
 interface ScrubberPlaneProps {
   layerCount: number;
   selectedLayerIndex: number | null;
+  layerOrder: number[];
   onPreviewLayer: (index: number | null) => void;
   onCommitLayer: (index: number) => void;
 }
@@ -100,14 +121,17 @@ const _intersection = new Vector3();
 const _raycaster = new Raycaster();
 
 function ScrubberPlane(props: ScrubberPlaneProps): React.JSX.Element | null {
-  const { layerCount, selectedLayerIndex, onPreviewLayer, onCommitLayer } = props;
+  const { layerCount, selectedLayerIndex, layerOrder, onPreviewLayer, onCommitLayer } = props;
   const { camera, controls } = useThree();
   const dragging = useRef(false);
   const startY = useRef(0);
   const startLayerY = useRef(0);
 
-  const currentIndex = selectedLayerIndex ?? 0;
-  const y = layerY(currentIndex, layerCount);
+  // Find the visual position of the selected logical layer
+  const currentLogical = selectedLayerIndex ?? 0;
+  const visualPos = layerOrder.indexOf(currentLogical);
+  const currentVisual = visualPos >= 0 ? visualPos : 0;
+  const y = layerY(currentVisual, layerCount);
 
   const handlePointerDown = useCallback(
     (e: ThreeEvent<PointerEvent>) => {
@@ -124,9 +148,9 @@ function ScrubberPlane(props: ScrubberPlaneProps): React.JSX.Element | null {
       camera.getWorldDirection(camDir);
       _dragPlane.setFromNormalAndCoplanarPoint(camDir, e.point);
       startY.current = e.point.y;
-      startLayerY.current = layerY(currentIndex, layerCount);
+      startLayerY.current = layerY(currentVisual, layerCount);
     },
-    [camera, controls, currentIndex, layerCount],
+    [camera, controls, currentVisual, layerCount],
   );
 
   const handlePointerMove = useCallback(
@@ -140,11 +164,13 @@ function ScrubberPlane(props: ScrubberPlaneProps): React.JSX.Element | null {
         const deltaY = _intersection.y - startY.current;
         const newY = startLayerY.current + deltaY;
         const continuous = yToLayerContinuous(newY, layerCount);
-        const snapped = clampLayerIndex(continuous, layerCount);
-        onPreviewLayer(snapped);
+        const snappedVisual = clampLayerIndex(continuous, layerCount);
+        // Map visual position back to logical layer index
+        const logicalIdx = layerOrder[snappedVisual] ?? snappedVisual;
+        onPreviewLayer(logicalIdx);
       }
     },
-    [camera, layerCount, onPreviewLayer],
+    [camera, layerCount, layerOrder, onPreviewLayer],
   );
 
   const handlePointerUp = useCallback(
@@ -158,18 +184,19 @@ function ScrubberPlane(props: ScrubberPlaneProps): React.JSX.Element | null {
 
       // Final snap
       _raycaster.setFromCamera(e.pointer, camera);
-      let finalIndex = currentIndex;
+      let finalLogical = currentLogical;
       if (_raycaster.ray.intersectPlane(_dragPlane, _intersection)) {
         const deltaY = _intersection.y - startY.current;
         const newY = startLayerY.current + deltaY;
         const continuous = yToLayerContinuous(newY, layerCount);
-        finalIndex = clampLayerIndex(continuous, layerCount);
+        const snappedVisual = clampLayerIndex(continuous, layerCount);
+        finalLogical = layerOrder[snappedVisual] ?? snappedVisual;
       }
 
       onPreviewLayer(null);
-      onCommitLayer(finalIndex);
+      onCommitLayer(finalLogical);
     },
-    [camera, controls, layerCount, currentIndex, onPreviewLayer, onCommitLayer],
+    [camera, controls, layerCount, layerOrder, currentLogical, onPreviewLayer, onCommitLayer],
   );
 
   return (
@@ -215,6 +242,9 @@ interface SpaceViewportProps {
   onPreviewOpacity: (value: number | null) => void;
   onCommitOpacity: (index: number, value: number) => void;
   persistedOpacity: number;
+  layerOrder: number[];
+  onPreviewOrder: (order: number[] | null) => void;
+  onCommitOrder: (order: number[]) => void;
   animPhase: AnimPhase;
   onAnimDone: () => void;
 }
@@ -232,6 +262,9 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
     onPreviewOpacity,
     onCommitOpacity,
     persistedOpacity,
+    layerOrder,
+    onPreviewOrder,
+    onCommitOrder,
     animPhase,
     onAnimDone,
   } = props;
@@ -250,11 +283,13 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
           layerCount={layerCount}
           selectedLayerIndex={selectedLayerIndex}
           layerVisibility={layerVisibility}
+          layerOrder={layerOrder}
           onSelectLayer={onSelectLayer}
         />
         <ScrubberPlane
           layerCount={layerCount}
           selectedLayerIndex={selectedLayerIndex}
+          layerOrder={layerOrder}
           onPreviewLayer={onPreviewLayer}
           onCommitLayer={onSelectLayer}
         />
@@ -274,6 +309,7 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
       <LayerScrubber
         layerCount={layerCount}
         selectedIndex={selectedLayerIndex}
+        layerOrder={layerOrder}
         onPreview={onPreviewLayer}
         onCommit={onSelectLayer}
       />
@@ -289,6 +325,13 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
           onCommitOpacity={onCommitOpacity}
         />
       )}
+      <LayerReorderHUD
+        layerCount={layerCount}
+        order={layerOrder}
+        selectedLayerIndex={selectedLayerIndex}
+        onPreviewOrder={onPreviewOrder}
+        onCommitOrder={onCommitOrder}
+      />
     </div>
   );
 }

@@ -3,6 +3,9 @@ import {
   applyPatch,
   findLayerSelection,
   findLayerProps,
+  findLayerOrder,
+  defaultLayerOrder,
+  serializeOrder,
   isHidden,
   opacityMultiplier,
   soloIndex,
@@ -31,6 +34,7 @@ export default function App(): React.JSX.Element {
   const [redoCount, setRedoCount] = useState(0);
   const [previewLayerIndex, setPreviewLayerIndex] = useState<number | null>(null);
   const [previewOpacity, setPreviewOpacity] = useState<number | null>(null);
+  const [previewOrder, setPreviewOrder] = useState<number[] | null>(null);
   const [animPhase, setAnimPhase] = useState<AnimPhase>("intro");
   const [isTopDown, setIsTopDown] = useState(false);
 
@@ -120,8 +124,14 @@ export default function App(): React.JSX.Element {
     [state, rootSpaceId],
   );
 
+  const persistedLayerOrder = useMemo(() => {
+    const found = findLayerOrder(state, rootSpaceId);
+    return found ? found : null;
+  }, [state, rootSpaceId]);
+
   // Build per-layer visibility/opacity for SpaceViewport
   const layerCount = rootSpace?.layerCount ?? 1;
+  const effectiveOrder = previewOrder ?? persistedLayerOrder?.order ?? defaultLayerOrder(layerCount);
   const solo = soloIndex(layerProps, layerCount);
   const layerVisibility = useMemo(() => {
     const result: Array<{ visible: boolean; opacity: number }> = [];
@@ -208,6 +218,39 @@ export default function App(): React.JSX.Element {
       });
     },
     [emitPropsUpdate],
+  );
+
+  const handleCommitOrder = useCallback(
+    (order: number[]) => {
+      // If it's the default order, delete the annotation instead
+      const isDefault = order.every((v, i) => v === i);
+      commitPatch((prev) => {
+        const existing = findLayerOrder(prev, rootSpaceId);
+        if (isDefault) {
+          if (!existing) return null;
+          return newPatch({
+            baseRevision: prev.revision,
+            ops: [delOp("Annotation", existing.annotationId)],
+          });
+        }
+        const annId: AnnotationId = existing
+          ? existing.annotationId
+          : makeId("annotation");
+        const annotationValue: JsonObject = {
+          id: annId,
+          kind: "Annotation",
+          target: { kind: "Space", id: rootSpaceId },
+          schema: "ui.layers.order",
+          data: { order: serializeOrder(order) },
+          createdAt: new Date().toISOString(),
+        };
+        return newPatch({
+          baseRevision: prev.revision,
+          ops: [putOp("Annotation", annId, annotationValue)],
+        });
+      });
+    },
+    [rootSpaceId, commitPatch],
   );
 
   const handleCommitOpacity = useCallback(
@@ -385,6 +428,7 @@ export default function App(): React.JSX.Element {
               setRedoCount(0);
               setPreviewLayerIndex(null);
               setPreviewOpacity(null);
+              setPreviewOrder(null);
             }}
             style={{
               marginLeft: 6,
@@ -414,6 +458,9 @@ export default function App(): React.JSX.Element {
         onPreviewOpacity={setPreviewOpacity}
         onCommitOpacity={handleCommitOpacity}
         persistedOpacity={effectiveSelectedIndex !== null ? opacityMultiplier(layerProps, effectiveSelectedIndex, layerCount) : 1.0}
+        layerOrder={effectiveOrder}
+        onPreviewOrder={setPreviewOrder}
+        onCommitOrder={handleCommitOrder}
         animPhase={animPhase}
         onAnimDone={handleAnimDone}
       />

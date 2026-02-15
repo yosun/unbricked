@@ -87,3 +87,75 @@ export function soloIndex(
   if (idx < 0 || idx >= layerCount) return null;
   return idx;
 }
+
+/* ── Layer order ─────────────────────────────────── */
+
+export interface LayerOrder {
+  annotationId: AnnotationId;
+  order: number[];
+}
+
+/**
+ * Parse and validate a persisted layer order annotation.
+ * Returns `null` if no valid order annotation exists;
+ * callers should fall back to the default `[0..layerCount-1]`.
+ */
+export function findLayerOrder(
+  state: ProjectState,
+  spaceId: SpaceId,
+): LayerOrder | null {
+  const ann = Object.values(state.annotations).find(
+    (a) =>
+      a.target.kind === "Space" &&
+      a.target.id === spaceId &&
+      a.schema === "ui.layers.order",
+  );
+  if (!ann) return null;
+
+  const raw = ann.data["order"];
+  if (raw === undefined) return null;
+
+  const space = state.spaces[spaceId];
+  if (!space) return null;
+
+  const order = parseLayerOrder(raw, space.layerCount);
+  if (!order) return null;
+
+  return { annotationId: ann.id, order };
+}
+
+/**
+ * Parse a comma-separated order string and validate it is a
+ * permutation of `[0..layerCount-1]`. Returns `null` if invalid.
+ */
+export function parseLayerOrder(
+  raw: string,
+  layerCount: number,
+): number[] | null {
+  const parts = raw.split(",");
+  if (parts.length !== layerCount) return null;
+
+  const order: number[] = [];
+  const seen = new Set<number>();
+  for (const part of parts) {
+    const n = Number(part);
+    if (!Number.isFinite(n)) return null;
+    const idx = Math.trunc(n);
+    if (idx < 0 || idx >= layerCount) return null;
+    if (seen.has(idx)) return null;
+    seen.add(idx);
+    order.push(idx);
+  }
+
+  return order;
+}
+
+/** Build the default order `[0, 1, 2, ..., layerCount-1]`. */
+export function defaultLayerOrder(layerCount: number): number[] {
+  return Array.from({ length: layerCount }, (_, i) => i);
+}
+
+/** Serialize an order array to the persisted comma-separated string. */
+export function serializeOrder(order: number[]): string {
+  return order.join(",");
+}

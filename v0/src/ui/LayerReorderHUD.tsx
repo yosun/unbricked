@@ -1,0 +1,216 @@
+import React, { useCallback, useRef, useState } from "react";
+
+interface LayerReorderHUDProps {
+  layerCount: number;
+  order: number[];
+  selectedLayerIndex: number | null;
+  onPreviewOrder: (order: number[] | null) => void;
+  onCommitOrder: (order: number[]) => void;
+}
+
+const ITEM_H = 32;
+
+/** Distinct hue per logical layer (matches SpaceViewport). */
+function layerColor(layerIdx: number, layerCount: number): string {
+  const hue = Math.round((layerIdx / Math.max(layerCount, 1)) * 360);
+  return `hsl(${String(hue)}, 55%, 65%)`;
+}
+
+export default function LayerReorderHUD(
+  props: LayerReorderHUDProps,
+): React.JSX.Element {
+  const {
+    layerCount,
+    order,
+    selectedLayerIndex,
+    onPreviewOrder,
+    onCommitOrder,
+  } = props;
+
+  const [dragIndex, setDragIndex] = useState<number | null>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const startY = useRef(0);
+  const currentOrder = useRef(order);
+
+  // Update currentOrder ref when order prop changes (but not during drag)
+  if (dragIndex === null) {
+    currentOrder.current = order;
+  }
+
+  // We display top-to-bottom = highest stack position first.
+  // "viewIndex" is the row index in the visual list (0 = top row = highest position).
+  // Conversion: viewIndex = layerCount - 1 - posIdx, posIdx = layerCount - 1 - viewIndex
+
+  const handlePointerDown = useCallback(
+    (viewIndex: number, e: React.PointerEvent<HTMLDivElement>) => {
+      e.preventDefault();
+      e.stopPropagation();
+      (e.target as HTMLElement).setPointerCapture(e.pointerId);
+      setDragIndex(viewIndex);
+      startY.current = e.clientY;
+      currentOrder.current = [...order];
+    },
+    [order],
+  );
+
+  const handlePointerMove = useCallback(
+    (e: React.PointerEvent<HTMLDivElement>) => {
+      if (dragIndex === null || !containerRef.current) return;
+      e.stopPropagation();
+
+      const deltaY = e.clientY - startY.current;
+      // Require 60% of a row height before swapping — adds friction so
+      // single-slot moves don't fire too eagerly.
+      const THRESHOLD = ITEM_H * 0.6;
+      const absDelta = Math.abs(deltaY);
+      if (absDelta < THRESHOLD) return;
+      // Only move one slot at a time, in the drag direction
+      const direction = deltaY > 0 ? 1 : -1;
+      const targetView = Math.max(
+        0,
+        Math.min(layerCount - 1, dragIndex + direction),
+      );
+
+      if (targetView !== dragIndex) {
+        // Convert view indices to position indices in the order array
+        const fromPos = layerCount - 1 - dragIndex;
+        const toPos = layerCount - 1 - targetView;
+        const newOrder = [...currentOrder.current];
+        const [item] = newOrder.splice(fromPos, 1);
+        if (item === undefined) return;
+        newOrder.splice(toPos, 0, item);
+        currentOrder.current = newOrder;
+        setDragIndex(targetView);
+        // Reset anchor to current cursor position so the threshold
+        // must be exceeded again for the next swap.
+        startY.current = e.clientY;
+        onPreviewOrder(newOrder);
+      }
+    },
+    [dragIndex, layerCount, onPreviewOrder],
+  );
+
+  const handlePointerUp = useCallback(
+    (e: React.PointerEvent<HTMLDivElement>) => {
+      if (dragIndex === null) return;
+      e.stopPropagation();
+      const finalOrder = currentOrder.current;
+      setDragIndex(null);
+      onPreviewOrder(null);
+      onCommitOrder(finalOrder);
+    },
+    [dragIndex, onPreviewOrder, onCommitOrder],
+  );
+
+  const handlePointerCancel = useCallback(() => {
+    setDragIndex(null);
+    onPreviewOrder(null);
+  }, [onPreviewOrder]);
+
+  const displayOrder = currentOrder.current;
+
+  return (
+    <div
+      ref={containerRef}
+      onPointerMove={handlePointerMove}
+      onPointerUp={handlePointerUp}
+      onPointerCancel={handlePointerCancel}
+      style={{
+        position: "absolute",
+        left: 12,
+        top: 60,
+        width: 72,
+        display: "flex",
+        flexDirection: "column",
+        gap: 2,
+        padding: "6px 0",
+        borderRadius: 8,
+        background: "var(--hud-bg)",
+        border: "1px solid var(--hud-border)",
+        zIndex: 10,
+        userSelect: "none",
+        touchAction: "none",
+      }}
+    >
+      <div
+        style={{
+          fontSize: 9,
+          textTransform: "uppercase",
+          letterSpacing: 1,
+          color: "var(--hud-muted)",
+          padding: "0 8px 4px",
+        }}
+      >
+        Order
+      </div>
+      {Array.from({ length: layerCount }, (_, viewIdx) => {
+        // viewIdx 0 = top row = highest stack position
+        const posIdx = layerCount - 1 - viewIdx;
+        const layerIdx = displayOrder[posIdx] ?? posIdx;
+        const isSelected = layerIdx === selectedLayerIndex;
+        const isDragging = viewIdx === dragIndex;
+        const color = layerColor(layerIdx, layerCount);
+        return (
+          <div
+            key={layerIdx}
+            onPointerDown={(e) => {
+              handlePointerDown(viewIdx, e);
+            }}
+            style={{
+              height: ITEM_H,
+              display: "flex",
+              alignItems: "center",
+              gap: 6,
+              padding: "0 8px",
+              cursor: isDragging ? "grabbing" : "grab",
+              borderRadius: 4,
+              background: isDragging
+                ? "var(--hud-active)"
+                : isSelected
+                  ? "rgba(126, 200, 227, 0.12)"
+                  : "transparent",
+              border: isDragging
+                ? "1px solid var(--scrubber-active)"
+                : "1px solid transparent",
+              transition: isDragging ? "none" : "background 0.15s",
+            }}
+          >
+            {/* Drag handle icon */}
+            <span
+              style={{
+                fontSize: 11,
+                lineHeight: 1,
+                color: "var(--hud-muted)",
+                cursor: "inherit",
+              }}
+            >
+              ⠿
+            </span>
+            {/* Color swatch */}
+            <span
+              style={{
+                width: 10,
+                height: 10,
+                borderRadius: 2,
+                background: color,
+                flexShrink: 0,
+              }}
+            />
+            {/* Label */}
+            <span
+              style={{
+                fontSize: 12,
+                color: isSelected
+                  ? "var(--scrubber-active)"
+                  : "var(--hud-text)",
+                fontWeight: isSelected ? 600 : 400,
+              }}
+            >
+              L{layerIdx}
+            </span>
+          </div>
+        );
+      })}
+    </div>
+  );
+}

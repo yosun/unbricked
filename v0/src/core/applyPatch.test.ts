@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { applyPatch } from "./applyPatch";
 import { newPatch, putOp, delOp } from "./graphPatch";
 import { makeId } from "./ids";
-import { findLayerSelection, findLayerProps, isHidden, opacityMultiplier, soloIndex } from "./selectors";
+import { findLayerSelection, findLayerProps, isHidden, opacityMultiplier, soloIndex, findLayerOrder, parseLayerOrder, defaultLayerOrder, serializeOrder } from "./selectors";
 import { sampleProject } from "./sampleProject";
 import type { AnnotationId, JsonObject } from "./types";
 
@@ -510,5 +510,167 @@ describe("applyPatch — snapshot isolation (undo/redo safety)", () => {
 
     // baseState must be unaffected
     expect(baseState.spaces[rootSpaceId].name).toBe("Root Space");
+  });
+});
+
+describe("applyPatch — layer order annotation", () => {
+  const baseState = sampleProject.state;
+  const rootSpaceId = baseState.manifest.rootSpaceId;
+  const rootSpace = baseState.spaces[rootSpaceId];
+  if (!rootSpace) throw new Error("root space missing");
+
+  function makeOrderAnnotation(annId: string, order: string): JsonObject {
+    return {
+      id: annId,
+      kind: "Annotation",
+      target: { kind: "Space", id: rootSpaceId },
+      schema: "ui.layers.order",
+      data: { order },
+      createdAt: new Date().toISOString(),
+    };
+  }
+
+  it("creates an order annotation via put", () => {
+    const annId = makeId("annotation");
+    const order = "6,5,4,3,2,1,0";
+    const patch = newPatch({
+      baseRevision: baseState.revision,
+      ops: [putOp("Annotation", annId, makeOrderAnnotation(annId, order))],
+    });
+
+    const next = applyPatch(baseState, patch);
+    const found = findLayerOrder(next, rootSpaceId);
+    expect(found).not.toBeNull();
+    if (!found) throw new Error("order missing");
+    expect(found.annotationId).toBe(annId);
+    expect(found.order).toEqual([6, 5, 4, 3, 2, 1, 0]);
+  });
+
+  it("overwrites order annotation with same id", () => {
+    const annId = makeId("annotation");
+
+    const patch1 = newPatch({
+      baseRevision: baseState.revision,
+      ops: [putOp("Annotation", annId, makeOrderAnnotation(annId, "6,5,4,3,2,1,0"))],
+    });
+    const state1 = applyPatch(baseState, patch1);
+
+    const patch2 = newPatch({
+      baseRevision: state1.revision,
+      ops: [putOp("Annotation", annId, makeOrderAnnotation(annId, "1,0,2,3,4,5,6"))],
+    });
+    const state2 = applyPatch(state1, patch2);
+
+    const found = findLayerOrder(state2, rootSpaceId);
+    if (!found) throw new Error("order missing");
+    expect(found.order).toEqual([1, 0, 2, 3, 4, 5, 6]);
+  });
+
+  it("clears order annotation via del", () => {
+    const annId = makeId("annotation");
+
+    const patch1 = newPatch({
+      baseRevision: baseState.revision,
+      ops: [putOp("Annotation", annId, makeOrderAnnotation(annId, "6,5,4,3,2,1,0"))],
+    });
+    const state1 = applyPatch(baseState, patch1);
+    expect(findLayerOrder(state1, rootSpaceId)).not.toBeNull();
+
+    const patch2 = newPatch({
+      baseRevision: state1.revision,
+      ops: [delOp("Annotation", annId)],
+    });
+    const state2 = applyPatch(state1, patch2);
+    expect(findLayerOrder(state2, rootSpaceId)).toBeNull();
+  });
+
+  it("invalid order (wrong length) → null", () => {
+    const annId = makeId("annotation");
+    const patch = newPatch({
+      baseRevision: baseState.revision,
+      ops: [putOp("Annotation", annId, makeOrderAnnotation(annId, "0,1,2"))],
+    });
+    const next = applyPatch(baseState, patch);
+    expect(findLayerOrder(next, rootSpaceId)).toBeNull();
+  });
+
+  it("invalid order (duplicate values) → null", () => {
+    const annId = makeId("annotation");
+    const patch = newPatch({
+      baseRevision: baseState.revision,
+      ops: [putOp("Annotation", annId, makeOrderAnnotation(annId, "0,0,2,3,4,5,6"))],
+    });
+    const next = applyPatch(baseState, patch);
+    expect(findLayerOrder(next, rootSpaceId)).toBeNull();
+  });
+
+  it("invalid order (out-of-range index) → null", () => {
+    const annId = makeId("annotation");
+    const patch = newPatch({
+      baseRevision: baseState.revision,
+      ops: [putOp("Annotation", annId, makeOrderAnnotation(annId, "0,1,2,3,4,5,99"))],
+    });
+    const next = applyPatch(baseState, patch);
+    expect(findLayerOrder(next, rootSpaceId)).toBeNull();
+  });
+
+  it("invalid order (NaN values) → null", () => {
+    const annId = makeId("annotation");
+    const patch = newPatch({
+      baseRevision: baseState.revision,
+      ops: [putOp("Annotation", annId, makeOrderAnnotation(annId, "0,1,abc,3,4,5,6"))],
+    });
+    const next = applyPatch(baseState, patch);
+    expect(findLayerOrder(next, rootSpaceId)).toBeNull();
+  });
+
+  it("missing order key → null", () => {
+    const annId = makeId("annotation");
+    const patch = newPatch({
+      baseRevision: baseState.revision,
+      ops: [putOp("Annotation", annId, {
+        id: annId,
+        kind: "Annotation",
+        target: { kind: "Space", id: rootSpaceId },
+        schema: "ui.layers.order",
+        data: {},
+        createdAt: new Date().toISOString(),
+      })],
+    });
+    const next = applyPatch(baseState, patch);
+    expect(findLayerOrder(next, rootSpaceId)).toBeNull();
+  });
+});
+
+describe("selectors — layer order parsing helpers", () => {
+  it("parseLayerOrder valid permutation", () => {
+    expect(parseLayerOrder("2,0,1", 3)).toEqual([2, 0, 1]);
+  });
+
+  it("parseLayerOrder wrong length → null", () => {
+    expect(parseLayerOrder("0,1", 3)).toBeNull();
+  });
+
+  it("parseLayerOrder duplicate → null", () => {
+    expect(parseLayerOrder("0,0,1", 3)).toBeNull();
+  });
+
+  it("parseLayerOrder negative → null", () => {
+    expect(parseLayerOrder("-1,0,1", 3)).toBeNull();
+  });
+
+  it("parseLayerOrder float truncated to int", () => {
+    expect(parseLayerOrder("0,1.9,2", 3)).toEqual([0, 1, 2]);
+  });
+
+  it("defaultLayerOrder returns identity", () => {
+    expect(defaultLayerOrder(5)).toEqual([0, 1, 2, 3, 4]);
+  });
+
+  it("serializeOrder round-trips with parseLayerOrder", () => {
+    const order = [3, 1, 0, 2];
+    const serialized = serializeOrder(order);
+    expect(serialized).toBe("3,1,0,2");
+    expect(parseLayerOrder(serialized, 4)).toEqual(order);
   });
 });

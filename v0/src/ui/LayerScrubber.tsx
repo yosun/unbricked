@@ -3,6 +3,7 @@ import React, { useCallback, useRef } from "react";
 interface LayerScrubberProps {
   layerCount: number;
   selectedIndex: number | null;
+  layerOrder: number[];
   onPreview: (index: number | null) => void;
   onCommit: (index: number) => void;
 }
@@ -23,7 +24,7 @@ function yToIndex(
 }
 
 export default function LayerScrubber(props: LayerScrubberProps): React.JSX.Element {
-  const { layerCount, selectedIndex, onPreview, onCommit } = props;
+  const { layerCount, selectedIndex, layerOrder, onPreview, onCommit } = props;
   const railRef = useRef<HTMLDivElement>(null);
   const dragging = useRef(false);
 
@@ -32,44 +33,49 @@ export default function LayerScrubber(props: LayerScrubberProps): React.JSX.Elem
       if (!railRef.current) return;
       e.currentTarget.setPointerCapture(e.pointerId);
       dragging.current = true;
-      const idx = yToIndex(e.clientY, railRef.current.getBoundingClientRect(), layerCount);
-      onPreview(idx);
+      const visualIdx = yToIndex(e.clientY, railRef.current.getBoundingClientRect(), layerCount);
+      const logicalIdx = layerOrder[visualIdx] ?? visualIdx;
+      onPreview(logicalIdx);
     },
-    [layerCount, onPreview],
+    [layerCount, layerOrder, onPreview],
   );
 
   const handlePointerMove = useCallback(
     (e: React.PointerEvent<HTMLDivElement>) => {
       if (!dragging.current || !railRef.current) return;
-      const idx = yToIndex(e.clientY, railRef.current.getBoundingClientRect(), layerCount);
-      onPreview(idx);
+      const visualIdx = yToIndex(e.clientY, railRef.current.getBoundingClientRect(), layerCount);
+      const logicalIdx = layerOrder[visualIdx] ?? visualIdx;
+      onPreview(logicalIdx);
     },
-    [layerCount, onPreview],
+    [layerCount, layerOrder, onPreview],
   );
 
   const handlePointerUp = useCallback(
     (e: React.PointerEvent<HTMLDivElement>) => {
       if (!railRef.current) return;
       dragging.current = false;
-      const idx = yToIndex(e.clientY, railRef.current.getBoundingClientRect(), layerCount);
+      const visualIdx = yToIndex(e.clientY, railRef.current.getBoundingClientRect(), layerCount);
+      const logicalIdx = layerOrder[visualIdx] ?? visualIdx;
       onPreview(null);
-      onCommit(idx);
+      onCommit(logicalIdx);
     },
-    [layerCount, onPreview, onCommit],
+    [layerCount, layerOrder, onPreview, onCommit],
   );
 
-  // Compute thumb position as a percentage from top (top = highest index)
+  // Compute thumb position based on visual position in the order
+  const selectedVisualPos = selectedIndex !== null ? layerOrder.indexOf(selectedIndex) : -1;
   const thumbPct =
-    selectedIndex !== null && layerCount > 1
-      ? ((layerCount - 1 - selectedIndex) / (layerCount - 1)) * 100
+    selectedVisualPos >= 0 && layerCount > 1
+      ? ((layerCount - 1 - selectedVisualPos) / (layerCount - 1)) * 100
       : null;
 
-  // Tick marks for each layer
-  const ticks = Array.from({ length: layerCount }, (_, i) => {
-    const pct = layerCount > 1 ? ((layerCount - 1 - i) / (layerCount - 1)) * 100 : 50;
+  // Tick marks for each visual position
+  const ticks = Array.from({ length: layerCount }, (_, posIdx) => {
+    const pct = layerCount > 1 ? ((layerCount - 1 - posIdx) / (layerCount - 1)) * 100 : 50;
+    const logicalIdx = layerOrder[posIdx] ?? posIdx;
     return (
       <div
-        key={i}
+        key={posIdx}
         style={{
           position: "absolute",
           top: `${String(pct)}%`,
@@ -78,7 +84,7 @@ export default function LayerScrubber(props: LayerScrubberProps): React.JSX.Elem
           height: 2,
           borderRadius: 1,
           background:
-            i === selectedIndex
+            logicalIdx === selectedIndex
               ? "var(--scrubber-active, #7ec8e3)"
               : "var(--scrubber-tick, rgba(255,255,255,0.18))",
           transform: "translateY(-1px)",
