@@ -1,4 +1,4 @@
-import React, { useCallback, useRef, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 
 interface LayerControlsHUDProps {
   layerIndex: number;
@@ -25,6 +25,8 @@ export default function LayerControlsHUD(props: LayerControlsHUDProps): React.JS
 
   const [localOpacity, setLocalOpacity] = useState(opacity);
   const dragging = useRef(false);
+  // Snapshot the value at drag-start so commit always has a valid number
+  const localRef = useRef(localOpacity);
 
   // Sync local opacity when layerIndex or persisted value changes (and not dragging)
   const prevLayerRef = useRef(layerIndex);
@@ -33,23 +35,36 @@ export default function LayerControlsHUD(props: LayerControlsHUDProps): React.JS
     prevLayerRef.current = layerIndex;
     prevOpacityRef.current = opacity;
     setLocalOpacity(opacity);
+    localRef.current = opacity;
   }
 
   const handleOpacityInput = useCallback(
     (e: React.ChangeEvent<HTMLInputElement>) => {
       const val = Number(e.target.value);
       setLocalOpacity(val);
-      dragging.current = true;
+      localRef.current = val;
       onPreviewOpacity(val);
     },
     [onPreviewOpacity],
   );
 
-  const handleOpacityCommit = useCallback(() => {
-    dragging.current = false;
-    onPreviewOpacity(null);
-    onCommitOpacity(layerIndex, localOpacity);
-  }, [layerIndex, localOpacity, onPreviewOpacity, onCommitOpacity]);
+  const handlePointerDown = useCallback(() => {
+    dragging.current = true;
+  }, []);
+
+  // Window-level pointerup so commit fires even if pointer leaves the slider
+  useEffect(() => {
+    const handlePointerUp = (): void => {
+      if (!dragging.current) return;
+      dragging.current = false;
+      onPreviewOpacity(null);
+      onCommitOpacity(layerIndex, localRef.current);
+    };
+    window.addEventListener("pointerup", handlePointerUp);
+    return () => {
+      window.removeEventListener("pointerup", handlePointerUp);
+    };
+  }, [layerIndex, onPreviewOpacity, onCommitOpacity]);
 
   return (
     <div
@@ -118,8 +133,7 @@ export default function LayerControlsHUD(props: LayerControlsHUDProps): React.JS
         step={0.01}
         value={localOpacity}
         onChange={handleOpacityInput}
-        onPointerUp={handleOpacityCommit}
-        onKeyUp={handleOpacityCommit}
+        onPointerDown={handlePointerDown}
         style={{
           width: 80,
           accentColor: "var(--scrubber-active, #7ec8e3)",
