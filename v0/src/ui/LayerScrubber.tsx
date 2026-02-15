@@ -40,6 +40,8 @@ export default function LayerScrubber(props: LayerScrubberProps): React.JSX.Elem
   const currentOrder = useRef(layerOrder);
   const originalOrder = useRef(layerOrder);
   const activePointerId = useRef<number | null>(null);
+  // Suppress the rail click that fires after a drag-release
+  const justFinishedDrag = useRef(false);
 
   // Sync ref with prop only when idle (no drag in progress).
   // Using useEffect avoids overwriting with a stale prop during the
@@ -125,6 +127,7 @@ export default function LayerScrubber(props: LayerScrubberProps): React.JSX.Elem
       const orderChanged = !movedOrder.every((v, i) => v === originalOrder.current[i]);
 
       activePointerId.current = null;
+      justFinishedDrag.current = true;
       setDragPosIdx(null);
       setDragOffsetPx(0);
       onPreview(null);
@@ -153,6 +156,11 @@ export default function LayerScrubber(props: LayerScrubberProps): React.JSX.Elem
   // Handle click on rail background (not on a tick): select nearest layer
   const handleRailClick = useCallback(
     (e: React.MouseEvent<HTMLDivElement>) => {
+      // After a drag-release the browser also fires a click — ignore it
+      if (justFinishedDrag.current) {
+        justFinishedDrag.current = false;
+        return;
+      }
       if (!railRef.current) return;
       // Only act if click was on the rail itself, not a tick
       if (e.target !== railRef.current && e.target !== railRef.current.querySelector("[data-rail-track]")) return;

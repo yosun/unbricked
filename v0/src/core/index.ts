@@ -6,3 +6,4 @@ export * from "./applyPatch";
 export * from "./selectors";
 export * from "./persistProjectState";
 export * from "./sampleProject";
+export * from "./crypto";

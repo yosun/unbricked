@@ -4,6 +4,8 @@ import {
   findLayerSelection,
   findLayerProps,
   findLayerOrder,
+  findLayerRender,
+  layerPayloadId,
   defaultLayerOrder,
   serializeOrder,
   isHidden,
@@ -13,12 +15,14 @@ import {
   newPatch,
   putOp,
   delOp,
+  sha256Hex,
   sampleProject,
   loadProjectState,
   saveProjectState,
   clearProjectState,
 } from "./core";
-import type { AnnotationId, GraphPatch, JsonObject, ProjectState } from "./core";
+import type { AnnotationId, GraphPatch, GraphPatchOp, JsonObject, PayloadId, ProjectState } from "./core";
+import { runImg2Img, fetchImageBlob } from "./services/falProxy";
 import SpaceViewport from "./ui/SpaceViewport";
 import ViewModeSwitcher from "./ui/ViewModeSwitcher";
 import type { AnimPhase } from "./ui/CameraRig";
@@ -323,6 +327,205 @@ export default function App(): React.JSX.Element {
     });
   }, [rootSpaceId, commitPatch]);
 
+  /* ── AI / Import state ───────────────────────────── */
+  const [aiRunning, setAiRunning] = useState(false);
+  const [aiError, setAiError] = useState<string | null>(null);
+  const abortRef = useRef<AbortController | null>(null);
+
+  const layerRender = useMemo(
+    () => findLayerRender(state, rootSpaceId),
+    [state, rootSpaceId],
+  );
+
+  /** Build a map of layerIndex → payload URI for texture rendering. */
+  const layerTextures = useMemo(() => {
+    const result: Record<number, string> = {};
+    for (let i = 0; i < layerCount; i++) {
+      const pid = layerPayloadId(layerRender, i);
+      if (pid) {
+        const payload = state.payloads[pid as PayloadId];
+        if (payload) {
+          result[i] = payload.uri;
+        }
+      }
+    }
+    return result;
+  }, [layerCount, layerRender, state.payloads]);
+
+  /**
+   * Helper: emit a render-mapping update patch.
+   * Takes the current render annotation (or creates one) and applies an updater.
+   */
+  const emitRenderUpdate = useCallback(
+    (
+      updater: (data: Record<string, string>) => Record<string, string>,
+      extraOps?: GraphPatchOp[],
+    ) => {
+      commitPatch((prev) => {
+        const existing = findLayerRender(prev, rootSpaceId);
+        const annId: AnnotationId = existing
+          ? existing.annotationId
+          : makeId("annotation");
+        const currentData = existing ? { ...existing.annotation.data } : {};
+        const newData = updater(currentData);
+
+        const annotationValue: JsonObject = {
+          id: annId,
+          kind: "Annotation",
+          target: { kind: "Space", id: rootSpaceId },
+          schema: "ui.layers.render",
+          data: newData,
+          createdAt: new Date().toISOString(),
+        };
+
+        const ops: GraphPatchOp[] = [
+          ...(extraOps ?? []),
+          putOp("Annotation", annId, annotationValue),
+        ];
+
+        return newPatch({ baseRevision: prev.revision, ops });
+      });
+    },
+    [rootSpaceId, commitPatch],
+  );
+
+  /** Import an image file into the selected layer. */
+  const handleImportImage = useCallback(async () => {
+    if (effectiveSelectedIndex === null) return;
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = "image/*";
+
+    const file = await new Promise<File | null>((resolve) => {
+      input.onchange = () => { resolve(input.files?.[0] ?? null); };
+      input.click();
+    });
+    if (!file) return;
+
+    const buffer = await file.arrayBuffer();
+    const hash = await sha256Hex(buffer);
+
+    // Convert to data URL for self-contained storage
+    const reader = new FileReader();
+    const dataUrl = await new Promise<string>((resolve, reject) => {
+      reader.onload = () => { resolve(reader.result as string); };
+      reader.onerror = () => { reject(new Error("Failed to read file")); };
+      reader.readAsDataURL(file);
+    });
+
+    const payloadId = makeId("payload");
+    const payloadValue: JsonObject = {
+      id: payloadId,
+      kind: "Payload",
+      mediaType: file.type || "image/png",
+      uri: dataUrl,
+      sha256: hash,
+      bytes: buffer.byteLength,
+      meta: {},
+    };
+
+    const layerIdx = effectiveSelectedIndex;
+    emitRenderUpdate(
+      (data) => ({ ...data, [`payload.${String(layerIdx)}`]: payloadId }),
+      [putOp("Payload", payloadId, payloadValue)],
+    );
+  }, [effectiveSelectedIndex, emitRenderUpdate]);
+
+  /** Run AI img2img on the selected layer's current image. */
+  const handleAiEdit = useCallback(
+    async (prompt: string, strength?: number) => {
+      if (effectiveSelectedIndex === null) return;
+      setAiError(null);
+      setAiRunning(true);
+
+      // Cancel any in-flight request
+      abortRef.current?.abort();
+      const controller = new AbortController();
+      abortRef.current = controller;
+
+      try {
+        // Get the current layer's image
+        const pid = layerPayloadId(layerRender, effectiveSelectedIndex);
+        if (!pid) {
+          throw new Error("No image on this layer. Import an image first.");
+        }
+        const payload = state.payloads[pid as PayloadId];
+        if (!payload) {
+          throw new Error("Payload not found in project state.");
+        }
+
+        const inputPayloadId = pid;
+
+        // Call the proxy
+        const result = await runImg2Img(
+          {
+            imageDataUrl: payload.uri,
+            prompt,
+            strength: strength ?? 0.75,
+          },
+          controller.signal,
+        );
+
+        const firstImage = result.images[0];
+        if (!firstImage) throw new Error("fal.ai returned no images");
+        const outputImageUrl = firstImage.url;
+
+        // Fetch the output image to compute sha256 + bytes
+        const { blob: outBlob, buffer: outBuffer } = await fetchImageBlob(
+          outputImageUrl,
+          controller.signal,
+        );
+        const outHash = await sha256Hex(outBuffer);
+
+        const outPayloadId = makeId("payload");
+        const outPayloadValue: JsonObject = {
+          id: outPayloadId,
+          kind: "Payload",
+          mediaType: outBlob.type || "image/png",
+          uri: outputImageUrl,
+          sha256: outHash,
+          bytes: outBuffer.byteLength,
+          meta: {},
+        };
+
+        // Create OperatorRun for provenance
+        const oprunId = makeId("oprun");
+        const oprunValue: JsonObject = {
+          id: oprunId,
+          kind: "OperatorRun",
+          operator: "fal.img2img",
+          status: "succeeded",
+          createdAt: new Date().toISOString(),
+          finishedAt: new Date().toISOString(),
+          inputs: [{ kind: "Payload", id: inputPayloadId }],
+          outputs: [{ kind: "Payload", id: outPayloadId }],
+          params: {
+            prompt,
+            strength: String(strength ?? 0.75),
+            proxyRoute: "fal-ai/flux/dev/image-to-image",
+          },
+        };
+
+        const layerIdx = effectiveSelectedIndex;
+        emitRenderUpdate(
+          (data) => ({ ...data, [`payload.${String(layerIdx)}`]: outPayloadId }),
+          [
+            putOp("Payload", outPayloadId, outPayloadValue),
+            putOp("OperatorRun", oprunId, oprunValue),
+          ],
+        );
+      } catch (err: unknown) {
+        if (err instanceof DOMException && err.name === "AbortError") return;
+        const msg = err instanceof Error ? err.message : "Unknown error";
+        setAiError(msg);
+      } finally {
+        setAiRunning(false);
+        abortRef.current = null;
+      }
+    },
+    [effectiveSelectedIndex, layerRender, state.payloads, emitRenderUpdate],
+  );
+
   // Helper functions for LayersPanel (needs layerProps + layerCount)
   const isHiddenFn = useCallback(
     (index: number) => isHidden(layerProps, index, layerCount),
@@ -541,6 +744,11 @@ export default function App(): React.JSX.Element {
         peekLayers={peekLayers}
         peekRail={peekRail}
         onClearSelection={handleClearSelection}
+        layerTextures={layerTextures}
+        onImportImage={() => { void handleImportImage(); }}
+        onAiEdit={(prompt, strength) => { void handleAiEdit(prompt, strength); }}
+        aiRunning={aiRunning}
+        aiError={aiError}
       />
     </div>
   );

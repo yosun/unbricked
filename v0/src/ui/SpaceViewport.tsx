@@ -1,8 +1,8 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { Canvas, useThree } from "@react-three/fiber";
 import { OrbitControls, Text } from "@react-three/drei";
-import { DoubleSide, Plane, Raycaster, Vector3 } from "three";
-import type { Camera } from "three";
+import { DoubleSide, Plane, Raycaster, Vector3, TextureLoader } from "three";
+import type { Camera, Texture } from "three";
 import type { ThreeEvent } from "@react-three/fiber";
 import LayerScrubber from "./LayerScrubber";
 import LayerControlsHUD from "./LayerControlsHUD";
@@ -56,6 +56,56 @@ interface SpacePrismProps {
   onSelectLayer: (index: number) => void;
   dragOverride?: DragOverride | null;
   suppressClicks?: boolean;
+  layerTextures: Record<number, string>;
+}
+
+/** Load a texture from a URL (data: or http) and cache by URI. */
+function useLayerTexture(uri: string | undefined): Texture | null {
+  const [texture, setTexture] = useState<Texture | null>(null);
+  const loaderRef = useRef(new TextureLoader());
+
+  useEffect(() => {
+    if (!uri) {
+      setTexture(null);
+      return;
+    }
+    let cancelled = false;
+    loaderRef.current.load(
+      uri,
+      (tex) => { if (!cancelled) setTexture(tex); },
+      undefined,
+      () => { if (!cancelled) setTexture(null); },
+    );
+    return () => { cancelled = true; };
+  }, [uri]);
+
+  return texture;
+}
+
+/** A single textured layer plane. */
+function TexturedLayerPlane({
+  uri,
+  width,
+  depth,
+}: {
+  uri: string | undefined;
+  width: number;
+  depth: number;
+}): React.JSX.Element | null {
+  const texture = useLayerTexture(uri);
+  if (!texture) return null;
+  return (
+    <mesh rotation={[Math.PI / 2, 0, 0]} position={[0, 0.02, 0]}>
+      <planeGeometry args={[width * 0.96, depth * 0.96]} />
+      <meshBasicMaterial
+        map={texture}
+        transparent
+        opacity={0.9}
+        depthWrite={false}
+        side={DoubleSide}
+      />
+    </mesh>
+  );
 }
 
 /** How far hidden layers slide to the right — fully outside the brick. */
@@ -84,7 +134,7 @@ function CameraRef({ cameraRef }: { cameraRef: React.MutableRefObject<Camera | n
 }
 
 function SpacePrism(props: SpacePrismProps): React.JSX.Element {
-  const { layerCount, selectedLayerIndex, layerVisibility, layerOrder, onSelectLayer, dragOverride, suppressClicks } = props;
+  const { layerCount, selectedLayerIndex, layerVisibility, layerOrder, onSelectLayer, dragOverride, suppressClicks, layerTextures } = props;
 
   // When a layer is being dragged, compute adjusted Y positions for non-dragged layers
   // so they "make room" without relying on parent re-renders (which cause ghost duplicates).
@@ -155,6 +205,14 @@ function SpacePrism(props: SpacePrismProps): React.JSX.Element {
                 side={DoubleSide}
               />
             </mesh>
+            {/* Texture overlay if this layer has an image */}
+            {layerTextures[layerIdx] && (
+              <TexturedLayerPlane
+                uri={layerTextures[layerIdx]}
+                width={PRISM_W}
+                depth={PRISM_D}
+              />
+            )}
             <Text
               position={[0, 0.01, 0]}
               rotation={[-Math.PI / 2, 0, 0]}
@@ -320,6 +378,11 @@ interface SpaceViewportProps {
   peekLayers: boolean;
   peekRail: boolean;
   onClearSelection: () => void;
+  layerTextures: Record<number, string>;
+  onImportImage: () => void;
+  onAiEdit: (prompt: string, strength?: number) => void;
+  aiRunning: boolean;
+  aiError: string | null;
 }
 
 export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Element {
@@ -345,6 +408,11 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
     viewMode,
     peekLayers,
     peekRail,
+    layerTextures,
+    onImportImage,
+    onAiEdit,
+    aiRunning,
+    aiError,
   } = props;
   const animating = animPhase !== "idle";
 
@@ -554,6 +622,7 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
           onSelectLayer={onSelectLayer}
           dragOverride={dragOverride}
           suppressClicks={longPressSelected || dragReorder}
+          layerTextures={layerTextures}
         />
         <ScrubberPlane
           layerCount={layerCount}
@@ -601,6 +670,11 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
           onToggleSolo={onToggleSolo}
           onPreviewOpacity={onPreviewOpacity}
           onCommitOpacity={onCommitOpacity}
+          hasImage={selectedLayerIndex in layerTextures}
+          onImportImage={onImportImage}
+          onAiEdit={onAiEdit}
+          aiRunning={aiRunning}
+          aiError={aiError}
         />
       )}
 

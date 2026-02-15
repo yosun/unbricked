@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { applyPatch } from "./applyPatch";
 import { newPatch, putOp, delOp } from "./graphPatch";
 import { makeId } from "./ids";
-import { findLayerSelection, findLayerProps, isHidden, opacityMultiplier, soloIndex, findLayerOrder, parseLayerOrder, defaultLayerOrder, serializeOrder } from "./selectors";
+import { findLayerSelection, findLayerProps, isHidden, opacityMultiplier, soloIndex, findLayerOrder, parseLayerOrder, defaultLayerOrder, serializeOrder, findLayerRender, layerPayloadId } from "./selectors";
 import { sampleProject } from "./sampleProject";
 import type { AnnotationId, JsonObject } from "./types";
 
@@ -463,7 +463,9 @@ describe("applyPatch — snapshot isolation (undo/redo safety)", () => {
     expect(sel3?.index).toBe(5);
 
     // Mutate state3's annotation data directly
-    state3.annotations[annId as AnnotationId].data["layerIndex"] = "999";
+    const ann3 = state3.annotations[annId as AnnotationId];
+    if (!ann3) throw new Error("annotation missing");
+    ann3.data["layerIndex"] = "999";
 
     // state1 and state2 must be unaffected
     expect(findLayerSelection(state1, rootSpaceId)?.index).toBe(0);
@@ -506,10 +508,13 @@ describe("applyPatch — snapshot isolation (undo/redo safety)", () => {
 
     // Mutate next.spaces
     const rootSpace = next.spaces[rootSpaceId];
+    if (!rootSpace) throw new Error("root space missing");
     next.spaces[rootSpaceId] = { ...rootSpace, name: "mutated" };
 
     // baseState must be unaffected
-    expect(baseState.spaces[rootSpaceId].name).toBe("Root Space");
+    const baseRoot = baseState.spaces[rootSpaceId];
+    if (!baseRoot) throw new Error("base root space missing");
+    expect(baseRoot.name).toBe("Root Space");
   });
 });
 
@@ -672,5 +677,190 @@ describe("selectors — layer order parsing helpers", () => {
     const serialized = serializeOrder(order);
     expect(serialized).toBe("3,1,0,2");
     expect(parseLayerOrder(serialized, 4)).toEqual(order);
+  });
+});
+
+describe("applyPatch — layer render mapping annotation", () => {
+  const baseState = sampleProject.state;
+  const rootSpaceId = baseState.manifest.rootSpaceId;
+
+  function makeRenderAnnotation(annId: string, data: Record<string, string>): JsonObject {
+    return {
+      id: annId,
+      kind: "Annotation",
+      target: { kind: "Space", id: rootSpaceId },
+      schema: "ui.layers.render",
+      data,
+      createdAt: new Date().toISOString(),
+    };
+  }
+
+  it("no render annotation → null payload for all layers", () => {
+    const render = findLayerRender(baseState, rootSpaceId);
+    expect(render).toBeNull();
+    expect(layerPayloadId(null, 0)).toBeNull();
+    expect(layerPayloadId(null, 3)).toBeNull();
+  });
+
+  it("creates render annotation with payload mapping", () => {
+    const annId = makeId("annotation");
+    const payloadId = makeId("payload");
+
+    const payloadValue: JsonObject = {
+      id: payloadId,
+      kind: "Payload",
+      mediaType: "image/png",
+      uri: "data:image/png;base64,abc",
+      sha256: "deadbeef",
+      bytes: 123,
+      meta: {},
+    };
+
+    const patch = newPatch({
+      baseRevision: baseState.revision,
+      ops: [
+        putOp("Payload", payloadId, payloadValue),
+        putOp("Annotation", annId, makeRenderAnnotation(annId, { "payload.2": payloadId })),
+      ],
+    });
+
+    const next = applyPatch(baseState, patch);
+    const render = findLayerRender(next, rootSpaceId);
+    expect(render).not.toBeNull();
+    if (!render) throw new Error("render missing");
+    expect(render.annotationId).toBe(annId);
+    expect(layerPayloadId(render, 2)).toBe(payloadId);
+    expect(layerPayloadId(render, 0)).toBeNull();
+  });
+
+  it("updates render mapping to a new payload (AI edit flow)", () => {
+    const annId = makeId("annotation");
+    const payloadId1 = makeId("payload");
+
+    const payloadValue1: JsonObject = {
+      id: payloadId1,
+      kind: "Payload",
+      mediaType: "image/png",
+      uri: "data:image/png;base64,input",
+      sha256: "aaa",
+      bytes: 100,
+      meta: {},
+    };
+
+    const patch1 = newPatch({
+      baseRevision: baseState.revision,
+      ops: [
+        putOp("Payload", payloadId1, payloadValue1),
+        putOp("Annotation", annId, makeRenderAnnotation(annId, { "payload.3": payloadId1 })),
+      ],
+    });
+    const state1 = applyPatch(baseState, patch1);
+
+    // Simulate AI edit: new payload + OperatorRun + updated render mapping
+    const payloadId2 = makeId("payload");
+    const oprunId = makeId("oprun");
+
+    const payloadValue2: JsonObject = {
+      id: payloadId2,
+      kind: "Payload",
+      mediaType: "image/png",
+      uri: "https://example.com/output.png",
+      sha256: "bbb",
+      bytes: 200,
+      meta: {},
+    };
+
+    const oprunValue: JsonObject = {
+      id: oprunId,
+      kind: "OperatorRun",
+      operator: "fal.img2img",
+      status: "succeeded",
+      createdAt: new Date().toISOString(),
+      finishedAt: new Date().toISOString(),
+      inputs: [{ kind: "Payload", id: payloadId1 }],
+      outputs: [{ kind: "Payload", id: payloadId2 }],
+      params: { prompt: "make it blue", strength: "0.75" },
+    };
+
+    const patch2 = newPatch({
+      baseRevision: state1.revision,
+      ops: [
+        putOp("Payload", payloadId2, payloadValue2),
+        putOp("OperatorRun", oprunId, oprunValue),
+        putOp("Annotation", annId, makeRenderAnnotation(annId, { "payload.3": payloadId2 })),
+      ],
+    });
+    const state2 = applyPatch(state1, patch2);
+
+    // Layer 3 now points to the new payload
+    const render = findLayerRender(state2, rootSpaceId);
+    expect(render).not.toBeNull();
+    if (!render) throw new Error("render missing");
+    expect(layerPayloadId(render, 3)).toBe(payloadId2);
+
+    // Both payloads exist
+    expect(state2.payloads[payloadId1]).toBeDefined();
+    expect(state2.payloads[payloadId2]).toBeDefined();
+
+    // OperatorRun exists with correct provenance
+    const oprun = state2.operatorRuns[oprunId];
+    expect(oprun).toBeDefined();
+    if (!oprun) throw new Error("oprun missing");
+    expect(oprun.operator).toBe("fal.img2img");
+    expect(oprun.status).toBe("succeeded");
+    expect(oprun.inputs).toEqual([{ kind: "Payload", id: payloadId1 }]);
+    expect(oprun.outputs).toEqual([{ kind: "Payload", id: payloadId2 }]);
+    expect(oprun.params["prompt"]).toBe("make it blue");
+  });
+
+  it("clears render annotation via del", () => {
+    const annId = makeId("annotation");
+    const payloadId = makeId("payload");
+
+    const payloadValue: JsonObject = {
+      id: payloadId,
+      kind: "Payload",
+      mediaType: "image/png",
+      uri: "data:image/png;base64,abc",
+      sha256: "deadbeef",
+      bytes: 123,
+      meta: {},
+    };
+
+    const patch1 = newPatch({
+      baseRevision: baseState.revision,
+      ops: [
+        putOp("Payload", payloadId, payloadValue),
+        putOp("Annotation", annId, makeRenderAnnotation(annId, { "payload.0": payloadId })),
+      ],
+    });
+    const state1 = applyPatch(baseState, patch1);
+    expect(findLayerRender(state1, rootSpaceId)).not.toBeNull();
+
+    const patch2 = newPatch({
+      baseRevision: state1.revision,
+      ops: [delOp("Annotation", annId)],
+    });
+    const state2 = applyPatch(state1, patch2);
+    expect(findLayerRender(state2, rootSpaceId)).toBeNull();
+  });
+
+  it("empty payload key → null", () => {
+    const annId = makeId("annotation");
+    const patch = newPatch({
+      baseRevision: baseState.revision,
+      ops: [putOp("Annotation", annId, makeRenderAnnotation(annId, { "payload.1": "" }))],
+    });
+    const next = applyPatch(baseState, patch);
+    const render = findLayerRender(next, rootSpaceId);
+    expect(render).not.toBeNull();
+    expect(layerPayloadId(render, 1)).toBeNull();
+  });
+});
+
+describe("selectors — layerPayloadId defaults", () => {
+  it("null render → null for any index", () => {
+    expect(layerPayloadId(null, 0)).toBeNull();
+    expect(layerPayloadId(null, 5)).toBeNull();
   });
 });

@@ -101,3 +101,9 @@ Based on observed iteration friction:
   - Slice 1: selection → Annotation → GraphPatch (plus Escape clear)
   - Slice 2: depth scrubber that writes the same selection annotation (preview vs commit to avoid patch spam)
   - Slice 2b: camera intro/reset animation (skippable on interaction)
+
+
+## fal.ai proxy contract  
+
+API Gateway URL is: https://e23fygjvzd.execute-api.us-east-1.amazonaws.com/prod/
+ Assume fal.ai maps completely in our dropin proxy

@@ -159,3 +159,41 @@ export function defaultLayerOrder(layerCount: number): number[] {
 export function serializeOrder(order: number[]): string {
   return order.join(",");
 }
+
+/* ── Layer render payload mapping ────────────────── */
+
+export interface LayerRender {
+  annotationId: AnnotationId;
+  annotation: Annotation;
+}
+
+/**
+ * Find the "ui.layers.render" annotation for a Space.
+ * Returns the annotation (which maps layer indices → payload IDs) or null.
+ */
+export function findLayerRender(
+  state: ProjectState,
+  spaceId: SpaceId,
+): LayerRender | null {
+  const ann = Object.values(state.annotations).find(
+    (a) =>
+      a.target.kind === "Space" &&
+      a.target.id === spaceId &&
+      a.schema === "ui.layers.render",
+  );
+  if (!ann) return null;
+  return { annotationId: ann.id, annotation: ann };
+}
+
+/**
+ * Get the payload ID assigned to a specific layer, or null if none.
+ */
+export function layerPayloadId(
+  render: LayerRender | null,
+  index: number,
+): string | null {
+  if (!render) return null;
+  const raw = render.annotation.data[`payload.${String(index)}`];
+  if (!raw || raw.length === 0) return null;
+  return raw;
+}

@@ -9,6 +9,11 @@ interface LayerControlsHUDProps {
   onToggleSolo: (index: number) => void;
   onPreviewOpacity: (value: number | null) => void;
   onCommitOpacity: (index: number, value: number) => void;
+  hasImage: boolean;
+  onImportImage: () => void;
+  onAiEdit: (prompt: string, strength?: number) => void;
+  aiRunning: boolean;
+  aiError: string | null;
 }
 
 function clamp01(v: number): number {
@@ -25,6 +30,11 @@ export default function LayerControlsHUD(props: LayerControlsHUDProps): React.JS
     onToggleSolo,
     onPreviewOpacity,
     onCommitOpacity,
+    hasImage,
+    onImportImage,
+    onAiEdit,
+    aiRunning,
+    aiError,
   } = props;
 
   // Local drag value: null when not dragging (use props instead)
@@ -32,10 +42,18 @@ export default function LayerControlsHUD(props: LayerControlsHUDProps): React.JS
   const dragging = useRef(false);
   const commitRef = useRef(0);
 
-  // Reset drag state when selected layer changes
+  // AI edit prompt panel
+  const [showPrompt, setShowPrompt] = useState(false);
+  const [promptText, setPromptText] = useState("");
+  const [strength, setStrength] = useState(0.75);
+
+  // Reset drag state and close prompt when selected layer changes
   useEffect(() => {
     setDragValue(null);
     dragging.current = false;
+    setShowPrompt(false);
+    setPromptText("");
+    setStrength(0.75);
   }, [layerIndex]);
 
   // effectiveOpacity: drag value while dragging, persisted prop otherwise.
@@ -155,6 +173,136 @@ export default function LayerControlsHUD(props: LayerControlsHUDProps): React.JS
       <span style={{ opacity: 0.5, minWidth: 30, textAlign: "right" }}>
         {displayPct}%
       </span>
+
+      {/* Separator */}
+      <span style={{ width: 1, height: 16, background: "var(--hud-border)", margin: "0 2px" }} />
+
+      {/* Import Image */}
+      <button
+        type="button"
+        onClick={onImportImage}
+        title="Import image onto this layer"
+        style={{
+          background: "none",
+          border: "1px solid var(--hud-border-btn)",
+          color: "var(--hud-text)",
+          borderRadius: 4,
+          padding: "2px 7px",
+          cursor: "pointer",
+          fontSize: 13,
+        }}
+      >
+        📥
+      </button>
+
+      {/* AI Edit toggle */}
+      {hasImage && (
+        <button
+          type="button"
+          onClick={() => { setShowPrompt((v) => !v); }}
+          disabled={aiRunning}
+          title="AI Edit (img2img)"
+          style={{
+            background: showPrompt ? "var(--hud-active)" : "none",
+            border: "1px solid var(--hud-border-btn)",
+            color: aiRunning ? "var(--hud-muted)" : "var(--scrubber-active)",
+            borderRadius: 4,
+            padding: "2px 7px",
+            cursor: aiRunning ? "wait" : "pointer",
+            fontSize: 13,
+          }}
+        >
+          {aiRunning ? "⏳" : "✨"}
+        </button>
+      )}
+
+      {/* AI prompt panel (shows below the HUD row) */}
+      {showPrompt && (
+        <div
+          style={{
+            position: "absolute",
+            bottom: "calc(100% + 6px)",
+            left: "50%",
+            transform: "translateX(-50%)",
+            display: "flex",
+            flexDirection: "column",
+            gap: 6,
+            padding: "8px 10px",
+            borderRadius: 6,
+            background: "var(--hud-bg)",
+            border: "1px solid var(--hud-border)",
+            color: "var(--hud-text)",
+            fontSize: 12,
+            minWidth: 240,
+            pointerEvents: "auto",
+          }}
+        >
+          <label style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+            <span style={{ opacity: 0.6 }}>Prompt</span>
+            <input
+              type="text"
+              value={promptText}
+              onChange={(e) => { setPromptText(e.target.value); }}
+              onKeyDown={(e) => {
+                e.stopPropagation();
+                if (e.key === "Enter" && promptText.trim() && !aiRunning) {
+                  onAiEdit(promptText.trim(), strength);
+                }
+              }}
+              placeholder="Describe the edit..."
+              style={{
+                background: "rgba(255,255,255,0.08)",
+                border: "1px solid var(--hud-border-btn)",
+                borderRadius: 4,
+                padding: "4px 6px",
+                color: "var(--hud-text)",
+                fontSize: 12,
+                outline: "none",
+              }}
+            />
+          </label>
+          <label style={{ display: "flex", alignItems: "center", gap: 6 }}>
+            <span style={{ opacity: 0.6, minWidth: 52 }}>Strength</span>
+            <input
+              type="range"
+              min={0}
+              max={100}
+              step={1}
+              value={Math.round(strength * 100)}
+              onChange={(e) => { setStrength(Number(e.target.value) / 100); }}
+              onKeyDown={(e) => { e.stopPropagation(); }}
+              style={{ flex: 1, accentColor: "var(--scrubber-active)", cursor: "pointer" }}
+            />
+            <span style={{ opacity: 0.5, minWidth: 30, textAlign: "right" }}>
+              {Math.round(strength * 100)}%
+            </span>
+          </label>
+          <button
+            type="button"
+            disabled={!promptText.trim() || aiRunning}
+            onClick={() => {
+              if (promptText.trim()) onAiEdit(promptText.trim(), strength);
+            }}
+            style={{
+              background: aiRunning ? "var(--hud-muted)" : "var(--scrubber-active)",
+              border: "none",
+              borderRadius: 4,
+              padding: "5px 10px",
+              color: "#111",
+              cursor: aiRunning ? "wait" : "pointer",
+              fontWeight: 600,
+              fontSize: 12,
+            }}
+          >
+            {aiRunning ? "Running…" : "Run AI Edit"}
+          </button>
+          {aiError && (
+            <div style={{ color: "#e55", fontSize: 11, wordBreak: "break-word" }}>
+              {aiError}
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }
