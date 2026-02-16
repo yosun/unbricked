@@ -1,11 +1,12 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { Canvas, useThree, useFrame } from "@react-three/fiber";
-import { OrbitControls, Text } from "@react-three/drei";
+import { OrbitControls, Text, Edges } from "@react-three/drei";
 import { DoubleSide, MathUtils, Plane, Raycaster, Vector3, TextureLoader } from "three";
 import type { Camera, Texture } from "three";
 import type { ThreeEvent } from "@react-three/fiber";
 
 export type SegmentDisplayMode = "masked" | "colored";
+import type { CropInfo } from "../services/falProxy";
 import LayerScrubber from "./LayerScrubber";
 import LayerControlsHUD from "./LayerControlsHUD";
 import LayersPanel from "./LayersPanel";
@@ -71,10 +72,13 @@ interface SpacePrismProps {
   dragOverride?: DragOverride | null;
   suppressClicks?: boolean;
   layerTextures: Record<number, string>;
+  layerCropInfo: Record<number, CropInfo>;
   imageAspect: number | null;
   /** When true, all layers start stacked at center and spread to final positions. */
   revealActive: boolean;
   onRevealDone?: () => void;
+  /** Layer index currently being AI-edited (for pulse animation), or null. */
+  aiEditingLayer?: number | null | undefined;
 }
 
 /** Lerp speed for position animations (higher = faster). */
@@ -143,33 +147,123 @@ function useLayerTexture(uri: string | undefined): Texture | null {
   return texture;
 }
 
-/** A single textured layer plane. */
+/** A single textured layer plane. Handles crop offset, AI pulse glow, and fade-in. */
 function TexturedLayerPlane({
   uri,
   width,
   depth,
   layerIdx,
   opacity,
+  crop,
+  aiEditing,
+  positionIndex,
+  selected,
 }: {
   uri: string | undefined;
   width: number;
   depth: number;
   layerIdx: number;
   opacity: number;
+  crop?: CropInfo | undefined;
+  aiEditing?: boolean | undefined;
+  /** Visual stack position (0 = bottom) for correct render ordering. */
+  positionIndex?: number | undefined;
+  selected?: boolean | undefined;
 }): React.JSX.Element | null {
   const texture = useLayerTexture(uri);
+  const matRef = useRef<import("three").MeshBasicMaterial>(null);
+  const glowRef = useRef<import("three").MeshBasicMaterial>(null);
+  // Track URI changes for fade-in
+  const prevUri = useRef(uri);
+  const fadeProgress = useRef(1); // 1 = fully visible
+  // Track AI editing state to trigger fade-in when it stops
+  const wasEditing = useRef(false);
+
+  useEffect(() => {
+    if (uri !== prevUri.current) {
+      // If the URI changed while (or just after) AI editing, fade in
+      if (wasEditing.current) {
+        fadeProgress.current = 0;
+      }
+      prevUri.current = uri;
+    }
+  }, [uri]);
+
+  useEffect(() => {
+    wasEditing.current = aiEditing ?? false;
+  }, [aiEditing]);
+
+  useFrame((_, delta) => {
+    // Fade-in animation
+    if (fadeProgress.current < 1 && matRef.current) {
+      fadeProgress.current = Math.min(1, fadeProgress.current + delta * 2.0); // ~0.5s
+      matRef.current.opacity = opacity * fadeProgress.current;
+    }
+    // Pulse glow while AI is editing
+    if (glowRef.current) {
+      if (aiEditing) {
+        const t = performance.now() / 600; // cycle period
+        glowRef.current.opacity = 0.12 + 0.18 * Math.sin(t) ** 2;
+      } else {
+        glowRef.current.opacity = 0;
+      }
+    }
+  });
+
   if (!texture) return null;
+
+  const fullW = width * 0.96;
+  const fullD = depth * 0.96;
+
+  let planeW = fullW;
+  let planeD = fullD;
+  let offX = 0;
+  let offZ = 0;
+
+  if (crop) {
+    planeW = fullW * (crop.cropW / crop.origW);
+    planeD = fullD * (crop.cropH / crop.origH);
+    offX = ((crop.cropX + crop.cropW / 2) / crop.origW - 0.5) * fullW;
+    offZ = ((crop.cropY + crop.cropH / 2) / crop.origH - 0.5) * fullD;
+  }
+
+  // Use position in stack for render ordering so upper layers draw on top
+  const baseOrder = (positionIndex ?? 0) * 10;
+
   return (
-    <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, 0.02, 0]} renderOrder={1}>
-      <planeGeometry args={[width * 0.96, depth * 0.96]} />
-      <meshBasicMaterial
-        map={texture}
-        transparent
-        opacity={opacity}
-        depthWrite={false}
-        side={DoubleSide}
-      />
-    </mesh>
+    <group>
+      <mesh rotation={[-Math.PI / 2, 0, 0]} position={[offX, 0.02, offZ]} renderOrder={baseOrder + 2}>
+        <planeGeometry args={[planeW, planeD]} />
+        <meshBasicMaterial
+          ref={matRef}
+          map={texture}
+          transparent
+          opacity={opacity * fadeProgress.current}
+          depthWrite={false}
+          side={DoubleSide}
+        />
+      </mesh>
+      {/* Glow overlay for AI editing pulse */}
+      <mesh rotation={[-Math.PI / 2, 0, 0]} position={[offX, 0.03, offZ]} renderOrder={baseOrder + 3}>
+        <planeGeometry args={[planeW, planeD]} />
+        <meshBasicMaterial
+          ref={glowRef}
+          transparent
+          opacity={0}
+          color="#7ec8e3"
+          depthWrite={false}
+          side={DoubleSide}
+        />
+      </mesh>
+      {/* Crisp white border for selected slice */}
+      {selected && (
+        <mesh rotation={[-Math.PI / 2, 0, 0]} position={[offX, 0.04, offZ]} renderOrder={baseOrder + 4}>
+          <planeGeometry args={[planeW, planeD]} />
+          <meshBasicMaterial visible={false} />
+          <Edges color="#ffffff" lineWidth={1.5} threshold={1} />
+        </mesh>
+      )}
+    </group>
   );
 }
 
@@ -198,7 +292,7 @@ function CameraRef({ cameraRef }: { cameraRef: React.MutableRefObject<Camera | n
 }
 
 function SpacePrism(props: SpacePrismProps): React.JSX.Element {
-  const { layerCount, selectedLayerIndex, layerVisibility, layerOrder, onSelectLayer, dragOverride, suppressClicks, layerTextures, imageAspect, revealActive, onRevealDone } = props;
+  const { layerCount, selectedLayerIndex, layerVisibility, layerOrder, onSelectLayer, dragOverride, suppressClicks, layerTextures, layerCropInfo, imageAspect, revealActive, onRevealDone, aiEditingLayer } = props;
   const { prismW, prismD } = prismDims(imageAspect);
   const hiddenSlideX = prismW + 0.5;
 
@@ -261,7 +355,7 @@ function SpacePrism(props: SpacePrismProps): React.JSX.Element {
         <meshBasicMaterial wireframe transparent opacity={0.4} color="#8888aa" />
       </mesh>
 
-      {positions.map(({ layerIdx, y, isDragged }) => {
+      {positions.map(({ layerIdx, y, isDragged }, positionIndex) => {
         const vis = layerVisibility[layerIdx];
         const hidden = vis ? !vis.visible : false;
         // Hidden / solo-aside layers slide to the right with smooth animation
@@ -271,17 +365,18 @@ function SpacePrism(props: SpacePrismProps): React.JSX.Element {
         const eased = t < 1 ? t * t * (3 - 2 * t) : 1; // smoothstep
         const targetY = isDragged ? y : eased * y;
         const selected = layerIdx === selectedLayerIndex;
-        const scale: [number, number, number] = selected
-          ? [1.02, 1.02, 1.02]
-          : [1, 1, 1];
+        const scale: [number, number, number] = [1, 1, 1];
         const baseOpacity = vis ? vis.opacity : (selected ? 0.30 : 0.10);
         const opacity = hidden ? Math.max(baseOpacity * 0.35, 0.06) : baseOpacity;
         const color = selected ? "#7ec8e3" : layerHue(layerIdx, layerCount);
+        // Use position in stack for render ordering so upper layers draw on top
+        const baseOrder = positionIndex * 10;
         return (
           <AnimatedLayerGroup key={layerIdx} targetX={targetX} targetY={targetY}>
             <mesh
               rotation={[Math.PI / 2, 0, 0]}
               scale={scale}
+              renderOrder={baseOrder}
               onClick={(e) => {
                 e.stopPropagation();
                 if (!suppressClicks) onSelectLayer(layerIdx);
@@ -295,6 +390,8 @@ function SpacePrism(props: SpacePrismProps): React.JSX.Element {
                 depthWrite={false}
                 side={DoubleSide}
               />
+              {/* White selection border on the colored plane */}
+              {selected && <Edges color="#ffffff" lineWidth={1.5} threshold={1} />}
             </mesh>
             {/* Texture overlay if this layer has an image */}
             {layerTextures[layerIdx] && (
@@ -304,6 +401,10 @@ function SpacePrism(props: SpacePrismProps): React.JSX.Element {
                 depth={prismD}
                 layerIdx={layerIdx}
                 opacity={vis ? vis.textureOpacity : 1}
+                crop={layerCropInfo[layerIdx]}
+                aiEditing={aiEditingLayer === layerIdx}
+                positionIndex={positionIndex}
+                selected={selected}
               />
             )}
             <Text
@@ -314,6 +415,7 @@ function SpacePrism(props: SpacePrismProps): React.JSX.Element {
               anchorX="center"
               anchorY="middle"
               fillOpacity={hidden ? 0.4 : Math.min(1, opacity * 3)}
+              renderOrder={baseOrder + 1}
             >
               {String(layerIdx)}
             </Text>
@@ -483,6 +585,7 @@ interface SpaceViewportProps {
   onClearSelection: () => void;
   layerTextures: Record<number, string>;
   colorLayerTextures: Record<number, string>;
+  layerCropInfo: Record<number, CropInfo>;
   segmentDisplayMode: SegmentDisplayMode;
   onToggleSegmentDisplay: () => void;
   revealActive: boolean;
@@ -492,6 +595,7 @@ interface SpaceViewportProps {
   onAiEdit: (prompt: string, strength?: number) => void;
   aiRunning: boolean;
   aiError: string | null;
+  onPromptVisibilityChange?: (visible: boolean) => void;
   onAddSlice: () => void;
   isMaskActiveFn: (index: number) => boolean;
   isMaskInvertedFn: (index: number) => boolean;
@@ -527,6 +631,7 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
     peekRail,
     layerTextures,
     colorLayerTextures,
+    layerCropInfo,
     segmentDisplayMode,
     onToggleSegmentDisplay,
     revealActive,
@@ -536,6 +641,7 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
     onAiEdit,
     aiRunning,
     aiError,
+    onPromptVisibilityChange,
     onAddSlice,
     isMaskActiveFn,
     isMaskInvertedFn,
@@ -758,9 +864,11 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
           dragOverride={dragOverride}
           suppressClicks={longPressSelected || dragReorder}
           layerTextures={segmentDisplayMode === "colored" ? colorLayerTextures : layerTextures}
+          layerCropInfo={layerCropInfo}
           imageAspect={imageAspect}
           revealActive={revealActive}
           onRevealDone={onRevealDone}
+          aiEditingLayer={aiRunning ? selectedLayerIndex : null}
         />
         <ScrubberPlane
           layerCount={layerCount}
@@ -849,6 +957,7 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
           onAddSlice={onAddSlice}
           aiEditModelId={aiEditModelId}
           onChangeAiEditModel={onChangeAiEditModel}
+          onPromptVisibilityChange={onPromptVisibilityChange}
         />
       )}
 

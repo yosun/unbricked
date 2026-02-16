@@ -19,6 +19,7 @@ import type {
 } from "../core";
 import { makeId, putOp } from "../core";
 import { runAutoSegment, fetchImageBlob } from "./falProxy";
+import type { CropInfo } from "./falProxy";
 import { sha256Hex } from "../core";
 
 export type OperationProgress =
@@ -189,13 +190,14 @@ async function colorizeMask(
 /**
  * Apply a binary mask to the original image: keep original pixels where
  * the mask is foreground, make everything else transparent.
- * Returns a PNG data URL.
+ * Tightly crops around the mask bounding box.
+ * Returns a PNG data URL and CropInfo for 3D positioning.
  */
 async function applyMaskToOriginal(
   maskUrl: string,
   originalBitmap: ImageBitmap,
   signal?: AbortSignal,
-): Promise<string> {
+): Promise<{ dataUrl: string; crop: CropInfo }> {
   const { blob } = await fetchImageBlob(maskUrl, signal);
   const maskBitmap = await createImageBitmap(blob);
 
@@ -231,7 +233,9 @@ async function applyMaskToOriginal(
   }
   const useAlpha = maxAlpha - minAlpha > 64;
 
+  // Apply mask + compute tight bounding box in one pass
   const data = imgData.data;
+  let minX = w, minY = h, maxX = 0, maxY = 0;
   for (let i = 0; i < data.length; i += 4) {
     const mR = mPx[i]!;
     const mG = mPx[i + 1]!;
@@ -242,12 +246,48 @@ async function applyMaskToOriginal(
       : mR > 64 || mG > 64 || mB > 64;
     if (!isForeground) {
       data[i + 3] = 0; // transparent where mask is background
+    } else {
+      const pIdx = i / 4;
+      const px = pIdx % w;
+      const py = Math.floor(pIdx / w);
+      if (px < minX) minX = px;
+      if (px > maxX) maxX = px;
+      if (py < minY) minY = py;
+      if (py > maxY) maxY = py;
     }
   }
 
   ctx.putImageData(imgData, 0, 0);
   maskBitmap.close();
-  return canvas.toDataURL("image/png");
+
+  // Fallback: if no foreground pixels found, return a 1×1 transparent image
+  if (maxX < minX || maxY < minY) {
+    const tiny = document.createElement("canvas");
+    tiny.width = 1;
+    tiny.height = 1;
+    return {
+      dataUrl: tiny.toDataURL("image/png"),
+      crop: { cropX: 0, cropY: 0, cropW: w, cropH: h, origW: w, origH: h },
+    };
+  }
+
+  const cropX = minX;
+  const cropY = minY;
+  const cropW = maxX - minX + 1;
+  const cropH = maxY - minY + 1;
+
+  // Extract the cropped region
+  const cropCanvas = document.createElement("canvas");
+  cropCanvas.width = cropW;
+  cropCanvas.height = cropH;
+  const cropCtx = cropCanvas.getContext("2d");
+  if (!cropCtx) throw new Error("Canvas 2D context unavailable");
+  cropCtx.drawImage(canvas, cropX, cropY, cropW, cropH, 0, 0, cropW, cropH);
+
+  return {
+    dataUrl: cropCanvas.toDataURL("image/png"),
+    crop: { cropX, cropY, cropW, cropH, origW: w, origH: h },
+  };
 }
 
 async function runSam3Segment(
@@ -449,9 +489,8 @@ async function runSam3Segment(
     }
     console.info(`[SAM2] ${String(subjects.length)} → ${String(deduped.length)} after dedup`);
 
-    // ── 6. Final selection: cap to 6 ──
-    const MAX_SLICES = 6;
-    masks = deduped.slice(0, MAX_SLICES);
+    // ── 6. Final selection (no hard cap — mask picker lets users refine) ──
+    masks = deduped;
     for (const m of masks) autoSelectedIdxSet.add(m.idx);
     console.info(`[SAM2] keeping ${String(masks.length)} final masks`);
   }
@@ -504,10 +543,11 @@ async function runSam3Segment(
   for (let idx = 0; idx < masks.length; idx++) {
     const mask = masks[idx]!;
 
-    const [maskedUrl, coloredUrl] = await Promise.all([
+    const [maskedResult, coloredUrl] = await Promise.all([
       applyMaskToOriginal(mask.url, originalBitmap, signal),
       colorizeMask(mask.url, idx, signal),
     ]);
+    const { dataUrl: maskedUrl, crop } = maskedResult;
     const encoder = new TextEncoder();
     const bytes = encoder.encode(maskedUrl);
     const hash = await sha256Hex(bytes.buffer as ArrayBuffer);
@@ -521,11 +561,17 @@ async function runSam3Segment(
       sha256: hash,
       bytes: bytes.byteLength,
       meta: {
-        width: String(mask.width),
-        height: String(mask.height),
+        width: String(crop.cropW),
+        height: String(crop.cropH),
         sourcePayloadId: payloadId,
         segmentIndex: String(outputPayloadIds.length),
         colorUri: coloredUrl,
+        cropX: String(crop.cropX),
+        cropY: String(crop.cropY),
+        cropW: String(crop.cropW),
+        cropH: String(crop.cropH),
+        origW: String(crop.origW),
+        origH: String(crop.origH),
       },
     };
 

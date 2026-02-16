@@ -145,8 +145,8 @@ export interface Img2ImgRequest {
 const FalImageSchema = z.object({
   url: z.string().url(),
   content_type: z.string().optional(),
-  width: z.number().optional(),
-  height: z.number().optional(),
+  width: z.number().nullish(),
+  height: z.number().nullish(),
 });
 
 const FalImg2ImgResponseSchema = z.object({
@@ -654,12 +654,17 @@ export async function invertAlpha(
  * takes the original (full) image and the current masked image, inverts the
  * alpha from the masked image, and uses it to cut out the *opposite* region
  * from the original — guaranteeing correct RGB everywhere.
+ *
+ * When `srcCrop` is provided, the masked image is placed at the correct
+ * position within the full-size canvas before inverting. The result is
+ * tightly cropped around the inverted foreground with new CropInfo.
  */
 export async function invertMaskWithOriginal(
   originalImageUrl: string,
   maskedImageUrl: string,
   signal?: AbortSignal,
-): Promise<string> {
+  srcCrop?: CropInfo | undefined,
+): Promise<{ dataUrl: string; crop: CropInfo | undefined }> {
   const [origResp, maskResp] = await Promise.all([
     fetchImageBlob(originalImageUrl, signal),
     fetchImageBlob(maskedImageUrl, signal),
@@ -682,26 +687,73 @@ export async function invertMaskWithOriginal(
   ctx.drawImage(origBitmap, 0, 0, w, h);
   const origData = ctx.getImageData(0, 0, w, h);
 
-  // Read the masked image to get its alpha channel
+  // Build the alpha channel at full size from the (possibly cropped) mask
   const maskCanvas = document.createElement("canvas");
   maskCanvas.width = w;
   maskCanvas.height = h;
   const maskCtx = maskCanvas.getContext("2d");
   if (!maskCtx) throw new Error("Canvas 2D context unavailable");
-  maskCtx.drawImage(maskBitmap, 0, 0, w, h);
+  // Clear to transparent (alpha = 0 everywhere by default)
+  maskCtx.clearRect(0, 0, w, h);
+  if (srcCrop) {
+    // Place the cropped mask at its original position
+    maskCtx.drawImage(maskBitmap, srcCrop.cropX, srcCrop.cropY, srcCrop.cropW, srcCrop.cropH);
+  } else {
+    maskCtx.drawImage(maskBitmap, 0, 0, w, h);
+  }
   const maskData = maskCtx.getImageData(0, 0, w, h);
 
-  // Apply inverted alpha from the masked image onto the original's pixels
+  // Apply inverted alpha from the mask onto the original's pixels
+  // Also compute tight bounding box of the inverted foreground
   const od = origData.data;
   const md = maskData.data;
+  let minX = w, minY = h, maxX = 0, maxY = 0;
   for (let i = 0; i < od.length; i += 4) {
-    od[i + 3] = 255 - (md[i + 3] ?? 0);
+    const invAlpha = 255 - (md[i + 3] ?? 0);
+    od[i + 3] = invAlpha;
+    if (invAlpha > 0) {
+      const pIdx = i / 4;
+      const px = pIdx % w;
+      const py = Math.floor(pIdx / w);
+      if (px < minX) minX = px;
+      if (px > maxX) maxX = px;
+      if (py < minY) minY = py;
+      if (py > maxY) maxY = py;
+    }
   }
 
   ctx.putImageData(origData, 0, 0);
   origBitmap.close();
   maskBitmap.close();
-  return canvas.toDataURL("image/png");
+
+  // If the inverted mask has foreground, tightly crop it
+  if (maxX >= minX && maxY >= minY) {
+    const cropX = minX;
+    const cropY = minY;
+    const cropW = maxX - minX + 1;
+    const cropH = maxY - minY + 1;
+
+    const cropCanvas = document.createElement("canvas");
+    cropCanvas.width = cropW;
+    cropCanvas.height = cropH;
+    const cropCtx = cropCanvas.getContext("2d");
+    if (!cropCtx) throw new Error("Canvas 2D context unavailable");
+    cropCtx.drawImage(canvas, cropX, cropY, cropW, cropH, 0, 0, cropW, cropH);
+
+    return {
+      dataUrl: cropCanvas.toDataURL("image/png"),
+      crop: { cropX, cropY, cropW, cropH, origW: w, origH: h },
+    };
+  }
+
+  // No foreground in the inverted mask — return 1×1 transparent
+  const tiny = document.createElement("canvas");
+  tiny.width = 1;
+  tiny.height = 1;
+  return {
+    dataUrl: tiny.toDataURL("image/png"),
+    crop: undefined,
+  };
 }
 
 /** Crop bounding box returned alongside the combined mask image. */
@@ -881,4 +933,235 @@ export async function runTextToImg(
 
   const json: unknown = await response.json();
   return FalTextToImgResponseSchema.parse(json);
+}
+/* ── Background Removal (fal-ai/birefnet) ───────── */
+
+const FalBirefnetResponseSchema = z.object({
+  image: FalImageSchema,
+});
+
+/**
+ * Remove the background from an image using BiRefNet via fal.ai.
+ * Returns a PNG data URL with transparent background.
+ */
+export async function runBackgroundRemoval(
+  imageUrl: string,
+  signal?: AbortSignal,
+): Promise<string> {
+  const body: Record<string, unknown> = {
+    image_url: imageUrl,
+  };
+
+  // Compress data URLs that exceed proxy payload limit
+  const overhead = JSON.stringify({ ...body, image_url: "" }).length + 128;
+  body["image_url"] = await compressDataUrl(imageUrl, overhead);
+
+  const url = `${PROXY_BASE}/fal-ai/birefnet`;
+
+  const response = await proxyFetch(
+    url,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    },
+    { timeoutMs: 120_000, signal },
+  );
+
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(`BiRefNet proxy error ${String(response.status)}: ${text}`);
+  }
+
+  const json: unknown = await response.json();
+  const parsed = FalBirefnetResponseSchema.parse(json);
+
+  // Convert to data URL to avoid CORS issues
+  const { blob } = await fetchImageBlob(parsed.image.url, signal);
+  return new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => { resolve(reader.result as string); };
+    reader.onerror = () => { reject(new Error("Failed to convert bg-removed image to data URL")); };
+    reader.readAsDataURL(blob);
+  });
+}
+
+/* ── AI Result Refit: detect mask fit & re-segment ── */
+
+/**
+ * Measure how well the AI output's visible content fits the original mask shape.
+ *
+ * Compares the alpha channels of the AI result and the original masked input.
+ * Returns a ratio (0–1) indicating how much of the AI output's non-transparent
+ * content overlaps with the original mask. A low value means the AI generated
+ * content that spills outside or is significantly different from the original
+ * mask shape.
+ *
+ * @param aiResultUrl - The AI-generated image (after applyAlphaMask).
+ * @param originalMaskedUrl - The original masked input sent to the AI.
+ * @returns IoU (intersection over union) of the two alpha masks.
+ */
+export async function measureMaskFit(
+  aiResultUrl: string,
+  originalMaskedUrl: string,
+  signal?: AbortSignal,
+): Promise<number> {
+  const [aiResp, origResp] = await Promise.all([
+    fetchImageBlob(aiResultUrl, signal),
+    fetchImageBlob(originalMaskedUrl, signal),
+  ]);
+
+  const [aiBitmap, origBitmap] = await Promise.all([
+    createImageBitmap(aiResp.blob),
+    createImageBitmap(origResp.blob),
+  ]);
+
+  // Use the original's dimensions as reference
+  const w = origBitmap.width;
+  const h = origBitmap.height;
+
+  const aiCanvas = document.createElement("canvas");
+  aiCanvas.width = w;
+  aiCanvas.height = h;
+  const aiCtx = aiCanvas.getContext("2d");
+  if (!aiCtx) throw new Error("Canvas 2D context unavailable");
+  aiCtx.drawImage(aiBitmap, 0, 0, w, h);
+  const aiData = aiCtx.getImageData(0, 0, w, h).data;
+
+  const origCanvas = document.createElement("canvas");
+  origCanvas.width = w;
+  origCanvas.height = h;
+  const origCtx = origCanvas.getContext("2d");
+  if (!origCtx) throw new Error("Canvas 2D context unavailable");
+  origCtx.drawImage(origBitmap, 0, 0, w, h);
+  const origData = origCtx.getImageData(0, 0, w, h).data;
+
+  aiBitmap.close();
+  origBitmap.close();
+
+  let intersection = 0;
+  let union = 0;
+  for (let i = 3; i < aiData.length; i += 4) {
+    const aiOpaque = aiData[i]! > 128;
+    const origOpaque = origData[i]! > 128;
+    if (aiOpaque || origOpaque) union++;
+    if (aiOpaque && origOpaque) intersection++;
+  }
+
+  return union > 0 ? intersection / union : 1;
+}
+
+/**
+ * Post-process an AI edit result for a masked segment.
+ *
+ * The AI model may generate content that doesn't match the original mask shape
+ * (e.g., "make it a cartoon" can change outlines). This function:
+ * 1. Re-applies the original alpha mask to the AI result
+ * 2. Measures how well the result fits the original mask
+ * 3. If fit is poor (IoU < threshold), runs background removal on the raw AI
+ *    output to create a fresh mask, then tight-crops the result
+ *
+ * @returns The processed image data URL and updated crop metadata.
+ */
+export async function refitAiResult(
+  rawAiOutputUrl: string,
+  originalMaskedUrl: string,
+  srcCrop: CropInfo | undefined,
+  signal?: AbortSignal,
+): Promise<{ dataUrl: string; crop: CropInfo | undefined; wasRefit: boolean }> {
+  const FIT_THRESHOLD = 0.65; // IoU below this triggers refit
+
+  // Step 1: Apply original alpha mask to get the "clamped" version
+  const clampedUrl = await applyAlphaMask(rawAiOutputUrl, originalMaskedUrl, signal);
+
+  // Step 2: Measure how well the AI content fits the original mask
+  const iou = await measureMaskFit(clampedUrl, originalMaskedUrl, signal);
+  console.info(`[AI Refit] mask fit IoU = ${(iou * 100).toFixed(1)}%`);
+
+  if (iou >= FIT_THRESHOLD) {
+    // Good fit — use the clamped result with original crop
+    return { dataUrl: clampedUrl, crop: srcCrop, wasRefit: false };
+  }
+
+  // Step 3: Poor fit — run background removal on raw AI output
+  console.info("[AI Refit] poor mask fit, running background removal on raw AI output");
+  const bgRemovedUrl = await runBackgroundRemoval(rawAiOutputUrl, signal);
+
+  // Step 4: Tight-crop the bg-removed result
+  const { blob } = await fetchImageBlob(bgRemovedUrl, signal);
+  const bitmap = await createImageBitmap(blob);
+  const w = bitmap.width;
+  const h = bitmap.height;
+
+  const canvas = document.createElement("canvas");
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) throw new Error("Canvas 2D context unavailable");
+  ctx.drawImage(bitmap, 0, 0);
+  const imgData = ctx.getImageData(0, 0, w, h);
+  const data = imgData.data;
+
+  // Compute tight bounding box from alpha
+  let minX = w, minY = h, maxX = 0, maxY = 0;
+  for (let i = 0; i < data.length; i += 4) {
+    if (data[i + 3]! > 10) { // threshold slightly above 0 for anti-aliasing
+      const pIdx = i / 4;
+      const px = pIdx % w;
+      const py = Math.floor(pIdx / w);
+      if (px < minX) minX = px;
+      if (px > maxX) maxX = px;
+      if (py < minY) minY = py;
+      if (py > maxY) maxY = py;
+    }
+  }
+
+  bitmap.close();
+
+  // Fallback: if no visible pixels, return as-is
+  if (maxX < minX || maxY < minY) {
+    return { dataUrl: bgRemovedUrl, crop: srcCrop, wasRefit: true };
+  }
+
+  const cropX = minX;
+  const cropY = minY;
+  const cropW = maxX - minX + 1;
+  const cropH = maxY - minY + 1;
+
+  // If we have source crop info, compute new crop relative to the original
+  // full image. The AI output is at the same size as the cropped input,
+  // so we need to map back to original coordinates.
+  let newCrop: CropInfo | undefined;
+  if (srcCrop) {
+    // The AI output is srcCrop.cropW × srcCrop.cropH, positioned at
+    // srcCrop.cropX, srcCrop.cropY in the original image.
+    // The new bounding box within the AI output maps to:
+    const scaleX = srcCrop.cropW / w;
+    const scaleY = srcCrop.cropH / h;
+    newCrop = {
+      cropX: srcCrop.cropX + Math.round(cropX * scaleX),
+      cropY: srcCrop.cropY + Math.round(cropY * scaleY),
+      cropW: Math.round(cropW * scaleX),
+      cropH: Math.round(cropH * scaleY),
+      origW: srcCrop.origW,
+      origH: srcCrop.origH,
+    };
+  } else {
+    newCrop = { cropX, cropY, cropW, cropH, origW: w, origH: h };
+  }
+
+  // Extract the cropped region
+  const cropCanvas = document.createElement("canvas");
+  cropCanvas.width = cropW;
+  cropCanvas.height = cropH;
+  const cropCtx = cropCanvas.getContext("2d");
+  if (!cropCtx) throw new Error("Canvas 2D context unavailable");
+  cropCtx.drawImage(canvas, cropX, cropY, cropW, cropH, 0, 0, cropW, cropH);
+
+  const croppedUrl = cropCanvas.toDataURL("image/png");
+  console.info(
+    `[AI Refit] re-cropped: ${String(cropW)}×${String(cropH)} at (${String(newCrop.cropX)},${String(newCrop.cropY)}) in ${String(newCrop.origW)}×${String(newCrop.origH)}`,
+  );
+
+  return { dataUrl: croppedUrl, crop: newCrop, wasRefit: true };
 }

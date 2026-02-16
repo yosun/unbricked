@@ -21,6 +21,7 @@ interface LayerControlsHUDProps {
   onAddSlice: () => void;
   aiEditModelId: string;
   onChangeAiEditModel: (id: string) => void;
+  onPromptVisibilityChange?: ((visible: boolean) => void) | undefined;
 }
 
 function clamp01(v: number): number {
@@ -56,7 +57,14 @@ export default function LayerControlsHUD(props: LayerControlsHUDProps): React.JS
   const commitRef = useRef(0);
 
   // AI edit prompt panel
-  const [showPrompt, setShowPrompt] = useState(false);
+  const [showPrompt, _setShowPrompt] = useState(false);
+  const setShowPrompt = useCallback((v: boolean | ((prev: boolean) => boolean)) => {
+    _setShowPrompt((prev) => {
+      const next = typeof v === "function" ? v(prev) : v;
+      if (next !== prev) props.onPromptVisibilityChange?.(next);
+      return next;
+    });
+  }, [props.onPromptVisibilityChange]);
   const [promptText, setPromptText] = useState("");
   const [strength, setStrength] = useState(0.75);
 
@@ -124,7 +132,7 @@ export default function LayerControlsHUD(props: LayerControlsHUDProps): React.JS
         color: "var(--hud-text)",
         fontSize: 13,
         pointerEvents: "auto",
-        zIndex: 10,
+        zIndex: 15,
         userSelect: "none",
       }}
     >
@@ -289,7 +297,7 @@ export default function LayerControlsHUD(props: LayerControlsHUDProps): React.JS
         </button>
       )}
 
-      {/* AI prompt panel (shows below the HUD row) */}
+      {/* AI prompt panel (shows above the HUD row) */}
       {showPrompt && (
         <div
           style={{
@@ -307,6 +315,8 @@ export default function LayerControlsHUD(props: LayerControlsHUDProps): React.JS
             color: "var(--hud-text)",
             fontSize: 12,
             minWidth: 240,
+            maxWidth: "min(360px, 60vw)",
+            zIndex: 85,
             pointerEvents: "auto",
           }}
         >
@@ -392,7 +402,17 @@ export default function LayerControlsHUD(props: LayerControlsHUDProps): React.JS
             {aiRunning ? "Running…" : "Run AI Edit"}
           </button>
           {aiError && (
-            <div style={{ color: "#e55", fontSize: 11, wordBreak: "break-word" }}>
+            <div
+              style={{
+                color: "#e55",
+                fontSize: 11,
+                wordBreak: "break-word",
+                userSelect: "text",
+                cursor: "text",
+                maxHeight: 80,
+                overflowY: "auto",
+              }}
+            >
               {aiError}
             </div>
           )}

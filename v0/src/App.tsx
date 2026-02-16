@@ -29,7 +29,8 @@ import {
 import type { AnnotationId, Edge, GraphPatch, GraphPatchOp, JsonObject, PayloadId, ProjectState, SpaceId } from "./core";
 import type { ProjectPreferences } from "./core/preferences";
 import { findPortalEdges } from "./core";
-import { runImg2Img, runTextToImg, runNanoBananaEdit, fetchImageBlob, applyAlphaMask, invertAlpha, invertMaskWithOriginal, getAiEditModel, combineMasksToOriginal } from "./services/falProxy";
+import { runImg2Img, runTextToImg, runNanoBananaEdit, fetchImageBlob, applyAlphaMask, invertAlpha, invertMaskWithOriginal, getAiEditModel, combineMasksToOriginal, refitAiResult } from "./services/falProxy";
+import type { CropInfo } from "./services/falProxy";
 import { runOperation } from "./services/operationRunner";
 import type { OperationProgress, MaskCandidate } from "./services/operationRunner";
 import SpaceViewport from "./ui/SpaceViewport";
@@ -490,6 +491,7 @@ export default function App(): React.JSX.Element {
   /* ── AI / Import state ───────────────────────────── */
   const [aiRunning, setAiRunning] = useState(false);
   const [aiError, setAiError] = useState<string | null>(null);
+  const [aiPromptOpen, setAiPromptOpen] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
 
   const layerRender = useMemo(
@@ -512,22 +514,45 @@ export default function App(): React.JSX.Element {
     const origPid = layerPayloadId(layerRender, 0);
     const origUri = origPid ? state.payloads[origPid as PayloadId]?.uri : undefined;
     for (let i = 0; i < layerCount; i++) {
+      const pid = layerPayloadId(layerRender, i);
+      const payload = pid ? state.payloads[pid as PayloadId] : undefined;
       const maskOn = isMaskActive(layerProps, i, layerCount);
-      // When mask is OFF on a slice layer, show the original image
-      if (!maskOn && i > 0 && origUri) {
+      // When mask is OFF on a slice layer whose payload is still the
+      // original segmentation mask, show the full original image instead.
+      // AI-edited payloads (no segmentIndex) always show their own URI.
+      const isOriginalMask = payload?.meta.segmentIndex !== undefined;
+      if (!maskOn && i > 0 && origUri && isOriginalMask) {
         result[i] = origUri;
         continue;
       }
-      const pid = layerPayloadId(layerRender, i);
-      if (pid) {
-        const payload = state.payloads[pid as PayloadId];
-        if (payload) {
-          result[i] = payload.uri;
-        }
+      if (payload) {
+        result[i] = payload.uri;
       }
     }
     return result;
   }, [layerCount, layerRender, state.payloads, layerProps]);
+
+  /** Build a map of layerIndex → CropInfo for layers that were tightly cropped. */
+  const layerCropInfo = useMemo(() => {
+    const result: Record<number, CropInfo> = {};
+    for (let i = 0; i < layerCount; i++) {
+      const pid = layerPayloadId(layerRender, i);
+      if (!pid) continue;
+      const payload = state.payloads[pid as PayloadId];
+      if (!payload) continue;
+      const m = payload.meta;
+      const cx = Number(m.cropX);
+      const cy = Number(m.cropY);
+      const cw = Number(m.cropW);
+      const ch = Number(m.cropH);
+      const ow = Number(m.origW);
+      const oh = Number(m.origH);
+      if (ow > 0 && oh > 0 && cw > 0 && ch > 0 && (cw < ow || ch < oh)) {
+        result[i] = { cropX: cx, cropY: cy, cropW: cw, cropH: ch, origW: ow, origH: oh };
+      }
+    }
+    return result;
+  }, [layerCount, layerRender, state.payloads]);
 
   /** Build a map of layerIndex → colored-segment URI for the "colored" display mode. */
   const colorLayerTextures = useMemo(() => {
@@ -621,8 +646,14 @@ export default function App(): React.JSX.Element {
         const origPayload = origPid ? state.payloads[origPid as PayloadId] : undefined;
 
         let invertedUrl: string;
+        let invertedCrop: CropInfo | undefined;
         if (origPayload && index > 0) {
-          invertedUrl = await invertMaskWithOriginal(origPayload.uri, payload.uri);
+          // Pass source crop info so the cropped mask is placed correctly
+          // in the full-size canvas before inverting.
+          const srcCrop = layerCropInfo[index];
+          const result = await invertMaskWithOriginal(origPayload.uri, payload.uri, undefined, srcCrop);
+          invertedUrl = result.dataUrl;
+          invertedCrop = result.crop;
         } else {
           invertedUrl = await invertAlpha(payload.uri);
         }
@@ -630,6 +661,27 @@ export default function App(): React.JSX.Element {
         const encoder = new TextEncoder();
         const bytes = encoder.encode(invertedUrl);
         const hash = await sha256Hex(bytes.buffer as ArrayBuffer);
+
+        // Build new meta: start from source, override crop with inverted bounds
+        const baseMeta = { ...(payload.meta as Record<string, string> ?? {}) };
+        if (invertedCrop) {
+          baseMeta.width = String(invertedCrop.cropW);
+          baseMeta.height = String(invertedCrop.cropH);
+          baseMeta.cropX = String(invertedCrop.cropX);
+          baseMeta.cropY = String(invertedCrop.cropY);
+          baseMeta.cropW = String(invertedCrop.cropW);
+          baseMeta.cropH = String(invertedCrop.cropH);
+          baseMeta.origW = String(invertedCrop.origW);
+          baseMeta.origH = String(invertedCrop.origH);
+        } else if (invertedCrop === undefined && origPayload && index > 0) {
+          // Inverted to nothing — remove crop fields
+          delete baseMeta.cropX;
+          delete baseMeta.cropY;
+          delete baseMeta.cropW;
+          delete baseMeta.cropH;
+          delete baseMeta.origW;
+          delete baseMeta.origH;
+        }
 
         const newPayloadId = makeId("payload");
         const newPayloadValue: JsonObject = {
@@ -640,7 +692,7 @@ export default function App(): React.JSX.Element {
           sha256: hash,
           bytes: bytes.byteLength,
           meta: {
-            ...(payload.meta as Record<string, string> ?? {}),
+            ...baseMeta,
             invertedFrom: pid,
           },
         };
@@ -664,7 +716,7 @@ export default function App(): React.JSX.Element {
         console.error("[InvertMask] failed:", err);
       }
     },
-    [layerRender, state.payloads, emitRenderUpdate, emitPropsUpdate],
+[layerRender, state.payloads, emitRenderUpdate, emitPropsUpdate, layerCropInfo],
   );
 
   /** Combine user-selected masks into a new layer. */
@@ -851,6 +903,10 @@ export default function App(): React.JSX.Element {
           throw new Error("Payload not found in project state.");
         }
 
+        // Use the *visible* texture (accounts for mask-off fallback, inversions,
+        // combined masks, etc.) so the AI receives what the user actually sees.
+        const visibleUri = layerTextures[effectiveSelectedIndex] ?? payload.uri;
+
         const inputPayloadId = pid;
         const modelDef = getAiEditModel(preferences.defaultAiEditModelId);
 
@@ -858,12 +914,12 @@ export default function App(): React.JSX.Element {
         let result;
         if (modelDef.id === "nano-banana") {
           result = await runNanoBananaEdit(
-            { imageDataUrls: [payload.uri], prompt },
+            { imageDataUrls: [visibleUri], prompt },
             controller.signal,
           );
         } else {
           result = await runImg2Img(
-            { imageDataUrl: payload.uri, prompt, strength: strength ?? 0.75 },
+            { imageDataUrl: visibleUri, prompt, strength: strength ?? 0.75 },
             controller.signal,
           );
         }
@@ -872,15 +928,40 @@ export default function App(): React.JSX.Element {
         if (!firstImage) throw new Error("fal.ai returned no images");
         let outputImageUrl = firstImage.url;
 
-        // If mask is active on this layer, re-apply the original slice's alpha
-        // channel to the AI output (removes black background from generated result)
+        // If the visible input was the masked payload (not the full original
+        // fallback), check if the AI result still fits the original mask shape.
+        // If not, run background removal to create a fresh segment.
         const maskOn = isMaskActive(layerProps, effectiveSelectedIndex, layerCount);
-        if (maskOn && effectiveSelectedIndex > 0) {
-          outputImageUrl = await applyAlphaMask(
+        const sentMaskedInput = maskOn && effectiveSelectedIndex > 0;
+
+        // Parse source crop metadata if present
+        const srcCrop: CropInfo | undefined = payload.meta.cropX !== undefined
+          ? {
+              cropX: Number(payload.meta.cropX),
+              cropY: Number(payload.meta.cropY),
+              cropW: Number(payload.meta.cropW),
+              cropH: Number(payload.meta.cropH),
+              origW: Number(payload.meta.origW),
+              origH: Number(payload.meta.origH),
+            }
+          : undefined;
+
+        let finalCrop: CropInfo | undefined = srcCrop;
+        let wasRefit = false;
+
+        if (sentMaskedInput) {
+          // Use refitAiResult: measures mask fit, and if the AI output
+          // doesn't match the original shape, runs background removal +
+          // tight crop to create a proper new segment.
+          const refit = await refitAiResult(
             outputImageUrl,
-            payload.uri,
+            visibleUri,
+            srcCrop,
             controller.signal,
           );
+          outputImageUrl = refit.dataUrl;
+          finalCrop = refit.crop;
+          wasRefit = refit.wasRefit;
         }
 
         // Fetch the output image to compute sha256 + bytes
@@ -890,9 +971,36 @@ export default function App(): React.JSX.Element {
         );
         const outHash = await sha256Hex(outBuffer);
 
+        // Always convert to a data URL so Three.js TextureLoader can use it
+        // (remote fal.ai URLs hit CORS / expiry issues).
+        if (!outputImageUrl.startsWith("data:")) {
+          outputImageUrl = await new Promise<string>((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => { resolve(reader.result as string); };
+            reader.onerror = () => { reject(new Error("Failed to convert blob to data URL")); };
+            reader.readAsDataURL(outBlob);
+          });
+        }
+
         const outPayloadId = makeId("payload");
-        const outW = firstImage.width;
-        const outH = firstImage.height;
+
+        // Build crop metadata from refitAiResult (may differ from source if refit)
+        const cropMeta: Record<string, string> = {};
+        if (finalCrop) {
+          cropMeta.cropX = String(finalCrop.cropX);
+          cropMeta.cropY = String(finalCrop.cropY);
+          cropMeta.cropW = String(finalCrop.cropW);
+          cropMeta.cropH = String(finalCrop.cropH);
+          cropMeta.origW = String(finalCrop.origW);
+          cropMeta.origH = String(finalCrop.origH);
+        }
+
+        // Use the actual output image dimensions for width/height meta
+        const outImgBitmap = await createImageBitmap(outBlob);
+        const outW = outImgBitmap.width;
+        const outH = outImgBitmap.height;
+        outImgBitmap.close();
+
         const outPayloadValue: JsonObject = {
           id: outPayloadId,
           kind: "Payload",
@@ -901,7 +1009,9 @@ export default function App(): React.JSX.Element {
           sha256: outHash,
           bytes: outBuffer.byteLength,
           meta: {
-            ...(outW && outH ? { width: String(outW), height: String(outH) } : {}),
+            width: String(outW),
+            height: String(outH),
+            ...cropMeta,
           },
         };
 
@@ -920,7 +1030,8 @@ export default function App(): React.JSX.Element {
             prompt,
             ...(modelDef.hasStrength ? { strength: String(strength ?? 0.75) } : {}),
             proxyRoute: modelDef.proxyRoute,
-            maskApplied: String(maskOn && effectiveSelectedIndex > 0),
+            maskApplied: String(sentMaskedInput),
+            maskRefit: String(wasRefit),
           },
         };
 
@@ -941,7 +1052,7 @@ export default function App(): React.JSX.Element {
         abortRef.current = null;
       }
     },
-    [effectiveSelectedIndex, layerRender, state.payloads, emitRenderUpdate, preferences.defaultAiEditModelId, layerProps, layerCount],
+    [effectiveSelectedIndex, layerRender, state.payloads, emitRenderUpdate, preferences.defaultAiEditModelId, layerProps, layerCount, layerTextures],
   );
 
   /* ── Ingest flow: Tabula Rasa → Image → BrickUI ── */
@@ -1383,6 +1494,7 @@ export default function App(): React.JSX.Element {
           onClearSelection={handleClearSelection}
           layerTextures={layerTextures}
           colorLayerTextures={colorLayerTextures}
+          layerCropInfo={layerCropInfo}
           segmentDisplayMode={segmentDisplayMode}
           onToggleSegmentDisplay={() => { setSegmentDisplayMode((m) => m === "masked" ? "colored" : "masked"); }}
           revealActive={revealActive}
@@ -1392,6 +1504,7 @@ export default function App(): React.JSX.Element {
           onAiEdit={(prompt, strength) => { void handleAiEdit(prompt, strength); }}
           aiRunning={aiRunning}
           aiError={aiError}
+          onPromptVisibilityChange={setAiPromptOpen}
           onAddSlice={handleAddSlice}
           isMaskActiveFn={isMaskActiveFn}
           isMaskInvertedFn={isMaskInvertedFn}
@@ -1521,7 +1634,7 @@ export default function App(): React.JSX.Element {
         )}
 
         {/* Persistent badge: recall last op result after HUD dismissed */}
-        {!opProgress && lastOpResult && !slicingImageUrl && !isTabulaRasa && (
+        {!opProgress && !aiRunning && !aiPromptOpen && lastOpResult && !slicingImageUrl && !isTabulaRasa && (
           <button
             type="button"
             onClick={() => {
@@ -1569,7 +1682,7 @@ export default function App(): React.JSX.Element {
         )}
 
         {/* Mask picker button — shown when candidates are available */}
-        {!opProgress && maskCandidates.length > 0 && !slicingImageUrl && !isTabulaRasa && (
+        {!opProgress && !aiRunning && !aiPromptOpen && maskCandidates.length > 0 && !slicingImageUrl && !isTabulaRasa && (
           <button
             type="button"
             onClick={() => { setShowMaskPicker(true); }}
