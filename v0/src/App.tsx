@@ -10,6 +10,7 @@ import {
   serializeOrder,
   isHidden,
   isMaskActive,
+  isMaskInverted,
   opacityMultiplier,
   soloIndex,
   makeId,
@@ -28,9 +29,9 @@ import {
 import type { AnnotationId, Edge, GraphPatch, GraphPatchOp, JsonObject, PayloadId, ProjectState, SpaceId } from "./core";
 import type { ProjectPreferences } from "./core/preferences";
 import { findPortalEdges } from "./core";
-import { runImg2Img, runTextToImg, fetchImageBlob } from "./services/falProxy";
+import { runImg2Img, runTextToImg, runNanoBananaEdit, fetchImageBlob, applyAlphaMask, invertAlpha, invertMaskWithOriginal, getAiEditModel, combineMasksToOriginal } from "./services/falProxy";
 import { runOperation } from "./services/operationRunner";
-import type { OperationProgress } from "./services/operationRunner";
+import type { OperationProgress, MaskCandidate } from "./services/operationRunner";
 import SpaceViewport from "./ui/SpaceViewport";
 import type { SegmentDisplayMode } from "./ui/SpaceViewport";
 import SpaceAddressHUD from "./slice8/SpaceAddressHUD";
@@ -43,6 +44,7 @@ import type { IngestResult } from "./ui/ImageIngestPanel";
 import OperationProgressHUD from "./ui/OperationProgressHUD";
 import SlicingOverlay from "./ui/SlicingOverlay";
 import SettingsPanel from "./ui/SettingsPanel";
+import MaskPickerPanel from "./ui/MaskPickerPanel";
 import type { AnimPhase } from "./ui/CameraRig";
 import type { ViewMode } from "./ui/ViewMode";
 
@@ -83,12 +85,20 @@ export default function App(): React.JSX.Element {
     width: number;
     height: number;
     operationId: string;
+    segmentMode?: "filtered" | "raw" | undefined;
   } | null>(null);
 
   /** Segment display mode: masked original or colored silhouettes. */
   const [segmentDisplayMode, setSegmentDisplayMode] = useState<SegmentDisplayMode>("masked");
   /** Reveal animation: triggers when new slices are added after segmentation. */
   const [revealActive, setRevealActive] = useState(false);
+
+  /** SAM2 mask candidates from the last segmentation — for the mask picker. */
+  const [maskCandidates, setMaskCandidates] = useState<MaskCandidate[]>([]);
+  /** Whether the mask picker panel is visible. */
+  const [showMaskPicker, setShowMaskPicker] = useState(false);
+  /** Whether a combine operation is in progress. */
+  const [combining, setCombining] = useState(false);
 
   /** Is the project in "tabula rasa" state — no meaningful content yet? */
   const isTabulaRasa = useMemo(() => {
@@ -493,10 +503,21 @@ export default function App(): React.JSX.Element {
     [state, activeSpaceId],
   );
 
-  /** Build a map of layerIndex → payload URI for texture rendering. */
+  /** Build a map of layerIndex → payload URI for texture rendering.
+   *  When maskActive is false for a slice layer, fall back to the
+   *  original image (layer 0) so the user sees the unmasked original. */
   const layerTextures = useMemo(() => {
     const result: Record<number, string> = {};
+    // Resolve the original image URI from layer 0 for mask-off fallback
+    const origPid = layerPayloadId(layerRender, 0);
+    const origUri = origPid ? state.payloads[origPid as PayloadId]?.uri : undefined;
     for (let i = 0; i < layerCount; i++) {
+      const maskOn = isMaskActive(layerProps, i, layerCount);
+      // When mask is OFF on a slice layer, show the original image
+      if (!maskOn && i > 0 && origUri) {
+        result[i] = origUri;
+        continue;
+      }
       const pid = layerPayloadId(layerRender, i);
       if (pid) {
         const payload = state.payloads[pid as PayloadId];
@@ -506,7 +527,7 @@ export default function App(): React.JSX.Element {
       }
     }
     return result;
-  }, [layerCount, layerRender, state.payloads]);
+  }, [layerCount, layerRender, state.payloads, layerProps]);
 
   /** Build a map of layerIndex → colored-segment URI for the "colored" display mode. */
   const colorLayerTextures = useMemo(() => {
@@ -580,6 +601,181 @@ export default function App(): React.JSX.Element {
     [activeSpaceId, commitPatch],
   );
 
+  /**
+   * Invert mask: flip the alpha channel of the layer's current image,
+   * creating a new payload with inverted transparency.
+   * Also toggles the `maskInverted` annotation flag.
+   */
+  const handleInvertMask = useCallback(
+    async (index: number) => {
+      const pid = layerPayloadId(layerRender, index);
+      if (!pid) return;
+      const payload = state.payloads[pid as PayloadId];
+      if (!payload) return;
+
+      try {
+        // Find the original (full) image for correct RGB compositing.
+        // PNG round-tripping loses RGB for transparent pixels, so we need
+        // the original to provide clean pixels in the inverted region.
+        const origPid = layerPayloadId(layerRender, 0);
+        const origPayload = origPid ? state.payloads[origPid as PayloadId] : undefined;
+
+        let invertedUrl: string;
+        if (origPayload && index > 0) {
+          invertedUrl = await invertMaskWithOriginal(origPayload.uri, payload.uri);
+        } else {
+          invertedUrl = await invertAlpha(payload.uri);
+        }
+
+        const encoder = new TextEncoder();
+        const bytes = encoder.encode(invertedUrl);
+        const hash = await sha256Hex(bytes.buffer as ArrayBuffer);
+
+        const newPayloadId = makeId("payload");
+        const newPayloadValue: JsonObject = {
+          id: newPayloadId,
+          kind: "Payload",
+          mediaType: "image/png",
+          uri: invertedUrl,
+          sha256: hash,
+          bytes: bytes.byteLength,
+          meta: {
+            ...(payload.meta as Record<string, string> ?? {}),
+            invertedFrom: pid,
+          },
+        };
+
+        // Update the render annotation to point to the new payload
+        emitRenderUpdate(
+          (data) => ({ ...data, [`payload.${String(index)}`]: newPayloadId }),
+          [putOp("Payload", newPayloadId, newPayloadValue)],
+        );
+
+        // Toggle the maskInverted annotation flag
+        emitPropsUpdate((data) => {
+          const key = `maskInverted.${String(index)}`;
+          const currently = data[key] === "true";
+          if (currently) {
+            return Object.fromEntries(Object.entries(data).filter(([k]) => k !== key));
+          }
+          return { ...data, [key]: "true" };
+        });
+      } catch (err) {
+        console.error("[InvertMask] failed:", err);
+      }
+    },
+    [layerRender, state.payloads, emitRenderUpdate, emitPropsUpdate],
+  );
+
+  /** Combine user-selected masks into a new layer. */
+  const handleCombineMasks = useCallback(
+    async (maskUrls: string[]) => {
+      if (maskUrls.length === 0) return;
+      setCombining(true);
+      try {
+        // Get original image from layer 0
+        const origPid = layerPayloadId(layerRender, 0);
+        const origPayload = origPid ? state.payloads[origPid as PayloadId] : undefined;
+        if (!origPayload) {
+          console.error("[CombineMasks] No original image found on layer 0");
+          return;
+        }
+
+        const { dataUrl: combinedUrl, crop } = await combineMasksToOriginal(maskUrls, origPayload.uri);
+
+        const encoder = new TextEncoder();
+        const bytes = encoder.encode(combinedUrl);
+        const hash = await sha256Hex(bytes.buffer as ArrayBuffer);
+
+        const newPayloadId = makeId("payload");
+        const payloadValue: JsonObject = {
+          id: newPayloadId,
+          kind: "Payload",
+          mediaType: "image/png",
+          uri: combinedUrl,
+          sha256: hash,
+          bytes: bytes.byteLength,
+          meta: {
+            source: "mask-picker-combine",
+            width: String(crop.cropW),
+            height: String(crop.cropH),
+            cropX: String(crop.cropX),
+            cropY: String(crop.cropY),
+            cropW: String(crop.cropW),
+            cropH: String(crop.cropH),
+            origW: String(crop.origW),
+            origH: String(crop.origH),
+          },
+        };
+
+        // Add new layer and assign the combined payload
+        commitPatch((prev) => {
+          const space = prev.spaces[activeSpaceId];
+          if (!space) return null;
+
+          const newCount = space.layerCount + 1;
+          const newLayerIdx = space.layerCount;
+          const ops: GraphPatchOp[] = [];
+
+          // Update space layerCount
+          ops.push(putOp("Space", activeSpaceId, { ...space, layerCount: newCount }));
+
+          // Add the payload
+          ops.push(putOp("Payload", newPayloadId, payloadValue));
+
+          // Extend layer order
+          const existingOrder = findLayerOrder(prev, activeSpaceId);
+          if (existingOrder) {
+            const newOrder = [...existingOrder.order, newLayerIdx];
+            ops.push(putOp("Annotation", existingOrder.annotationId, {
+              id: existingOrder.annotationId,
+              kind: "Annotation",
+              target: { kind: "Space", id: activeSpaceId },
+              schema: "ui.layers.order",
+              data: { order: serializeOrder(newOrder) },
+              createdAt: new Date().toISOString(),
+            }));
+          }
+
+          // Assign payload to the new layer in render
+          const existing = findLayerRender(prev, activeSpaceId);
+          const annId = existing ? existing.annotationId : makeId("annotation");
+          const currentData = existing ? { ...existing.annotation.data } : {};
+          currentData[`payload.${String(newLayerIdx)}`] = newPayloadId;
+          ops.push(putOp("Annotation", annId, {
+            id: annId,
+            kind: "Annotation",
+            target: { kind: "Space", id: activeSpaceId },
+            schema: "ui.layers.render",
+            data: currentData,
+            createdAt: new Date().toISOString(),
+          }));
+
+          // Select the new layer
+          const existingSel = findLayerSelection(prev, activeSpaceId);
+          const selAnnId = existingSel ? existingSel.annotationId : makeId("annotation");
+          ops.push(putOp("Annotation", selAnnId, {
+            id: selAnnId,
+            kind: "Annotation",
+            target: { kind: "Space", id: activeSpaceId },
+            schema: "ui.selection.layerIndex",
+            data: { layerIndex: String(newLayerIdx) },
+            createdAt: new Date().toISOString(),
+          }));
+
+          return newPatch({ baseRevision: prev.revision, ops });
+        });
+
+        setShowMaskPicker(false);
+      } catch (err) {
+        console.error("[CombineMasks] failed:", err);
+      } finally {
+        setCombining(false);
+      }
+    },
+    [layerRender, state.payloads, activeSpaceId, commitPatch],
+  );
+
   /** Import an image file into the selected layer. */
   const handleImportImage = useCallback(async () => {
     if (effectiveSelectedIndex === null) return;
@@ -632,7 +828,7 @@ export default function App(): React.JSX.Element {
     );
   }, [effectiveSelectedIndex, emitRenderUpdate]);
 
-  /** Run AI img2img on the selected layer's current image. */
+  /** Run AI edit on the selected layer's current image using the preferred model. */
   const handleAiEdit = useCallback(
     async (prompt: string, strength?: number) => {
       if (effectiveSelectedIndex === null) return;
@@ -656,20 +852,36 @@ export default function App(): React.JSX.Element {
         }
 
         const inputPayloadId = pid;
+        const modelDef = getAiEditModel(preferences.defaultAiEditModelId);
 
-        // Call the proxy
-        const result = await runImg2Img(
-          {
-            imageDataUrl: payload.uri,
-            prompt,
-            strength: strength ?? 0.75,
-          },
-          controller.signal,
-        );
+        // Run the selected model
+        let result;
+        if (modelDef.id === "nano-banana") {
+          result = await runNanoBananaEdit(
+            { imageDataUrls: [payload.uri], prompt },
+            controller.signal,
+          );
+        } else {
+          result = await runImg2Img(
+            { imageDataUrl: payload.uri, prompt, strength: strength ?? 0.75 },
+            controller.signal,
+          );
+        }
 
         const firstImage = result.images[0];
         if (!firstImage) throw new Error("fal.ai returned no images");
-        const outputImageUrl = firstImage.url;
+        let outputImageUrl = firstImage.url;
+
+        // If mask is active on this layer, re-apply the original slice's alpha
+        // channel to the AI output (removes black background from generated result)
+        const maskOn = isMaskActive(layerProps, effectiveSelectedIndex, layerCount);
+        if (maskOn && effectiveSelectedIndex > 0) {
+          outputImageUrl = await applyAlphaMask(
+            outputImageUrl,
+            payload.uri,
+            controller.signal,
+          );
+        }
 
         // Fetch the output image to compute sha256 + bytes
         const { blob: outBlob, buffer: outBuffer } = await fetchImageBlob(
@@ -698,7 +910,7 @@ export default function App(): React.JSX.Element {
         const oprunValue: JsonObject = {
           id: oprunId,
           kind: "OperatorRun",
-          operator: "fal.img2img",
+          operator: `fal.${modelDef.id}`,
           status: "succeeded",
           createdAt: new Date().toISOString(),
           finishedAt: new Date().toISOString(),
@@ -706,8 +918,9 @@ export default function App(): React.JSX.Element {
           outputs: [{ kind: "Payload", id: outPayloadId }],
           params: {
             prompt,
-            strength: String(strength ?? 0.75),
-            proxyRoute: "fal-ai/flux/dev/image-to-image",
+            ...(modelDef.hasStrength ? { strength: String(strength ?? 0.75) } : {}),
+            proxyRoute: modelDef.proxyRoute,
+            maskApplied: String(maskOn && effectiveSelectedIndex > 0),
           },
         };
 
@@ -728,7 +941,7 @@ export default function App(): React.JSX.Element {
         abortRef.current = null;
       }
     },
-    [effectiveSelectedIndex, layerRender, state.payloads, emitRenderUpdate],
+    [effectiveSelectedIndex, layerRender, state.payloads, emitRenderUpdate, preferences.defaultAiEditModelId, layerProps, layerCount],
   );
 
   /* ── Ingest flow: Tabula Rasa → Image → BrickUI ── */
@@ -806,6 +1019,7 @@ export default function App(): React.JSX.Element {
         width: result.width,
         height: result.height,
         operationId: result.operationId,
+        segmentMode: result.segmentMode,
       };
 
       // Run the default operation
@@ -831,7 +1045,7 @@ export default function App(): React.JSX.Element {
             op,
             activeSpaceId,
             payloadId,
-            { state: currentState, imageWidth: result.width, imageHeight: result.height },
+            { state: currentState, imageWidth: result.width, imageHeight: result.height, segmentMode: result.segmentMode },
             controller.signal,
           );
           // Commit the operation result + build the render annotation from
@@ -868,6 +1082,10 @@ export default function App(): React.JSX.Element {
           setSlicingImageUrl(null);
 
           const mc = opResult.maskCount ?? 0;
+          // Store mask candidates for the picker
+          if (opResult.maskCandidates && opResult.maskCandidates.length > 0) {
+            setMaskCandidates(opResult.maskCandidates);
+          }
           // Trigger reveal animation when new slices are produced
           if (mc > 0) {
             setRevealActive(true);
@@ -920,6 +1138,16 @@ export default function App(): React.JSX.Element {
 
   const persistedOpacityFn = useCallback(
     (index: number) => opacityMultiplier(layerProps, index, layerCount),
+    [layerProps, layerCount],
+  );
+
+  const isMaskActiveFn = useCallback(
+    (index: number) => isMaskActive(layerProps, index, layerCount),
+    [layerProps, layerCount],
+  );
+
+  const isMaskInvertedFn = useCallback(
+    (index: number) => isMaskInverted(layerProps, index, layerCount),
     [layerProps, layerCount],
   );
 
@@ -1109,6 +1337,8 @@ export default function App(): React.JSX.Element {
             setOpProgress(null);
             setLastOpResult(null);
             setSlicingImageUrl(null);
+            setMaskCandidates([]);
+            setShowMaskPicker(false);
           }}
           style={{
             marginLeft: 6,
@@ -1163,6 +1393,11 @@ export default function App(): React.JSX.Element {
           aiRunning={aiRunning}
           aiError={aiError}
           onAddSlice={handleAddSlice}
+          isMaskActiveFn={isMaskActiveFn}
+          isMaskInvertedFn={isMaskInvertedFn}
+          onInvertMask={(index) => { void handleInvertMask(index); }}
+          aiEditModelId={preferences.defaultAiEditModelId}
+          onChangeAiEditModel={(id) => { handleChangePreference("defaultAiEditModelId", id); }}
         />
         <SpaceAddressHUD
           fallbackSpaceId={rootSpaceId}
@@ -1225,7 +1460,7 @@ export default function App(): React.JSX.Element {
                         op,
                         activeSpaceId,
                         ctx.payloadId,
-                        { state: currentState, imageWidth: ctx.width, imageHeight: ctx.height },
+                        { state: currentState, imageWidth: ctx.width, imageHeight: ctx.height, segmentMode: ctx.segmentMode },
                         controller.signal,
                       );
                       commitPatch((prev) => {
@@ -1253,6 +1488,9 @@ export default function App(): React.JSX.Element {
                       });
                       setSlicingImageUrl(null);
                       const mc = opResult.maskCount ?? 0;
+                      if (opResult.maskCandidates && opResult.maskCandidates.length > 0) {
+                        setMaskCandidates(opResult.maskCandidates);
+                      }
                       if (mc > 0) setRevealActive(true);
                       if (mc === 0) {
                         const warning = "No slices produced — segmentation returned 0 segments. Try a different image or retry.";
@@ -1328,6 +1566,46 @@ export default function App(): React.JSX.Element {
             <span style={{ fontSize: 14 }}>{lastOpResult.maskCount === 0 ? "⚠" : "✓"}</span>
             <span>{lastOpResult.maskCount === 0 ? "0 slices" : `${String(lastOpResult.maskCount)} slices`}</span>
           </button>
+        )}
+
+        {/* Mask picker button — shown when candidates are available */}
+        {!opProgress && maskCandidates.length > 0 && !slicingImageUrl && !isTabulaRasa && (
+          <button
+            type="button"
+            onClick={() => { setShowMaskPicker(true); }}
+            title="Pick & combine masks"
+            style={{
+              position: "absolute",
+              bottom: 60,
+              left: "50%",
+              transform: "translateX(80px)",
+              display: "flex",
+              alignItems: "center",
+              gap: 4,
+              padding: "4px 10px",
+              background: "var(--hud-bg)",
+              border: "1px solid var(--hud-border)",
+              borderRadius: 6,
+              color: "#8cf",
+              fontSize: 12,
+              cursor: "pointer",
+              zIndex: 79,
+              backdropFilter: "blur(8px)",
+            }}
+          >
+            <span style={{ fontSize: 14 }}>🎭</span>
+            <span>Masks ({String(maskCandidates.length)})</span>
+          </button>
+        )}
+
+        {/* Mask picker panel */}
+        {showMaskPicker && maskCandidates.length > 0 && (
+          <MaskPickerPanel
+            candidates={maskCandidates}
+            onCombine={handleCombineMasks}
+            onClose={() => { setShowMaskPicker(false); }}
+            combining={combining}
+          />
         )}
 
         {/* Settings panel */}

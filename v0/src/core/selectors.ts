@@ -75,6 +75,20 @@ export function isMaskActive(
   return props.annotation.data[`maskActive.${String(index)}`] !== "false";
 }
 
+/**
+ * Whether the mask for a layer is inverted (foreground/background swapped).
+ * Defaults to `false`.
+ */
+export function isMaskInverted(
+  props: LayerProps | null,
+  index: number,
+  layerCount: number,
+): boolean {
+  if (!props) return false;
+  if (index < 0 || index >= layerCount) return false;
+  return props.annotation.data[`maskInverted.${String(index)}`] === "true";
+}
+
 export function opacityMultiplier(
   props: LayerProps | null,
   index: number,

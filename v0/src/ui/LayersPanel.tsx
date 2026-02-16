@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
+import { AI_EDIT_MODELS, getAiEditModel } from "../services/falProxy";
 
 interface LayersPanelProps {
   layerCount: number;
@@ -7,10 +8,14 @@ interface LayersPanelProps {
   soloIndex: number | null;
   layerVisibility: Array<{ visible: boolean; opacity: number }>;
   isHidden: (index: number) => boolean;
+  isMaskActive: (index: number) => boolean;
+  isMaskInverted: (index: number) => boolean;
   persistedOpacity: (index: number) => number;
   onSelectLayer: (index: number) => void;
   onToggleHidden: (index: number) => void;
   onToggleSolo: (index: number) => void;
+  onToggleMask: (index: number) => void;
+  onInvertMask: (index: number) => void;
   onPreviewOpacity: (value: number | null) => void;
   onCommitOpacity: (index: number, value: number) => void;
   onPreviewOrder: (order: number[] | null) => void;
@@ -21,6 +26,8 @@ interface LayersPanelProps {
   aiError: string | null;
   onAddSlice: () => void;
   layerTextures: Record<number, string>;
+  aiEditModelId: string;
+  onChangeAiEditModel: (id: string) => void;
 }
 
 const ITEM_H = 40;
@@ -41,10 +48,14 @@ export default function LayersPanel(props: LayersPanelProps): React.JSX.Element 
     selectedLayerIndex,
     soloIndex,
     isHidden,
+    isMaskActive,
+    isMaskInverted,
     persistedOpacity,
     onSelectLayer,
     onToggleHidden,
     onToggleSolo,
+    onToggleMask,
+    onInvertMask,
     onPreviewOpacity,
     onCommitOpacity,
     onPreviewOrder,
@@ -55,6 +66,8 @@ export default function LayersPanel(props: LayersPanelProps): React.JSX.Element 
     aiError,
     onAddSlice,
     layerTextures,
+    aiEditModelId,
+    onChangeAiEditModel,
   } = props;
 
   /* ── Drag reorder state ──────────────────────── */
@@ -322,6 +335,48 @@ export default function LayersPanel(props: LayersPanelProps): React.JSX.Element 
                 S
               </button>
 
+              {/* Mask toggle */}
+              <button
+                type="button"
+                onClick={(e) => { e.stopPropagation(); onToggleMask(layerIdx); }}
+                title={isMaskActive(layerIdx) ? "Disable mask" : "Enable mask"}
+                style={{
+                  background: isMaskActive(layerIdx) ? "var(--hud-active)" : "none",
+                  border: "none",
+                  color: isMaskActive(layerIdx) ? "var(--scrubber-active)" : "var(--hud-muted)",
+                  cursor: "pointer",
+                  fontSize: 10,
+                  fontWeight: 600,
+                  padding: "2px 4px",
+                  borderRadius: 3,
+                  flexShrink: 0,
+                }}
+              >
+                M
+              </button>
+
+              {/* Invert mask */}
+              {layerIdx in layerTextures && (
+                <button
+                  type="button"
+                  onClick={(e) => { e.stopPropagation(); onInvertMask(layerIdx); }}
+                  title={isMaskInverted(layerIdx) ? "Revert mask (original)" : "Invert mask"}
+                  style={{
+                    background: isMaskInverted(layerIdx) ? "var(--hud-active)" : "none",
+                    border: "none",
+                    color: isMaskInverted(layerIdx) ? "var(--scrubber-active)" : "var(--hud-muted)",
+                    cursor: "pointer",
+                    fontSize: 10,
+                    fontWeight: 600,
+                    padding: "2px 4px",
+                    borderRadius: 3,
+                    flexShrink: 0,
+                  }}
+                >
+                  ⊘
+                </button>
+              )}
+
               {/* Opacity */}
               <span
                 onClick={(e) => {
@@ -443,6 +498,26 @@ export default function LayersPanel(props: LayersPanelProps): React.JSX.Element 
           }}
         >
           <label style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+            <span style={{ opacity: 0.6, fontSize: 11 }}>Model</span>
+            <select
+              value={aiEditModelId}
+              onChange={(e) => { onChangeAiEditModel(e.target.value); }}
+              style={{
+                background: "rgba(255,255,255,0.08)",
+                border: "1px solid var(--hud-border-btn, rgba(255,255,255,0.15))",
+                borderRadius: 4,
+                padding: "4px 6px",
+                color: "var(--hud-text)",
+                fontSize: 12,
+                outline: "none",
+              }}
+            >
+              {AI_EDIT_MODELS.map((m) => (
+                <option key={m.id} value={m.id}>{m.label}</option>
+              ))}
+            </select>
+          </label>
+          <label style={{ display: "flex", flexDirection: "column", gap: 2 }}>
             <span style={{ opacity: 0.6, fontSize: 11 }}>Prompt (L{showAiPromptLayer})</span>
             <input
               type="text"
@@ -466,6 +541,7 @@ export default function LayersPanel(props: LayersPanelProps): React.JSX.Element 
               }}
             />
           </label>
+          {getAiEditModel(aiEditModelId).hasStrength && (
           <label style={{ display: "flex", alignItems: "center", gap: 6 }}>
             <span style={{ opacity: 0.6, minWidth: 52 }}>Strength</span>
             <input
@@ -482,6 +558,7 @@ export default function LayersPanel(props: LayersPanelProps): React.JSX.Element 
               {Math.round(strength * 100)}%
             </span>
           </label>
+          )}
           <button
             type="button"
             disabled={!promptText.trim() || aiRunning}

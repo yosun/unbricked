@@ -1,5 +1,6 @@
 import React from "react";
 import { OPERATIONS } from "../core/operations";
+import { AI_EDIT_MODELS } from "../services/falProxy";
 import type { ProjectPreferences } from "../core/preferences";
 
 interface SettingsPanelProps {
@@ -77,6 +78,31 @@ export default function SettingsPanel({
           {OPERATIONS.map((op) => (
             <option key={op.id} value={op.id}>
               {op.label}
+            </option>
+          ))}
+        </select>
+
+        <label
+          style={{ display: "block", fontSize: 12, color: "var(--hud-muted)", marginBottom: 6, marginTop: 16 }}
+        >
+          Default AI edit model
+        </label>
+        <select
+          value={preferences.defaultAiEditModelId}
+          onChange={(e) => { onChangePreference("defaultAiEditModelId", e.target.value); }}
+          style={{
+            width: "100%",
+            padding: "6px 8px",
+            background: "#1a1a2e",
+            border: "1px solid var(--hud-border-btn)",
+            borderRadius: 4,
+            color: "var(--hud-text)",
+            fontSize: 13,
+          }}
+        >
+          {AI_EDIT_MODELS.map((m) => (
+            <option key={m.id} value={m.id}>
+              {m.label}
             </option>
           ))}
         </select>

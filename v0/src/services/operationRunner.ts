@@ -34,6 +34,8 @@ export interface OperationContext {
   /** Natural width/height of the source image — used to construct full-image box prompt. */
   imageWidth: number;
   imageHeight: number;
+  /** Segmentation mode: "filtered" applies smart post-processing, "raw" returns all SAM masks. */
+  segmentMode?: "filtered" | "raw" | undefined;
 }
 
 /**
@@ -41,13 +43,29 @@ export interface OperationContext {
  * Returns the patch ops needed to record the OperatorRun, derived payloads,
  * updated space layerCount, and render annotation mappings.
  */
+/** A SAM2 mask candidate for user selection in the mask picker. */
+export interface MaskCandidate {
+  /** Index in the original SAM2 response. */
+  index: number;
+  /** Remote URL of the raw binary mask image. */
+  maskUrl: string;
+  /** Colored thumbnail data URL for display. */
+  coloredUrl: string;
+  /** Fraction of image area (0–1). */
+  areaFraction: number;
+  /** Whether auto-selection chose this mask for a layer. */
+  autoSelected: boolean;
+  /** Whether this was detected as background. */
+  isBackground: boolean;
+}
+
 export async function runOperation(
   op: OperationDef,
   spaceId: SpaceId,
   payloadId: PayloadId,
   ctx: OperationContext,
   signal?: AbortSignal,
-): Promise<{ oprunId: OperatorRunId; ops: GraphPatchOp[]; maskCount?: number; maskPayloadIds?: PayloadId[] }> {
+): Promise<{ oprunId: OperatorRunId; ops: GraphPatchOp[]; maskCount?: number; maskPayloadIds?: PayloadId[]; maskCandidates?: MaskCandidate[] }> {
   if (op.id === "none") {
     const oprunId = makeId("oprun");
     const oprunValue: JsonObject = {
@@ -238,16 +256,16 @@ async function runSam3Segment(
   payloadId: PayloadId,
   ctx: OperationContext,
   signal?: AbortSignal,
-): Promise<{ oprunId: OperatorRunId; ops: GraphPatchOp[]; maskCount: number; maskPayloadIds: PayloadId[] }> {
+): Promise<{ oprunId: OperatorRunId; ops: GraphPatchOp[]; maskCount: number; maskPayloadIds: PayloadId[]; maskCandidates: MaskCandidate[] }> {
   const payload = ctx.state.payloads[payloadId];
   if (!payload) throw new Error("Source payload not found");
 
   const space = ctx.state.spaces[spaceId];
   if (!space) throw new Error("Space not found");
 
-  // 1. Run SAM2 auto-segmentation — true automatic segmentation, no prompts needed
-
-
+  // 1. Run SAM2 auto-segmentation.
+  //    We use default SAM2 params (which may produce many masks) and rely on
+  //    smart post-processing to select the best segments.
   const segResult = await runAutoSegment(
     { imageUrl: payload.uri },
     signal,
@@ -274,26 +292,33 @@ async function runSam3Segment(
         note: "No segments detected",
       },
     };
-    return { oprunId, ops: [putOp("OperatorRun", oprunId, oprunValue)], maskCount: 0, maskPayloadIds: [] };
+    return { oprunId, ops: [putOp("OperatorRun", oprunId, oprunValue)], maskCount: 0, maskPayloadIds: [], maskCandidates: [] };
   }
 
-  const totalPixels = ctx.imageWidth * ctx.imageHeight;
+  const w = ctx.imageWidth;
+  const h = ctx.imageHeight;
+  const totalPixels = w * h;
 
-  // 2. Pre-analyze every mask: download and count foreground pixels to compute
-  //    area fraction.  This lets us filter out tiny noise masks and sort by size
-  //    so large backgrounds end up on the back layers and smaller subjects float
-  //    to the front of the 3D prism.
-  const MIN_AREA_FRACTION = 0.01; // skip masks covering less than 1% of the image
+  // ── 2. Analyze every mask: count fg pixels, build bitmask, detect edge-touching ──
 
-  interface MaskInfo { idx: number; url: string; fgPixels: number; blob: Blob; width: number; height: number }
+  const MIN_AREA_FRACTION = 0.01; // skip masks < 1% of image area
+
+  interface MaskInfo {
+    idx: number;
+    url: string;
+    fgPixels: number;
+    fgBitmask: Uint8Array;
+    touchesAllEdges: boolean;
+    blob: Blob;
+    width: number;
+    height: number;
+  }
   const analyzed: MaskInfo[] = [];
 
   for (let idx = 0; idx < allMasks.length; idx++) {
     const mask = allMasks[idx]!;
     const { blob } = await fetchImageBlob(mask.url, signal);
     const bitmap = await createImageBitmap(blob);
-    const w = ctx.imageWidth;
-    const h = ctx.imageHeight;
     const canvas = document.createElement("canvas");
     canvas.width = w;
     canvas.height = h;
@@ -312,31 +337,140 @@ async function runSam3Segment(
     }
     const useAlpha = maxA - minA > 64;
 
+    // Build per-pixel bitmask + count fg + detect edge-touching
+    const pixelCount = w * h;
+    const fgBitmask = new Uint8Array(pixelCount);
     let fg = 0;
+    let touchTop = false, touchBottom = false, touchLeft = false, touchRight = false;
+
     for (let i = 0; i < px.length; i += 4) {
       const isFg = useAlpha
         ? px[i + 3]! > 128
         : px[i]! > 64 || px[i + 1]! > 64 || px[i + 2]! > 64;
-      if (isFg) fg++;
+      if (isFg) {
+        fg++;
+        const pIdx = i / 4;
+        fgBitmask[pIdx] = 1;
+        const row = Math.floor(pIdx / w);
+        const col = pIdx % w;
+        if (row === 0) touchTop = true;
+        if (row === h - 1) touchBottom = true;
+        if (col === 0) touchLeft = true;
+        if (col === w - 1) touchRight = true;
+      }
     }
 
     const frac = fg / totalPixels;
-    console.info(`[SAM2] mask ${String(idx)}: ${String(fg)}/${String(totalPixels)} fg pixels (${(frac * 100).toFixed(1)}%)`);
+    const touchesAllEdges = touchTop && touchBottom && touchLeft && touchRight;
+    console.info(
+      `[SAM2] mask ${String(idx)}: ${(frac * 100).toFixed(1)}% area` +
+      (touchesAllEdges ? " [touches-all-edges]" : ""),
+    );
+
     if (frac >= MIN_AREA_FRACTION) {
-      analyzed.push({ idx, url: mask.url, fgPixels: fg, blob, width: mask.width ?? ctx.imageWidth, height: mask.height ?? ctx.imageHeight });
+      analyzed.push({
+        idx, url: mask.url, fgPixels: fg, fgBitmask, touchesAllEdges,
+        blob, width: mask.width ?? w, height: mask.height ?? h,
+      });
     } else {
-      console.info(`[SAM2] mask ${String(idx)} skipped — below ${String(MIN_AREA_FRACTION * 100)}% area threshold`);
+      console.info(`[SAM2]   → skipped (below ${(MIN_AREA_FRACTION * 100).toFixed(0)}% area threshold)`);
     }
   }
 
-  // Sort by area descending: large background segments → back layers (low index),
-  // small subject segments → front layers (high index in the 3D prism).
-  analyzed.sort((a, b) => b.fgPixels - a.fgPixels);
+  const isRaw = ctx.segmentMode === "raw";
 
-  // Cap masks to a reasonable limit for the brick UI
-  const MAX_SLICES = 8;
-  const masks = analyzed.slice(0, MAX_SLICES);
-  console.info(`[SAM2] keeping ${String(masks.length)} masks after area filter + cap`);
+  // ── 3–6. Filter masks (skipped in raw mode) ──
+  let masks: MaskInfo[];
+  const backgroundIdxSet = new Set<number>();
+  const autoSelectedIdxSet = new Set<number>();
+
+  if (isRaw) {
+    // Raw mode: use all analyzed masks directly, no filtering or dedup.
+    masks = analyzed;
+    for (const m of masks) autoSelectedIdxSet.add(m.idx);
+    console.info(`[SAM2] raw mode — keeping all ${String(masks.length)} analyzed masks`);
+  } else {
+    // ── 3. Identify & remove background masks ──
+    const BG_AREA_FRACTION = 0.30;
+    const subjects = analyzed.filter((m) => {
+      if (m.touchesAllEdges && m.fgPixels / totalPixels > BG_AREA_FRACTION) {
+        backgroundIdxSet.add(m.idx);
+        console.info(`[SAM2] mask ${String(m.idx)} removed — background (${(m.fgPixels / totalPixels * 100).toFixed(1)}% area, touches all edges)`);
+        return false;
+      }
+      return true;
+    });
+    console.info(`[SAM2] ${String(analyzed.length)} → ${String(subjects.length)} after background removal`);
+
+    // ── 4. Sort by area descending ──
+    subjects.sort((a, b) => b.fgPixels - a.fgPixels);
+
+    // ── 5. Deduplicate: containment + IoU ──
+    const CONTAINMENT_THRESHOLD = 0.70;
+    const IOU_THRESHOLD = 0.75;
+    const deduped: MaskInfo[] = [];
+
+    for (const candidate of subjects) {
+      let isDuplicate = false;
+      for (const kept of deduped) {
+        let intersection = 0;
+        let union = 0;
+        const len = candidate.fgBitmask.length;
+        for (let p = 0; p < len; p++) {
+          const a = candidate.fgBitmask[p]!;
+          const b = kept.fgBitmask[p]!;
+          if (a || b) union++;
+          if (a && b) intersection++;
+        }
+
+        const candidateContained = candidate.fgPixels > 0
+          ? intersection / candidate.fgPixels
+          : 0;
+        if (candidateContained > CONTAINMENT_THRESHOLD) {
+          isDuplicate = true;
+          console.info(
+            `[SAM2] mask ${String(candidate.idx)} is ${(candidateContained * 100).toFixed(0)}% contained in mask ${String(kept.idx)} → skip`,
+          );
+          break;
+        }
+
+        const iou = union > 0 ? intersection / union : 0;
+        if (iou > IOU_THRESHOLD) {
+          isDuplicate = true;
+          console.info(
+            `[SAM2] mask ${String(candidate.idx)} ≈ mask ${String(kept.idx)} (IoU ${(iou * 100).toFixed(0)}%) → skip`,
+          );
+          break;
+        }
+      }
+      if (!isDuplicate) {
+        deduped.push(candidate);
+      }
+    }
+    console.info(`[SAM2] ${String(subjects.length)} → ${String(deduped.length)} after dedup`);
+
+    // ── 6. Final selection: cap to 6 ──
+    const MAX_SLICES = 6;
+    masks = deduped.slice(0, MAX_SLICES);
+    for (const m of masks) autoSelectedIdxSet.add(m.idx);
+    console.info(`[SAM2] keeping ${String(masks.length)} final masks`);
+  }
+
+  // ── 7. Build mask candidates for the picker (ALL analyzed masks) ──
+  const maskCandidates: MaskCandidate[] = [];
+  for (let ci = 0; ci < analyzed.length; ci++) {
+    const m = analyzed[ci]!;
+    const coloredUrl = await colorizeMask(m.url, ci, signal);
+    maskCandidates.push({
+      index: m.idx,
+      maskUrl: m.url,
+      coloredUrl,
+      areaFraction: m.fgPixels / totalPixels,
+      autoSelected: autoSelectedIdxSet.has(m.idx),
+      isBackground: backgroundIdxSet.has(m.idx),
+    });
+  }
+  console.info(`[SAM2] built ${String(maskCandidates.length)} mask candidates for picker`);
 
   if (masks.length === 0) {
     const oprunId = makeId("oprun");
@@ -355,7 +489,7 @@ async function runSam3Segment(
         note: "All segments below minimum area threshold",
       },
     };
-    return { oprunId, ops: [putOp("OperatorRun", oprunId, oprunValue)], maskCount: 0, maskPayloadIds: [] };
+    return { oprunId, ops: [putOp("OperatorRun", oprunId, oprunValue)], maskCount: 0, maskPayloadIds: [], maskCandidates };
   }
 
   // Load the original image bitmap once for compositing masks
@@ -449,5 +583,5 @@ async function runSam3Segment(
   };
   ops.push(putOp("Annotation", annId, annValue));
 
-  return { oprunId, ops, maskCount: outputPayloadIds.length, maskPayloadIds: outputPayloadIds };
+  return { oprunId, ops, maskCount: outputPayloadIds.length, maskPayloadIds: outputPayloadIds, maskCandidates };
 }

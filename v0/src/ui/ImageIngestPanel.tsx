@@ -3,6 +3,8 @@ import { OPERATIONS } from "../core/operations";
 
 export type IngestTab = "import" | "generate";
 
+export type SegmentMode = "filtered" | "raw";
+
 export interface IngestResult {
   /** The image as a data URL (for import) or a remote URL (for generate). */
   imageUrl: string;
@@ -15,6 +17,8 @@ export interface IngestResult {
   mediaType: string;
   /** Which operation to run after placing. */
   operationId: string;
+  /** Segmentation mode: "filtered" (smart post-processing) or "raw" (all SAM masks). */
+  segmentMode?: SegmentMode | undefined;
   /** For generate: the prompt used. */
   prompt?: string;
 }
@@ -37,6 +41,8 @@ export default function ImageIngestPanel({
 }: ImageIngestPanelProps): React.JSX.Element {
   const [tab, setTab] = useState<IngestTab>("import");
   const [operationId, setOperationId] = useState(defaultOperationId);
+  const [segmentMode, setSegmentMode] = useState<SegmentMode>("filtered");
+  const showSegmentMode = operationId === "sam3.segment";
 
   // ── Import state ──
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
@@ -80,6 +86,7 @@ export default function ImageIngestPanel({
       bytes: buffer,
       mediaType: importFile.type || "image/png",
       operationId,
+      segmentMode: showSegmentMode ? segmentMode : undefined,
     });
   }, [importFile, previewUrl, onCommit, operationId]);
 
@@ -150,6 +157,7 @@ export default function ImageIngestPanel({
         bytes: buffer,
         mediaType: blob.type || "image/png",
         operationId,
+        segmentMode: showSegmentMode ? segmentMode : undefined,
         prompt: prompt.trim(),
       });
     } catch (err: unknown) {
@@ -238,6 +246,44 @@ export default function ImageIngestPanel({
             ))}
           </select>
         </div>
+
+        {/* Segmentation mode toggle */}
+        {showSegmentMode && (
+          <div
+            style={{
+              padding: "8px 20px 10px",
+              borderBottom: "1px solid var(--hud-border)",
+              display: "flex",
+              alignItems: "center",
+              gap: 8,
+            }}
+          >
+            <span style={{ fontSize: 12, color: "var(--hud-muted)", whiteSpace: "nowrap" }}>
+              Segmentation
+            </span>
+            {(["filtered", "raw"] as const).map((mode) => (
+              <button
+                key={mode}
+                type="button"
+                onClick={() => { setSegmentMode(mode); }}
+                style={{
+                  padding: "3px 10px",
+                  borderRadius: 4,
+                  border: segmentMode === mode
+                    ? "1px solid var(--scrubber-active)"
+                    : "1px solid var(--hud-border-btn)",
+                  background: segmentMode === mode ? "var(--hud-active)" : "transparent",
+                  color: segmentMode === mode ? "#fff" : "var(--hud-muted)",
+                  cursor: "pointer",
+                  fontSize: 11,
+                  fontWeight: 600,
+                }}
+              >
+                {mode === "filtered" ? "Filtered" : "Raw (all masks)"}
+              </button>
+            ))}
+          </div>
+        )}
 
         {/* Tabs */}
         <div style={{ display: "flex", borderBottom: "1px solid var(--hud-border)" }}>

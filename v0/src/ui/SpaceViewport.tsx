@@ -493,6 +493,11 @@ interface SpaceViewportProps {
   aiRunning: boolean;
   aiError: string | null;
   onAddSlice: () => void;
+  isMaskActiveFn: (index: number) => boolean;
+  isMaskInvertedFn: (index: number) => boolean;
+  onInvertMask: (index: number) => void;
+  aiEditModelId: string;
+  onChangeAiEditModel: (id: string) => void;
 }
 
 export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Element {
@@ -532,6 +537,11 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
     aiRunning,
     aiError,
     onAddSlice,
+    isMaskActiveFn,
+    isMaskInvertedFn,
+    onInvertMask,
+    aiEditModelId,
+    onChangeAiEditModel,
   } = props;
   const animating = animPhase !== "idle";
 
@@ -828,6 +838,7 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
           onToggleHidden={onToggleHidden}
           onToggleSolo={onToggleSolo}
           onToggleMask={onToggleMask}
+          onInvertMask={onInvertMask}
           onPreviewOpacity={onPreviewOpacity}
           onCommitOpacity={onCommitOpacity}
           hasImage={selectedLayerIndex in layerTextures}
@@ -836,6 +847,8 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
           aiRunning={aiRunning}
           aiError={aiError}
           onAddSlice={onAddSlice}
+          aiEditModelId={aiEditModelId}
+          onChangeAiEditModel={onChangeAiEditModel}
         />
       )}
 
@@ -848,10 +861,14 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
           soloIndex={soloIndex}
           layerVisibility={layerVisibility}
           isHidden={isHiddenFn}
+          isMaskActive={isMaskActiveFn}
+          isMaskInverted={isMaskInvertedFn}
           persistedOpacity={persistedOpacityFn}
           onSelectLayer={onSelectLayer}
           onToggleHidden={onToggleHidden}
           onToggleSolo={onToggleSolo}
+          onToggleMask={onToggleMask}
+          onInvertMask={onInvertMask}
           onPreviewOpacity={onPreviewOpacity}
           onCommitOpacity={onCommitOpacity}
           onPreviewOrder={onPreviewOrder}
@@ -862,6 +879,8 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
           aiError={aiError}
           onAddSlice={onAddSlice}
           layerTextures={layerTextures}
+          aiEditModelId={aiEditModelId}
+          onChangeAiEditModel={onChangeAiEditModel}
         />
       )}
 

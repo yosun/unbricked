@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
+import { AI_EDIT_MODELS, getAiEditModel } from "../services/falProxy";
 
 interface LayerControlsHUDProps {
   layerIndex: number;
@@ -9,6 +10,7 @@ interface LayerControlsHUDProps {
   onToggleHidden: (index: number) => void;
   onToggleSolo: (index: number) => void;
   onToggleMask: (index: number) => void;
+  onInvertMask: (index: number) => void;
   onPreviewOpacity: (value: number | null) => void;
   onCommitOpacity: (index: number, value: number) => void;
   hasImage: boolean;
@@ -17,6 +19,8 @@ interface LayerControlsHUDProps {
   aiRunning: boolean;
   aiError: string | null;
   onAddSlice: () => void;
+  aiEditModelId: string;
+  onChangeAiEditModel: (id: string) => void;
 }
 
 function clamp01(v: number): number {
@@ -33,6 +37,7 @@ export default function LayerControlsHUD(props: LayerControlsHUDProps): React.JS
     onToggleHidden,
     onToggleSolo,
     onToggleMask,
+    onInvertMask,
     onPreviewOpacity,
     onCommitOpacity,
     hasImage,
@@ -41,6 +46,8 @@ export default function LayerControlsHUD(props: LayerControlsHUDProps): React.JS
     aiRunning,
     aiError,
     onAddSlice,
+    aiEditModelId,
+    onChangeAiEditModel,
   } = props;
 
   // Local drag value: null when not dragging (use props instead)
@@ -179,6 +186,28 @@ export default function LayerControlsHUD(props: LayerControlsHUDProps): React.JS
         M
       </button>
 
+      {/* Invert mask toggle */}
+      {hasImage && (
+        <button
+          type="button"
+          onClick={() => { onInvertMask(layerIndex); }}
+          title="Invert mask (swap visible/transparent regions)"
+          style={{
+            background: "none",
+            border: "1px solid var(--hud-border-btn)",
+            color: "var(--hud-text)",
+            borderRadius: 4,
+            padding: "2px 7px",
+            cursor: "pointer",
+            fontSize: 11,
+            fontWeight: 600,
+            letterSpacing: 0.3,
+          }}
+        >
+          ⊘
+        </button>
+      )}
+
       {/* Opacity slider — 0..100 integer scale */}
       <input
         data-testid="opacity-slider"
@@ -282,6 +311,26 @@ export default function LayerControlsHUD(props: LayerControlsHUDProps): React.JS
           }}
         >
           <label style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+            <span style={{ opacity: 0.6 }}>Model</span>
+            <select
+              value={aiEditModelId}
+              onChange={(e) => { onChangeAiEditModel(e.target.value); }}
+              style={{
+                background: "rgba(255,255,255,0.08)",
+                border: "1px solid var(--hud-border-btn)",
+                borderRadius: 4,
+                padding: "4px 6px",
+                color: "var(--hud-text)",
+                fontSize: 12,
+                outline: "none",
+              }}
+            >
+              {AI_EDIT_MODELS.map((m) => (
+                <option key={m.id} value={m.id}>{m.label}</option>
+              ))}
+            </select>
+          </label>
+          <label style={{ display: "flex", flexDirection: "column", gap: 2 }}>
             <span style={{ opacity: 0.6 }}>Prompt</span>
             <input
               type="text"
@@ -305,6 +354,7 @@ export default function LayerControlsHUD(props: LayerControlsHUDProps): React.JS
               }}
             />
           </label>
+          {getAiEditModel(aiEditModelId).hasStrength && (
           <label style={{ display: "flex", alignItems: "center", gap: 6 }}>
             <span style={{ opacity: 0.6, minWidth: 52 }}>Strength</span>
             <input
@@ -321,6 +371,7 @@ export default function LayerControlsHUD(props: LayerControlsHUDProps): React.JS
               {Math.round(strength * 100)}%
             </span>
           </label>
+          )}
           <button
             type="button"
             disabled={!promptText.trim() || aiRunning}

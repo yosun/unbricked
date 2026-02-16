@@ -4,10 +4,12 @@ const PREFS_KEY = "unbricked.preferences.v1";
 
 export interface ProjectPreferences {
   defaultImageOperationId: string;
+  defaultAiEditModelId: string;
 }
 
 const DEFAULT_PREFS: ProjectPreferences = {
   defaultImageOperationId: "sam3.segment",
+  defaultAiEditModelId: "nano-banana",
 };
 
 export function loadPreferences(): ProjectPreferences {
@@ -20,6 +22,10 @@ export function loadPreferences(): ProjectPreferences {
         typeof parsed.defaultImageOperationId === "string"
           ? parsed.defaultImageOperationId
           : DEFAULT_PREFS.defaultImageOperationId,
+      defaultAiEditModelId:
+        typeof parsed.defaultAiEditModelId === "string"
+          ? parsed.defaultAiEditModelId
+          : DEFAULT_PREFS.defaultAiEditModelId,
     };
   } catch {
     return { ...DEFAULT_PREFS };

@@ -478,6 +478,366 @@ export async function runAutoSegment(
   return FalSam2AutoSegmentResponseSchema.parse(json);
 }
 
+/* ── AI Edit Model Registry ───────────────────── */
+
+export type AiEditModelId = "nano-banana" | "flux1-img2img";
+
+export interface AiEditModelDef {
+  id: AiEditModelId;
+  label: string;
+  proxyRoute: string;
+  hasStrength: boolean;
+}
+
+export const AI_EDIT_MODELS: AiEditModelDef[] = [
+  { id: "nano-banana", label: "Nano Banana", proxyRoute: "fal-ai/nano-banana/edit", hasStrength: false },
+  { id: "flux1-img2img", label: "Flux 1 (img2img)", proxyRoute: "fal-ai/flux/dev/image-to-image", hasStrength: true },
+];
+
+export function getAiEditModel(id: string): AiEditModelDef {
+  const found = AI_EDIT_MODELS.find((m) => m.id === id);
+  if (found) return found;
+  // Default to first model (nano-banana)
+  return AI_EDIT_MODELS[0] ?? { id: "nano-banana" as AiEditModelId, label: "Nano Banana", proxyRoute: "fal-ai/nano-banana/edit", hasStrength: false };
+}
+
+/* ── Nano Banana Edit (fal-ai/nano-banana/edit) ── */
+
+export interface NanoBananaEditRequest {
+  imageDataUrls: string[];
+  prompt: string;
+  numImages?: number;
+  seed?: number;
+  aspectRatio?: string;
+  outputFormat?: "jpeg" | "png" | "webp";
+}
+
+export async function runNanoBananaEdit(
+  req: NanoBananaEditRequest,
+  signal?: AbortSignal,
+): Promise<FalImg2ImgResponse> {
+  const body: Record<string, unknown> = {
+    prompt: req.prompt,
+    image_urls: req.imageDataUrls,
+  };
+  if (req.numImages !== undefined) body["num_images"] = req.numImages;
+  if (req.seed !== undefined) body["seed"] = req.seed;
+  if (req.aspectRatio !== undefined) body["aspect_ratio"] = req.aspectRatio;
+  if (req.outputFormat !== undefined) body["output_format"] = req.outputFormat;
+
+  // Compress each image URL if needed
+  const overhead = JSON.stringify({ ...body, image_urls: [] }).length + 128;
+  const perImageBudget = Math.max(1, Math.floor((MAX_BODY_BYTES - overhead) / Math.max(req.imageDataUrls.length, 1)));
+  const compressed: string[] = [];
+  for (const url of req.imageDataUrls) {
+    compressed.push(await compressDataUrl(url, MAX_BODY_BYTES - perImageBudget));
+  }
+  body["image_urls"] = compressed;
+
+  const url = `${PROXY_BASE}/fal-ai/nano-banana/edit`;
+
+  const response = await proxyFetch(
+    url,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    },
+    { timeoutMs: 120_000, signal },
+  );
+
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(`fal proxy error ${String(response.status)}: ${text}`);
+  }
+
+  const json: unknown = await response.json();
+  return FalImg2ImgResponseSchema.parse(json);
+}
+
+/* ── Alpha Mask Compositing ──────────────────────── */
+
+/**
+ * Apply the alpha channel from a mask source image to an output image.
+ * Used to remove black backgrounds from AI edit results by re-applying
+ * the original slice mask transparency.
+ * Returns a PNG data URL.
+ */
+export async function applyAlphaMask(
+  outputImageUrl: string,
+  maskSourceUrl: string,
+  signal?: AbortSignal,
+): Promise<string> {
+  const [outResp, maskResp] = await Promise.all([
+    fetchImageBlob(outputImageUrl, signal),
+    fetchImageBlob(maskSourceUrl, signal),
+  ]);
+
+  const [outBitmap, maskBitmap] = await Promise.all([
+    createImageBitmap(outResp.blob),
+    createImageBitmap(maskResp.blob),
+  ]);
+
+  const w = outBitmap.width;
+  const h = outBitmap.height;
+
+  const canvas = document.createElement("canvas");
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) throw new Error("Canvas 2D context unavailable");
+
+  ctx.drawImage(outBitmap, 0, 0, w, h);
+  const outData = ctx.getImageData(0, 0, w, h);
+
+  const maskCanvas = document.createElement("canvas");
+  maskCanvas.width = w;
+  maskCanvas.height = h;
+  const maskCtx = maskCanvas.getContext("2d");
+  if (!maskCtx) throw new Error("Canvas 2D context unavailable");
+  maskCtx.drawImage(maskBitmap, 0, 0, w, h);
+  const maskData = maskCtx.getImageData(0, 0, w, h);
+
+  const od = outData.data;
+  const md = maskData.data;
+  for (let i = 0; i < od.length; i += 4) {
+    od[i + 3] = md[i + 3] ?? 0; // copy alpha channel from mask source
+  }
+
+  ctx.putImageData(outData, 0, 0);
+  outBitmap.close();
+  maskBitmap.close();
+
+  return canvas.toDataURL("image/png");
+}
+
+/**
+ * Invert the alpha channel of an image: transparent <-> opaque.
+ * Used for the "invert mask" feature — swapping which part of the slice
+ * is visible vs transparent.
+ * Returns a PNG data URL.
+ */
+export async function invertAlpha(
+  imageUrl: string,
+  signal?: AbortSignal,
+): Promise<string> {
+  const { blob } = await fetchImageBlob(imageUrl, signal);
+  const bitmap = await createImageBitmap(blob);
+
+  const w = bitmap.width;
+  const h = bitmap.height;
+  const canvas = document.createElement("canvas");
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) throw new Error("Canvas 2D context unavailable");
+
+  ctx.drawImage(bitmap, 0, 0, w, h);
+  const imgData = ctx.getImageData(0, 0, w, h);
+  const data = imgData.data;
+
+  for (let i = 0; i < data.length; i += 4) {
+    const a = data[i + 3] ?? 0;
+    data[i + 3] = 255 - a;
+  }
+
+  ctx.putImageData(imgData, 0, 0);
+  bitmap.close();
+  return canvas.toDataURL("image/png");
+}
+
+/**
+ * Invert a mask and composite with the original image.
+ *
+ * PNG round-tripping discards RGB data for fully transparent pixels, so simply
+ * flipping alpha on a pre-masked image produces black regions. This function
+ * takes the original (full) image and the current masked image, inverts the
+ * alpha from the masked image, and uses it to cut out the *opposite* region
+ * from the original — guaranteeing correct RGB everywhere.
+ */
+export async function invertMaskWithOriginal(
+  originalImageUrl: string,
+  maskedImageUrl: string,
+  signal?: AbortSignal,
+): Promise<string> {
+  const [origResp, maskResp] = await Promise.all([
+    fetchImageBlob(originalImageUrl, signal),
+    fetchImageBlob(maskedImageUrl, signal),
+  ]);
+
+  const [origBitmap, maskBitmap] = await Promise.all([
+    createImageBitmap(origResp.blob),
+    createImageBitmap(maskResp.blob),
+  ]);
+
+  const w = origBitmap.width;
+  const h = origBitmap.height;
+
+  // Draw the original image (provides correct RGB for all pixels)
+  const canvas = document.createElement("canvas");
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) throw new Error("Canvas 2D context unavailable");
+  ctx.drawImage(origBitmap, 0, 0, w, h);
+  const origData = ctx.getImageData(0, 0, w, h);
+
+  // Read the masked image to get its alpha channel
+  const maskCanvas = document.createElement("canvas");
+  maskCanvas.width = w;
+  maskCanvas.height = h;
+  const maskCtx = maskCanvas.getContext("2d");
+  if (!maskCtx) throw new Error("Canvas 2D context unavailable");
+  maskCtx.drawImage(maskBitmap, 0, 0, w, h);
+  const maskData = maskCtx.getImageData(0, 0, w, h);
+
+  // Apply inverted alpha from the masked image onto the original's pixels
+  const od = origData.data;
+  const md = maskData.data;
+  for (let i = 0; i < od.length; i += 4) {
+    od[i + 3] = 255 - (md[i + 3] ?? 0);
+  }
+
+  ctx.putImageData(origData, 0, 0);
+  origBitmap.close();
+  maskBitmap.close();
+  return canvas.toDataURL("image/png");
+}
+
+/** Crop bounding box returned alongside the combined mask image. */
+export interface CropInfo {
+  /** Left edge of the crop box in the original image (px). */
+  cropX: number;
+  /** Top edge of the crop box in the original image (px). */
+  cropY: number;
+  /** Width of the cropped region (px). */
+  cropW: number;
+  /** Height of the cropped region (px). */
+  cropH: number;
+  /** Full original image width (px). */
+  origW: number;
+  /** Full original image height (px). */
+  origH: number;
+}
+
+/**
+ * Combine multiple binary masks into one by union (OR), then apply to the
+ * original image, tightly cropped around the mask bounding box.
+ * Returns a PNG data URL and the crop metadata for positioning.
+ */
+export async function combineMasksToOriginal(
+  maskUrls: string[],
+  originalImageUrl: string,
+  signal?: AbortSignal,
+): Promise<{ dataUrl: string; crop: CropInfo }> {
+  if (maskUrls.length === 0) throw new Error("No masks to combine");
+
+  const origResp = await fetchImageBlob(originalImageUrl, signal);
+  const origBitmap = await createImageBitmap(origResp.blob);
+  const w = origBitmap.width;
+  const h = origBitmap.height;
+
+  // Load all masks in parallel
+  const maskBlobs = await Promise.all(
+    maskUrls.map((url) => fetchImageBlob(url, signal)),
+  );
+  const maskBitmaps = await Promise.all(
+    maskBlobs.map((r) => createImageBitmap(r.blob)),
+  );
+
+  // Union foreground from all masks
+  const combined = new Uint8Array(w * h); // 0 = bg, 1 = fg
+  const tmpCanvas = document.createElement("canvas");
+  tmpCanvas.width = w;
+  tmpCanvas.height = h;
+  const tmpCtx = tmpCanvas.getContext("2d");
+  if (!tmpCtx) throw new Error("Canvas 2D context unavailable");
+
+  for (const mb of maskBitmaps) {
+    tmpCtx.clearRect(0, 0, w, h);
+    tmpCtx.drawImage(mb, 0, 0, w, h);
+    const px = tmpCtx.getImageData(0, 0, w, h).data;
+
+    // Detect mask format (alpha vs brightness)
+    let minA = 255, maxA = 0;
+    for (let i = 3; i < px.length; i += 4) {
+      const a = px[i]!;
+      if (a < minA) minA = a;
+      if (a > maxA) maxA = a;
+    }
+    const useAlpha = maxA - minA > 64;
+
+    for (let i = 0; i < px.length; i += 4) {
+      const isFg = useAlpha
+        ? px[i + 3]! > 128
+        : px[i]! > 64 || px[i + 1]! > 64 || px[i + 2]! > 64;
+      if (isFg) combined[i / 4] = 1;
+    }
+    mb.close();
+  }
+
+  // Compute tight bounding box of the combined mask
+  let minX = w, minY = h, maxX = 0, maxY = 0;
+  for (let p = 0; p < combined.length; p++) {
+    if (combined[p]) {
+      const px = p % w;
+      const py = Math.floor(p / w);
+      if (px < minX) minX = px;
+      if (px > maxX) maxX = px;
+      if (py < minY) minY = py;
+      if (py > maxY) maxY = py;
+    }
+  }
+
+  // Fallback: if no foreground pixels, return full-size transparent
+  if (maxX < minX || maxY < minY) {
+    const canvas = document.createElement("canvas");
+    canvas.width = 1;
+    canvas.height = 1;
+    origBitmap.close();
+    return {
+      dataUrl: canvas.toDataURL("image/png"),
+      crop: { cropX: 0, cropY: 0, cropW: w, cropH: h, origW: w, origH: h },
+    };
+  }
+
+  const cropX = minX;
+  const cropY = minY;
+  const cropW = maxX - minX + 1;
+  const cropH = maxY - minY + 1;
+
+  // Draw the original image, apply mask, then crop
+  const fullCanvas = document.createElement("canvas");
+  fullCanvas.width = w;
+  fullCanvas.height = h;
+  const fullCtx = fullCanvas.getContext("2d");
+  if (!fullCtx) throw new Error("Canvas 2D context unavailable");
+  fullCtx.drawImage(origBitmap, 0, 0, w, h);
+  const imgData = fullCtx.getImageData(0, 0, w, h);
+  const data = imgData.data;
+
+  for (let p = 0; p < combined.length; p++) {
+    if (!combined[p]) {
+      data[p * 4 + 3] = 0; // transparent where no mask
+    }
+  }
+  fullCtx.putImageData(imgData, 0, 0);
+
+  // Extract the cropped region
+  const cropCanvas = document.createElement("canvas");
+  cropCanvas.width = cropW;
+  cropCanvas.height = cropH;
+  const cropCtx = cropCanvas.getContext("2d");
+  if (!cropCtx) throw new Error("Canvas 2D context unavailable");
+  cropCtx.drawImage(fullCanvas, cropX, cropY, cropW, cropH, 0, 0, cropW, cropH);
+
+  origBitmap.close();
+  return {
+    dataUrl: cropCanvas.toDataURL("image/png"),
+    crop: { cropX, cropY, cropW, cropH, origW: w, origH: h },
+  };
+}
+
 /* ── Text-to-Image (fal-ai/flux/dev) ───────────── */
 
 export interface TextToImgRequest {
