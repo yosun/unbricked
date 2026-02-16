@@ -332,11 +332,17 @@ function ScrubberPlane(props: ScrubberPlaneProps): React.JSX.Element | null {
         finalLogical = layerOrder[snappedVisual] ?? snappedVisual;
       }
 
-      onPreviewLayer(null);
+      // Commit selection BEFORE clearing preview so effectiveSelectedIndex
+      // never drops to null (which would unmount the LayerControlsHUD).
       onCommitLayer(finalLogical);
+      onPreviewLayer(null);
     },
     [camera, controls, layerCount, layerOrder, currentLogical, onPreviewLayer, onCommitLayer],
   );
+
+  // With a single layer there is nothing to scrub — skip rendering so
+  // the invisible grab mesh does not block clicks on the layer plane.
+  if (layerCount <= 1) return null;
 
   return (
     <group position={[0, y, 0]} rotation={[Math.PI / 2, 0, 0]}>

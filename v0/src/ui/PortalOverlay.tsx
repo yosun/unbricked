@@ -28,6 +28,7 @@ export default function PortalOverlay(props: PortalOverlayProps): React.JSX.Elem
         gap: 4,
         maxHeight: "40%",
         overflowY: "auto",
+        pointerEvents: "none",
       }}
     >
       <div
@@ -57,6 +58,7 @@ export default function PortalOverlay(props: PortalOverlayProps): React.JSX.Elem
               padding: "5px 10px",
               backdropFilter: "blur(10px)",
               WebkitBackdropFilter: "blur(10px)",
+              pointerEvents: "auto",
             }}
           >
             <span style={{ fontSize: 12, color: "var(--hud-text)", flex: 1 }}>

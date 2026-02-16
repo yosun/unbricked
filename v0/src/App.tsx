@@ -25,10 +25,10 @@ import type { AnnotationId, Edge, GraphPatch, GraphPatchOp, JsonObject, PayloadI
 import { findPortalEdges } from "./core";
 import { runImg2Img, fetchImageBlob } from "./services/falProxy";
 import SpaceViewport from "./ui/SpaceViewport";
-import SpaceAddressHUD from "./ui/SpaceAddressHUD";
+import SpaceAddressHUD from "./slice8/SpaceAddressHUD";
+import { useSpaceNav } from "./slice8/useSpaceNav";
 import PortalOverlay from "./ui/PortalOverlay";
 import ViewModeSwitcher from "./ui/ViewModeSwitcher";
-import { useSpaceNav } from "./ui/useSpaceNav";
 import type { AnimPhase } from "./ui/CameraRig";
 import type { ViewMode } from "./ui/ViewMode";
 
@@ -53,7 +53,16 @@ export default function App(): React.JSX.Element {
 
   const rootSpaceId = state.manifest.rootSpaceId;
   const spaceNav = useSpaceNav(rootSpaceId);
-  const activeSpaceId = spaceNav.currentSpaceId;
+  const activeSpaceId = spaceNav.current;
+
+  // Trigger camera transition whenever the active space changes (covers browser back/forward)
+  const prevActiveRef = useRef(activeSpaceId);
+  useEffect(() => {
+    if (activeSpaceId !== prevActiveRef.current) {
+      prevActiveRef.current = activeSpaceId;
+      setAnimPhase("spaceTransition");
+    }
+  }, [activeSpaceId]);
 
   /** Central commit: applies a patch, pushes to undo stack, clears redo, persists. */
   const commitPatch = useCallback(
@@ -118,8 +127,7 @@ export default function App(): React.JSX.Element {
       else if (prev === "spaceTransition") setIsTopDown(false);
       return "idle";
     });
-    spaceNav.onTransitionDone();
-  }, [spaceNav]);
+  }, []);
 
   const handleResetView = useCallback(() => {
     setAnimPhase("reset");
@@ -137,12 +145,11 @@ export default function App(): React.JSX.Element {
     setViewMode(mode);
   }, []);
 
-  /** Navigate to a different space with camera transition. */
+  /** Navigate to a different space via portal entry. Camera transition handled by activeSpaceId effect. */
   const handleNavigateToSpace = useCallback(
     (spaceId: SpaceId) => {
       if (!state.spaces[spaceId]) return; // target must exist
-      spaceNav.navigateTo(spaceId);
-      setAnimPhase("spaceTransition");
+      void spaceNav.navigateTo(spaceId);
     },
     [state.spaces, spaceNav],
   );
@@ -633,24 +640,6 @@ export default function App(): React.JSX.Element {
       if (e.key === "[") { handleStepLayer(-1); return; }
       if (e.key === "]") { handleStepLayer(1); return; }
 
-      // Spatial back/forward: Alt+Left / Alt+Right
-      if (e.altKey && e.key === "ArrowLeft") {
-        e.preventDefault();
-        if (spaceNav.canGoBack) {
-          spaceNav.goBack();
-          setAnimPhase("spaceTransition");
-        }
-        return;
-      }
-      if (e.altKey && e.key === "ArrowRight") {
-        e.preventDefault();
-        if (spaceNav.canGoForward) {
-          spaceNav.goForward();
-          setAnimPhase("spaceTransition");
-        }
-        return;
-      }
-
       // Peek overlays: hold Tab = layers, hold Shift = rail
       if (e.key === "Tab" && !mod) {
         e.preventDefault();
@@ -678,7 +667,7 @@ export default function App(): React.JSX.Element {
       window.removeEventListener("keydown", onKeyDown);
       window.removeEventListener("keyup", onKeyUp);
     };
-  }, [handleClearSelection, handleUndo, handleRedo, handleStepLayer, handleSetViewMode, spaceNav]);
+  }, [handleClearSelection, handleUndo, handleRedo, handleStepLayer, handleSetViewMode]);
 
   return (
     <div style={{ height: "100%", display: "grid", gridTemplateRows: "48px 1fr" }}>
@@ -826,19 +815,8 @@ export default function App(): React.JSX.Element {
           aiError={aiError}
         />
         <SpaceAddressHUD
-          currentSpaceId={activeSpaceId}
-          space={activeSpace}
-          origin={spaceNav.origin}
-          canGoBack={spaceNav.canGoBack}
-          canGoForward={spaceNav.canGoForward}
-          onSetOrigin={spaceNav.setOrigin}
-          onReturnToOrigin={spaceNav.returnToOrigin}
-          onGoBack={() => {
-            if (spaceNav.goBack()) setAnimPhase("spaceTransition");
-          }}
-          onGoForward={() => {
-            if (spaceNav.goForward()) setAnimPhase("spaceTransition");
-          }}
+          fallbackSpaceId={rootSpaceId}
+          spaces={state.spaces}
         />
         <PortalOverlay
           portalEdges={portalEdges}

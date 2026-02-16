@@ -34,6 +34,8 @@ export default function LayerScrubber(props: LayerScrubberProps): React.JSX.Elem
 
   // Drag state: which tick is being dragged (by posIdx), and the live order
   const [dragPosIdx, setDragPosIdx] = useState<number | null>(null);
+  // Mirror as ref so handlePointerUp never sees a stale closure value
+  const dragPosIdxRef = useRef<number | null>(null);
   // Pixel offset of the dragged tick from its home position (continuous visual feedback)
   const [dragOffsetPx, setDragOffsetPx] = useState(0);
   const dragStartY = useRef(0);
@@ -65,6 +67,7 @@ export default function LayerScrubber(props: LayerScrubberProps): React.JSX.Elem
       if (railRef.current) {
         railRef.current.setPointerCapture(e.pointerId);
       }
+      dragPosIdxRef.current = posIdx;
       setDragPosIdx(posIdx);
       setDragOffsetPx(0);
       dragStartY.current = e.clientY;
@@ -104,6 +107,7 @@ export default function LayerScrubber(props: LayerScrubberProps): React.JSX.Elem
           if (item === undefined) return;
           newOrder.splice(targetPos, 0, item);
           currentOrder.current = newOrder;
+          dragPosIdxRef.current = targetPos;
           setDragPosIdx(targetPos);
           dragStartY.current = e.clientY;
           setDragOffsetPx(0);
@@ -116,37 +120,42 @@ export default function LayerScrubber(props: LayerScrubberProps): React.JSX.Elem
 
   const handlePointerUp = useCallback(
     (e: React.PointerEvent<HTMLDivElement>) => {
-      if (dragPosIdx === null) return;
+      // Use ref to avoid stale-closure issues when pointerup fires
+      // in the same frame as pointerdown (fast clicks / touch devices).
+      const posIdx = dragPosIdxRef.current;
+      if (posIdx === null) return;
       e.stopPropagation();
 
       const movedOrder = currentOrder.current;
-      const logicalIdx = movedOrder[dragPosIdx] ?? dragPosIdx;
+      const logicalIdx = movedOrder[posIdx] ?? posIdx;
 
       // Compare against the order captured at drag-start, NOT the current prop
       // (which includes the preview and would always match movedOrder).
       const orderChanged = !movedOrder.every((v, i) => v === originalOrder.current[i]);
 
       activePointerId.current = null;
+      dragPosIdxRef.current = null;
       justFinishedDrag.current = true;
       setDragPosIdx(null);
       setDragOffsetPx(0);
-      onPreview(null);
 
-      // Commit BEFORE clearing preview to avoid bounce-back:
-      // clearing previewOrder reverts effectiveOrder to persisted (old) order,
-      // so the commit must land first.
+      // Commit selection BEFORE clearing preview so effectiveSelectedIndex
+      // never drops to null (which would unmount the LayerControlsHUD).
       if (orderChanged) {
         onCommitOrder(movedOrder);
       }
-      onPreviewOrder(null);
-      // Always commit selection
       onCommit(logicalIdx);
+
+      // Now safe to clear transient preview state
+      onPreview(null);
+      onPreviewOrder(null);
     },
-    [dragPosIdx, onPreview, onCommit, onPreviewOrder, onCommitOrder],
+    [onPreview, onCommit, onPreviewOrder, onCommitOrder],
   );
 
   const handlePointerCancel = useCallback(() => {
     activePointerId.current = null;
+    dragPosIdxRef.current = null;
     setDragPosIdx(null);
     setDragOffsetPx(0);
     onPreview(null);
