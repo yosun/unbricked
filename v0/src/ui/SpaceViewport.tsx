@@ -13,9 +13,19 @@ import type { AnimPhase } from "./CameraRig";
 import type { ViewMode } from "./ViewMode";
 
 /* ── Shared prism dimensions ──────────────────────── */
-const PRISM_W = 4;
 const PRISM_H = 2.5;
-const PRISM_D = 3;
+const DEFAULT_PRISM_W = 4;
+const DEFAULT_PRISM_D = 3;
+
+/** Compute prism W and D from an image aspect ratio (width/height). */
+function prismDims(imageAspect: number | null): { prismW: number; prismD: number } {
+  if (!imageAspect || imageAspect <= 0) return { prismW: DEFAULT_PRISM_W, prismD: DEFAULT_PRISM_D };
+  // Keep roughly the same visual area (~12 sq units) while matching the aspect ratio.
+  const area = DEFAULT_PRISM_W * DEFAULT_PRISM_D;
+  const prismW = Math.sqrt(area * imageAspect);
+  const prismD = area / prismW;
+  return { prismW, prismD };
+}
 
 /** Distinct hue per logical layer index (evenly spaced around the wheel). */
 function layerHue(layerIdx: number, layerCount: number): string {
@@ -57,6 +67,7 @@ interface SpacePrismProps {
   dragOverride?: DragOverride | null;
   suppressClicks?: boolean;
   layerTextures: Record<number, string>;
+  imageAspect: number | null;
 }
 
 /** Load a texture from a URL (data: or http) and cache by URI. */
@@ -95,7 +106,7 @@ function TexturedLayerPlane({
   const texture = useLayerTexture(uri);
   if (!texture) return null;
   return (
-    <mesh rotation={[Math.PI / 2, 0, 0]} position={[0, 0.02, 0]}>
+    <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, 0.02, 0]}>
       <planeGeometry args={[width * 0.96, depth * 0.96]} />
       <meshBasicMaterial
         map={texture}
@@ -108,8 +119,7 @@ function TexturedLayerPlane({
   );
 }
 
-/** How far hidden layers slide to the right — fully outside the brick. */
-const HIDDEN_SLIDE_X = PRISM_W + 0.5;
+
 
 /**
  * Compute how many brick-space Y-units correspond to one screen pixel,
@@ -134,7 +144,9 @@ function CameraRef({ cameraRef }: { cameraRef: React.MutableRefObject<Camera | n
 }
 
 function SpacePrism(props: SpacePrismProps): React.JSX.Element {
-  const { layerCount, selectedLayerIndex, layerVisibility, layerOrder, onSelectLayer, dragOverride, suppressClicks, layerTextures } = props;
+  const { layerCount, selectedLayerIndex, layerVisibility, layerOrder, onSelectLayer, dragOverride, suppressClicks, layerTextures, imageAspect } = props;
+  const { prismW, prismD } = prismDims(imageAspect);
+  const hiddenSlideX = prismW + 0.5;
 
   // When a layer is being dragged, compute adjusted Y positions for non-dragged layers
   // so they "make room" without relying on parent re-renders (which cause ghost duplicates).
@@ -170,7 +182,7 @@ function SpacePrism(props: SpacePrismProps): React.JSX.Element {
   return (
     <group>
       <mesh>
-        <boxGeometry args={[PRISM_W, PRISM_H, PRISM_D]} />
+        <boxGeometry args={[prismW, PRISM_H, prismD]} />
         <meshBasicMaterial wireframe transparent opacity={0.4} color="#8888aa" />
       </mesh>
 
@@ -178,7 +190,7 @@ function SpacePrism(props: SpacePrismProps): React.JSX.Element {
         const vis = layerVisibility[layerIdx];
         const hidden = vis ? !vis.visible : false;
         // Hidden layers slide to the right — same size, like slides pushed aside
-        const x = hidden ? HIDDEN_SLIDE_X : 0;
+        const x = hidden ? hiddenSlideX : 0;
         const selected = layerIdx === selectedLayerIndex;
         const scale: [number, number, number] = selected
           ? [1.02, 1.02, 1.02]
@@ -196,7 +208,7 @@ function SpacePrism(props: SpacePrismProps): React.JSX.Element {
                 if (!suppressClicks) onSelectLayer(layerIdx);
               }}
             >
-              <planeGeometry args={[PRISM_W * 0.96, PRISM_D * 0.96]} />
+              <planeGeometry args={[prismW * 0.96, prismD * 0.96]} />
               <meshBasicMaterial
                 transparent
                 opacity={isDragged ? Math.max(opacity, 0.5) : opacity}
@@ -209,8 +221,8 @@ function SpacePrism(props: SpacePrismProps): React.JSX.Element {
             {layerTextures[layerIdx] && (
               <TexturedLayerPlane
                 uri={layerTextures[layerIdx]}
-                width={PRISM_W}
-                depth={PRISM_D}
+                width={prismW}
+                depth={prismD}
               />
             )}
             <Text
@@ -239,6 +251,7 @@ interface ScrubberPlaneProps {
   layerOrder: number[];
   onPreviewLayer: (index: number | null) => void;
   onCommitLayer: (index: number) => void;
+  imageAspect: number | null;
 }
 
 const _dragPlane = new Plane(new Vector3(0, 0, 1), 0);
@@ -246,7 +259,8 @@ const _intersection = new Vector3();
 const _raycaster = new Raycaster();
 
 function ScrubberPlane(props: ScrubberPlaneProps): React.JSX.Element | null {
-  const { layerCount, selectedLayerIndex, layerOrder, onPreviewLayer, onCommitLayer } = props;
+  const { layerCount, selectedLayerIndex, layerOrder, onPreviewLayer, onCommitLayer, imageAspect } = props;
+  const { prismW, prismD } = prismDims(imageAspect);
   const { camera, controls } = useThree();
   const dragging = useRef(false);
   const startY = useRef(0);
@@ -328,7 +342,7 @@ function ScrubberPlane(props: ScrubberPlaneProps): React.JSX.Element | null {
     <group position={[0, y, 0]} rotation={[Math.PI / 2, 0, 0]}>
       {/* Visible scrubber indicator — thin line across the prism */}
       <mesh>
-        <planeGeometry args={[PRISM_W * 0.98, PRISM_D * 0.02]} />
+        <planeGeometry args={[prismW * 0.98, prismD * 0.02]} />
         <meshBasicMaterial
           transparent
           opacity={0.6}
@@ -343,7 +357,7 @@ function ScrubberPlane(props: ScrubberPlaneProps): React.JSX.Element | null {
         onPointerMove={handlePointerMove}
         onPointerUp={handlePointerUp}
       >
-        <planeGeometry args={[PRISM_W * 0.5, PRISM_D * 0.5]} />
+        <planeGeometry args={[prismW * 0.5, prismD * 0.5]} />
         <meshBasicMaterial
           transparent
           opacity={0}
@@ -379,6 +393,7 @@ interface SpaceViewportProps {
   peekRail: boolean;
   onClearSelection: () => void;
   layerTextures: Record<number, string>;
+  imageAspect: number | null;
   onImportImage: () => void;
   onAiEdit: (prompt: string, strength?: number) => void;
   aiRunning: boolean;
@@ -409,6 +424,7 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
     peekLayers,
     peekRail,
     layerTextures,
+    imageAspect,
     onImportImage,
     onAiEdit,
     aiRunning,
@@ -623,6 +639,7 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
           dragOverride={dragOverride}
           suppressClicks={longPressSelected || dragReorder}
           layerTextures={layerTextures}
+          imageAspect={imageAspect}
         />
         <ScrubberPlane
           layerCount={layerCount}
@@ -630,6 +647,7 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
           layerOrder={layerOrder}
           onPreviewLayer={onPreviewLayer}
           onCommitLayer={onSelectLayer}
+          imageAspect={imageAspect}
         />
         <CameraRef cameraRef={cameraRef} />
         <CameraRig animPhase={animPhase} onAnimDone={onAnimDone} />

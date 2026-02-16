@@ -352,6 +352,20 @@ export default function App(): React.JSX.Element {
     return result;
   }, [layerCount, layerRender, state.payloads]);
 
+  /** Derive aspect ratio (width/height) from the first payload that has dimensions. */
+  const imageAspect = useMemo<number | null>(() => {
+    for (let i = 0; i < layerCount; i++) {
+      const pid = layerPayloadId(layerRender, i);
+      if (!pid) continue;
+      const payload = state.payloads[pid as PayloadId];
+      if (!payload) continue;
+      const w = Number(payload.meta.width);
+      const h = Number(payload.meta.height);
+      if (w > 0 && h > 0) return w / h;
+    }
+    return null;
+  }, [layerCount, layerRender, state.payloads]);
+
   /**
    * Helper: emit a render-mapping update patch.
    * Takes the current render annotation (or creates one) and applies an updater.
@@ -413,6 +427,14 @@ export default function App(): React.JSX.Element {
       reader.readAsDataURL(file);
     });
 
+    // Read image natural dimensions
+    const { w: imgW, h: imgH } = await new Promise<{ w: number; h: number }>((resolve) => {
+      const img = new Image();
+      img.onload = () => { resolve({ w: img.naturalWidth, h: img.naturalHeight }); };
+      img.onerror = () => { resolve({ w: 0, h: 0 }); };
+      img.src = dataUrl;
+    });
+
     const payloadId = makeId("payload");
     const payloadValue: JsonObject = {
       id: payloadId,
@@ -421,7 +443,9 @@ export default function App(): React.JSX.Element {
       uri: dataUrl,
       sha256: hash,
       bytes: buffer.byteLength,
-      meta: {},
+      meta: {
+        ...(imgW > 0 && imgH > 0 ? { width: String(imgW), height: String(imgH) } : {}),
+      },
     };
 
     const layerIdx = effectiveSelectedIndex;
@@ -478,6 +502,8 @@ export default function App(): React.JSX.Element {
         const outHash = await sha256Hex(outBuffer);
 
         const outPayloadId = makeId("payload");
+        const outW = firstImage.width;
+        const outH = firstImage.height;
         const outPayloadValue: JsonObject = {
           id: outPayloadId,
           kind: "Payload",
@@ -485,7 +511,9 @@ export default function App(): React.JSX.Element {
           uri: outputImageUrl,
           sha256: outHash,
           bytes: outBuffer.byteLength,
-          meta: {},
+          meta: {
+            ...(outW && outH ? { width: String(outW), height: String(outH) } : {}),
+          },
         };
 
         // Create OperatorRun for provenance
@@ -745,6 +773,7 @@ export default function App(): React.JSX.Element {
         peekRail={peekRail}
         onClearSelection={handleClearSelection}
         layerTextures={layerTextures}
+        imageAspect={imageAspect}
         onImportImage={() => { void handleImportImage(); }}
         onAiEdit={(prompt, strength) => { void handleAiEdit(prompt, strength); }}
         aiRunning={aiRunning}
