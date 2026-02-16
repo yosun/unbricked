@@ -14,6 +14,7 @@ interface LayerControlsHUDProps {
   onAiEdit: (prompt: string, strength?: number) => void;
   aiRunning: boolean;
   aiError: string | null;
+  onAddSlice: () => void;
 }
 
 function clamp01(v: number): number {
@@ -35,6 +36,7 @@ export default function LayerControlsHUD(props: LayerControlsHUDProps): React.JS
     onAiEdit,
     aiRunning,
     aiError,
+    onAddSlice,
   } = props;
 
   // Local drag value: null when not dragging (use props instead)
@@ -176,6 +178,24 @@ export default function LayerControlsHUD(props: LayerControlsHUDProps): React.JS
 
       {/* Separator */}
       <span style={{ width: 1, height: 16, background: "var(--hud-border)", margin: "0 2px" }} />
+
+      {/* Add Slice */}
+      <button
+        type="button"
+        onClick={onAddSlice}
+        title="Add a new slice"
+        style={{
+          background: "none",
+          border: "1px solid var(--hud-border-btn)",
+          color: "var(--hud-text)",
+          borderRadius: 4,
+          padding: "2px 7px",
+          cursor: "pointer",
+          fontSize: 13,
+        }}
+      >
+        ＋
+      </button>
 
       {/* Import Image */}
       <button

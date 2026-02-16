@@ -10,7 +10,8 @@
 			"q": true,
 			"npx tsc": true,
 			"npx eslint": true,
-			"npx vitest": true
+			"npx vitest": true,
+			"npx vite": true
 		}
 	}
 }

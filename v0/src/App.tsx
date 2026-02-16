@@ -355,6 +355,58 @@ export default function App(): React.JSX.Element {
     });
   }, [activeSpaceId, commitPatch]);
 
+  /** Add a new slice (layer) to the active space and select it. */
+  const handleAddSlice = useCallback(() => {
+    commitPatch((prev) => {
+      const space = prev.spaces[activeSpaceId];
+      if (!space) return null;
+
+      const newCount = space.layerCount + 1;
+      const newLayerIdx = space.layerCount; // 0-based, so old count = new index
+
+      const ops: GraphPatchOp[] = [];
+
+      // 1. Update space with incremented layerCount
+      const updatedSpace: JsonObject = {
+        ...space,
+        layerCount: newCount,
+      };
+      ops.push(putOp("Space", activeSpaceId, updatedSpace));
+
+      // 2. Extend layer order if one exists (append new index at top)
+      const existingOrder = findLayerOrder(prev, activeSpaceId);
+      if (existingOrder) {
+        const newOrder = [...existingOrder.order, newLayerIdx];
+        const orderAnnotation: JsonObject = {
+          id: existingOrder.annotationId,
+          kind: "Annotation",
+          target: { kind: "Space", id: activeSpaceId },
+          schema: "ui.layers.order",
+          data: { order: serializeOrder(newOrder) },
+          createdAt: new Date().toISOString(),
+        };
+        ops.push(putOp("Annotation", existingOrder.annotationId, orderAnnotation));
+      }
+
+      // 3. Select the new layer
+      const existingSel = findLayerSelection(prev, activeSpaceId);
+      const selAnnId: AnnotationId = existingSel
+        ? existingSel.annotationId
+        : makeId("annotation");
+      const selAnnotation: JsonObject = {
+        id: selAnnId,
+        kind: "Annotation",
+        target: { kind: "Space", id: activeSpaceId },
+        schema: "ui.selection.layerIndex",
+        data: { layerIndex: String(newLayerIdx) },
+        createdAt: new Date().toISOString(),
+      };
+      ops.push(putOp("Annotation", selAnnId, selAnnotation));
+
+      return newPatch({ baseRevision: prev.revision, ops });
+    });
+  }, [activeSpaceId, commitPatch]);
+
   /* ── AI / Import state ───────────────────────────── */
   const [aiRunning, setAiRunning] = useState(false);
   const [aiError, setAiError] = useState<string | null>(null);
@@ -813,6 +865,7 @@ export default function App(): React.JSX.Element {
           onAiEdit={(prompt, strength) => { void handleAiEdit(prompt, strength); }}
           aiRunning={aiRunning}
           aiError={aiError}
+          onAddSlice={handleAddSlice}
         />
         <SpaceAddressHUD
           fallbackSpaceId={rootSpaceId}

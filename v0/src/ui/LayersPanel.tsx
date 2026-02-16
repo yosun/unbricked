@@ -15,6 +15,12 @@ interface LayersPanelProps {
   onCommitOpacity: (index: number, value: number) => void;
   onPreviewOrder: (order: number[] | null) => void;
   onCommitOrder: (order: number[]) => void;
+  onImportImage: () => void;
+  onAiEdit: (prompt: string, strength?: number) => void;
+  aiRunning: boolean;
+  aiError: string | null;
+  onAddSlice: () => void;
+  layerTextures: Record<number, string>;
 }
 
 const ITEM_H = 40;
@@ -43,6 +49,12 @@ export default function LayersPanel(props: LayersPanelProps): React.JSX.Element 
     onCommitOpacity,
     onPreviewOrder,
     onCommitOrder,
+    onImportImage,
+    onAiEdit,
+    aiRunning,
+    aiError,
+    onAddSlice,
+    layerTextures,
   } = props;
 
   /* ── Drag reorder state ──────────────────────── */
@@ -62,6 +74,11 @@ export default function LayersPanel(props: LayersPanelProps): React.JSX.Element 
 
   /* ── Per-layer inline opacity editing ───────── */
   const [editingOpacityLayer, setEditingOpacityLayer] = useState<number | null>(null);
+
+  /* ── Per-layer AI prompt ───────── */
+  const [showAiPromptLayer, setShowAiPromptLayer] = useState<number | null>(null);
+  const [promptText, setPromptText] = useState("");
+  const [strength, setStrength] = useState(0.75);
 
   const handleDragPointerDown = useCallback(
     (viewIdx: number, e: React.PointerEvent<HTMLSpanElement>) => {
@@ -164,9 +181,29 @@ export default function LayersPanel(props: LayersPanelProps): React.JSX.Element 
           color: "var(--hud-muted)",
           borderBottom: "1px solid var(--hud-border)",
           flexShrink: 0,
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
         }}
       >
         Layers
+        <button
+          type="button"
+          onClick={onAddSlice}
+          title="Add a new slice"
+          style={{
+            background: "none",
+            border: "1px solid var(--hud-border-btn, rgba(255,255,255,0.15))",
+            color: "var(--hud-text)",
+            borderRadius: 4,
+            padding: "1px 7px",
+            cursor: "pointer",
+            fontSize: 14,
+            lineHeight: 1,
+          }}
+        >
+          ＋
+        </button>
       </div>
 
       {/* Layer list */}
@@ -303,6 +340,48 @@ export default function LayersPanel(props: LayersPanelProps): React.JSX.Element 
               >
                 {Math.round(opacity * 100)}%
               </span>
+
+              {/* Import image (selected row only) */}
+              {isSelected && (
+                <button
+                  type="button"
+                  onClick={(e) => { e.stopPropagation(); onImportImage(); }}
+                  title="Import image onto this layer"
+                  style={{
+                    background: "none",
+                    border: "none",
+                    color: "var(--hud-text)",
+                    cursor: "pointer",
+                    fontSize: 13,
+                    padding: "2px 3px",
+                    flexShrink: 0,
+                    opacity: 0.8,
+                  }}
+                >
+                  📥
+                </button>
+              )}
+
+              {/* AI Edit (selected row with image only) */}
+              {isSelected && layerIdx in layerTextures && (
+                <button
+                  type="button"
+                  onClick={(e) => { e.stopPropagation(); setShowAiPromptLayer(showAiPromptLayer === layerIdx ? null : layerIdx); }}
+                  disabled={aiRunning}
+                  title="AI Edit (img2img)"
+                  style={{
+                    background: showAiPromptLayer === layerIdx ? "var(--hud-active)" : "none",
+                    border: "none",
+                    color: aiRunning ? "var(--hud-muted)" : "var(--scrubber-active)",
+                    cursor: aiRunning ? "wait" : "pointer",
+                    fontSize: 13,
+                    padding: "2px 3px",
+                    flexShrink: 0,
+                  }}
+                >
+                  {aiRunning ? "⏳" : "✨"}
+                </button>
+              )}
             </div>
           );
         })}
@@ -347,6 +426,86 @@ export default function LayersPanel(props: LayersPanelProps): React.JSX.Element 
           <span style={{ fontSize: 10, color: "var(--hud-muted)", minWidth: 28, textAlign: "right" }}>
             {Math.round(persistedOpacity(editingOpacityLayer) * 100)}%
           </span>
+        </div>
+      )}
+
+      {/* AI prompt panel for selected layer */}
+      {showAiPromptLayer !== null && (
+        <div
+          style={{
+            padding: "8px 12px",
+            borderTop: "1px solid var(--hud-border)",
+            display: "flex",
+            flexDirection: "column",
+            gap: 6,
+            flexShrink: 0,
+            fontSize: 12,
+          }}
+        >
+          <label style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+            <span style={{ opacity: 0.6, fontSize: 11 }}>Prompt (L{showAiPromptLayer})</span>
+            <input
+              type="text"
+              value={promptText}
+              onChange={(e) => { setPromptText(e.target.value); }}
+              onKeyDown={(e) => {
+                e.stopPropagation();
+                if (e.key === "Enter" && promptText.trim() && !aiRunning) {
+                  onAiEdit(promptText.trim(), strength);
+                }
+              }}
+              placeholder="Describe the edit..."
+              style={{
+                background: "rgba(255,255,255,0.08)",
+                border: "1px solid var(--hud-border-btn, rgba(255,255,255,0.15))",
+                borderRadius: 4,
+                padding: "4px 6px",
+                color: "var(--hud-text)",
+                fontSize: 12,
+                outline: "none",
+              }}
+            />
+          </label>
+          <label style={{ display: "flex", alignItems: "center", gap: 6 }}>
+            <span style={{ opacity: 0.6, minWidth: 52 }}>Strength</span>
+            <input
+              type="range"
+              min={0}
+              max={100}
+              step={1}
+              value={Math.round(strength * 100)}
+              onChange={(e) => { setStrength(Number(e.target.value) / 100); }}
+              onKeyDown={(e) => { e.stopPropagation(); }}
+              style={{ flex: 1, accentColor: "var(--scrubber-active)", cursor: "pointer" }}
+            />
+            <span style={{ opacity: 0.5, minWidth: 30, textAlign: "right" }}>
+              {Math.round(strength * 100)}%
+            </span>
+          </label>
+          <button
+            type="button"
+            disabled={!promptText.trim() || aiRunning}
+            onClick={() => {
+              if (promptText.trim()) onAiEdit(promptText.trim(), strength);
+            }}
+            style={{
+              background: aiRunning ? "var(--hud-muted)" : "var(--scrubber-active)",
+              border: "none",
+              borderRadius: 4,
+              padding: "5px 10px",
+              color: "#111",
+              cursor: aiRunning ? "wait" : "pointer",
+              fontWeight: 600,
+              fontSize: 12,
+            }}
+          >
+            {aiRunning ? "Running…" : "Run AI Edit"}
+          </button>
+          {aiError && (
+            <div style={{ color: "#e55", fontSize: 11, wordBreak: "break-word" }}>
+              {aiError}
+            </div>
+          )}
         </div>
       )}
     </div>

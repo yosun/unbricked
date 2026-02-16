@@ -165,7 +165,7 @@ function SpacePrism(props: SpacePrismProps): React.JSX.Element {
     tempOrder.splice(targetSlot, 0, dragIdx);
 
     for (let posIdx = 0; posIdx < tempOrder.length; posIdx++) {
-      const li = tempOrder[posIdx]!;
+      const li = tempOrder[posIdx] ?? posIdx;
       if (li === dragIdx) {
         // Dragged layer renders at the continuous override Y
         positions.push({ layerIdx: li, y: dragOverride.y, isDragged: true });
@@ -175,7 +175,7 @@ function SpacePrism(props: SpacePrismProps): React.JSX.Element {
     }
   } else {
     for (let posIdx = 0; posIdx < layerOrder.length; posIdx++) {
-      positions.push({ layerIdx: layerOrder[posIdx]!, y: layerY(posIdx, layerCount), isDragged: false });
+      positions.push({ layerIdx: layerOrder[posIdx] ?? posIdx, y: layerY(posIdx, layerCount), isDragged: false });
     }
   }
 
@@ -404,6 +404,7 @@ interface SpaceViewportProps {
   onAiEdit: (prompt: string, strength?: number) => void;
   aiRunning: boolean;
   aiError: string | null;
+  onAddSlice: () => void;
 }
 
 export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Element {
@@ -435,6 +436,7 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
     onAiEdit,
     aiRunning,
     aiError,
+    onAddSlice,
   } = props;
   const animating = animPhase !== "idle";
 
@@ -611,6 +613,12 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
     { label: "Solo", icon: "S", action: () => {
       if (selectedLayerIndex !== null) onToggleSolo(selectedLayerIndex);
     }},
+    { label: "Import", icon: "📥", action: () => {
+      onImportImage();
+    }},
+    { label: "+Slice", icon: "＋", action: () => {
+      onAddSlice();
+    }},
   ];
 
   /* ── Determine what to show ──────────────────── */
@@ -699,6 +707,7 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
           onAiEdit={onAiEdit}
           aiRunning={aiRunning}
           aiError={aiError}
+          onAddSlice={onAddSlice}
         />
       )}
 
@@ -719,6 +728,12 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
           onCommitOpacity={onCommitOpacity}
           onPreviewOrder={onPreviewOrder}
           onCommitOrder={onCommitOrder}
+          onImportImage={onImportImage}
+          onAiEdit={onAiEdit}
+          aiRunning={aiRunning}
+          aiError={aiError}
+          onAddSlice={onAddSlice}
+          layerTextures={layerTextures}
         />
       )}
 
