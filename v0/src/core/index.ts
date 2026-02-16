@@ -7,3 +7,5 @@ export * from "./selectors";
 export * from "./persistProjectState";
 export * from "./sampleProject";
 export * from "./crypto";
+export * from "./operations";
+export * from "./preferences";

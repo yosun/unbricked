@@ -864,3 +864,180 @@ describe("selectors — layerPayloadId defaults", () => {
     expect(layerPayloadId(null, 5)).toBeNull();
   });
 });
+
+describe("full ingest + operation flow simulation", () => {
+  const baseState = sampleProject.state;
+  const rootSpaceId = baseState.manifest.rootSpaceId;
+
+  it("simulates handleIngestCommit → operation commit → layerTextures derivation", () => {
+    // Step 1: Ingest commit — creates payload + render annotation with payload.0
+    const payloadId = makeId("payload");
+    const renderAnnId = makeId("annotation");
+    const ingestPatch = newPatch({
+      baseRevision: baseState.revision,
+      ops: [
+        putOp("Payload", payloadId, {
+          id: payloadId,
+          kind: "Payload",
+          mediaType: "image/jpeg",
+          uri: "data:image/jpeg;base64,FAKE_ORIGINAL_IMAGE",
+          sha256: "abc123",
+          bytes: 100,
+          meta: { width: "512", height: "512" },
+        }),
+        putOp("Annotation", renderAnnId, {
+          id: renderAnnId,
+          kind: "Annotation",
+          target: { kind: "Space", id: rootSpaceId },
+          schema: "ui.layers.render",
+          data: { "payload.0": payloadId },
+          createdAt: new Date().toISOString(),
+        }),
+      ],
+    });
+    const stateAfterIngest = applyPatch(baseState, ingestPatch);
+
+    // Verify: render annotation exists with payload.0
+    const renderAfterIngest = findLayerRender(stateAfterIngest, rootSpaceId);
+    expect(renderAfterIngest).not.toBeNull();
+    expect(layerPayloadId(renderAfterIngest, 0)).toBe(payloadId);
+
+    // Step 2: handleSelectLayer(0) — creates selection annotation
+    const selAnnId = makeId("annotation");
+    const selectPatch = newPatch({
+      baseRevision: stateAfterIngest.revision,
+      ops: [
+        putOp("Annotation", selAnnId, {
+          id: selAnnId,
+          kind: "Annotation",
+          target: { kind: "Space", id: rootSpaceId },
+          schema: "ui.selection.layerIndex",
+          data: { layerIndex: "0" },
+          createdAt: new Date().toISOString(),
+        }),
+      ],
+    });
+    const stateAfterSelect = applyPatch(stateAfterIngest, selectPatch);
+
+    // Step 3: Operation produces ops (simulating operationRunner output)
+    // The operation creates 3 mask payloads, updates layerCount, updates render annotation
+    const maskPayloadIds = [makeId("payload"), makeId("payload"), makeId("payload")];
+    const opOps: typeof ingestPatch.ops = [];
+
+    // 3a. Mask payloads
+    for (let i = 0; i < maskPayloadIds.length; i++) {
+      const mpid = maskPayloadIds[i]!;
+      opOps.push(putOp("Payload", mpid, {
+        id: mpid,
+        kind: "Payload",
+        mediaType: "image/png",
+        uri: `data:image/png;base64,FAKE_MASK_${String(i)}`,
+        sha256: `mask_hash_${String(i)}`,
+        bytes: 50,
+        meta: {
+          width: "512",
+          height: "512",
+          sourcePayloadId: payloadId,
+          segmentIndex: String(i),
+        },
+      }));
+    }
+
+    // 3b. Update space layerCount
+    const space = stateAfterSelect.spaces[rootSpaceId]!;
+    opOps.push(putOp("Space", rootSpaceId, {
+      ...space,
+      layerCount: 1 + maskPayloadIds.length, // 4
+    }));
+
+    // 3c. Update render annotation with mask mappings
+    //     (operation reads existing render, spreads its data, adds payload.1..N)
+    const existingRender = findLayerRender(stateAfterSelect, rootSpaceId);
+    const renderData: Record<string, string> = existingRender
+      ? { ...existingRender.annotation.data }
+      : {};
+    for (let i = 0; i < maskPayloadIds.length; i++) {
+      renderData[`payload.${String(i + 1)}`] = maskPayloadIds[i]!;
+    }
+    opOps.push(putOp("Annotation", renderAnnId, {
+      id: renderAnnId,
+      kind: "Annotation",
+      target: { kind: "Space", id: rootSpaceId },
+      schema: "ui.layers.render",
+      data: renderData,
+      createdAt: new Date().toISOString(),
+    }));
+
+    // 3d. OperatorRun
+    const oprunId = makeId("oprun");
+    opOps.push(putOp("OperatorRun", oprunId, {
+      id: oprunId,
+      kind: "OperatorRun",
+      operator: "sam3.segment",
+      status: "succeeded",
+      createdAt: new Date().toISOString(),
+      finishedAt: new Date().toISOString(),
+      inputs: [{ kind: "Payload", id: payloadId }],
+      outputs: maskPayloadIds.map(pid => ({ kind: "Payload", id: pid })),
+      params: { proxyRoute: "fal-ai/sam2/auto-segment", maskCount: "3" },
+    }));
+
+    // 3e. Result annotation
+    const resultAnnId = makeId("annotation");
+    opOps.push(putOp("Annotation", resultAnnId, {
+      id: resultAnnId,
+      kind: "Annotation",
+      target: { kind: "Space", id: rootSpaceId },
+      schema: "op.result",
+      data: {
+        operatorRunId: oprunId,
+        operator: "sam3.segment",
+        status: "succeeded",
+        maskCount: "3",
+      },
+      createdAt: new Date().toISOString(),
+    }));
+
+    // Step 4: Commit the operation patch
+    const opPatch = newPatch({
+      baseRevision: stateAfterSelect.revision,
+      ops: opOps,
+    });
+    const stateAfterOp = applyPatch(stateAfterSelect, opPatch);
+
+    // Step 5: Verify final state — simulate layerTextures derivation
+    const finalSpace = stateAfterOp.spaces[rootSpaceId];
+    expect(finalSpace).toBeDefined();
+    expect(finalSpace!.layerCount).toBe(4);
+
+    const finalRender = findLayerRender(stateAfterOp, rootSpaceId);
+    expect(finalRender).not.toBeNull();
+
+    // Build layerTextures the same way App.tsx does
+    const layerTextures: Record<number, string> = {};
+    for (let i = 0; i < finalSpace!.layerCount; i++) {
+      const pid = layerPayloadId(finalRender, i);
+      if (pid) {
+        const payload = stateAfterOp.payloads[pid as import("./types").PayloadId];
+        if (payload) {
+          layerTextures[i] = payload.uri;
+        }
+      }
+    }
+
+    // Layer 0 should have the original image
+    expect(layerTextures[0]).toBe("data:image/jpeg;base64,FAKE_ORIGINAL_IMAGE");
+    // Layers 1-3 should have mask data URLs
+    expect(layerTextures[1]).toBe("data:image/png;base64,FAKE_MASK_0");
+    expect(layerTextures[2]).toBe("data:image/png;base64,FAKE_MASK_1");
+    expect(layerTextures[3]).toBe("data:image/png;base64,FAKE_MASK_2");
+    // No extra layers
+    expect(layerTextures[4]).toBeUndefined();
+
+    // All 4 payload IDs present in render annotation
+    expect(finalRender!.annotation.data["payload.0"]).toBe(payloadId);
+    expect(finalRender!.annotation.data["payload.1"]).toBe(maskPayloadIds[0]);
+    expect(finalRender!.annotation.data["payload.2"]).toBe(maskPayloadIds[1]);
+    expect(finalRender!.annotation.data["payload.3"]).toBe(maskPayloadIds[2]);
+  });
+});

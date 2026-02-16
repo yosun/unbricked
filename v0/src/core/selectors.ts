@@ -60,6 +60,21 @@ export function isHidden(
   return props.annotation.data[`hidden.${String(index)}`] === "true";
 }
 
+/**
+ * Whether the mask for a layer is active (operations are constrained to this slice's region).
+ * Defaults to `true` — masks are active out of the box.
+ */
+export function isMaskActive(
+  props: LayerProps | null,
+  index: number,
+  layerCount: number,
+): boolean {
+  if (!props) return true;
+  if (index < 0 || index >= layerCount) return true;
+  // Stored as "false" to disable; absent / "true" = active
+  return props.annotation.data[`maskActive.${String(index)}`] !== "false";
+}
+
 export function opacityMultiplier(
   props: LayerProps | null,
   index: number,

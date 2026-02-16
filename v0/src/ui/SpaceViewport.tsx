@@ -1,9 +1,11 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
-import { Canvas, useThree } from "@react-three/fiber";
+import { Canvas, useThree, useFrame } from "@react-three/fiber";
 import { OrbitControls, Text } from "@react-three/drei";
-import { DoubleSide, Plane, Raycaster, Vector3, TextureLoader } from "three";
+import { DoubleSide, MathUtils, Plane, Raycaster, Vector3, TextureLoader } from "three";
 import type { Camera, Texture } from "three";
 import type { ThreeEvent } from "@react-three/fiber";
+
+export type SegmentDisplayMode = "masked" | "colored";
 import LayerScrubber from "./LayerScrubber";
 import LayerControlsHUD from "./LayerControlsHUD";
 import LayersPanel from "./LayersPanel";
@@ -50,6 +52,8 @@ function clampLayerIndex(raw: number, layerCount: number): number {
 interface LayerVis {
   visible: boolean;
   opacity: number;
+  /** User-facing opacity multiplier (0–1) applied to the texture image. */
+  textureOpacity: number;
 }
 
 /** Override for a layer being dragged: its logical index and continuous Y in brick space. */
@@ -68,6 +72,47 @@ interface SpacePrismProps {
   suppressClicks?: boolean;
   layerTextures: Record<number, string>;
   imageAspect: number | null;
+  /** When true, all layers start stacked at center and spread to final positions. */
+  revealActive: boolean;
+  onRevealDone?: () => void;
+}
+
+/** Lerp speed for position animations (higher = faster). */
+const LERP_SPEED = 4.0;
+const LERP_THRESHOLD = 0.005;
+
+/**
+ * Animated wrapper for a layer group — smoothly lerps x and y toward targets.
+ */
+function AnimatedLayerGroup({
+  targetX,
+  targetY,
+  children,
+}: {
+  targetX: number;
+  targetY: number;
+  children: React.ReactNode;
+}): React.JSX.Element {
+  const groupRef = useRef<import("three").Group>(null);
+  // Initialise at target so first frame doesn't jitter
+  const currentX = useRef(targetX);
+  const currentY = useRef(targetY);
+
+  useFrame((_, delta) => {
+    if (!groupRef.current) return;
+    const dt = Math.min(delta, 0.05); // clamp large dt
+    const factor = 1 - Math.exp(-LERP_SPEED * dt);
+    currentX.current = MathUtils.lerp(currentX.current, targetX, factor);
+    currentY.current = MathUtils.lerp(currentY.current, targetY, factor);
+    groupRef.current.position.x = currentX.current;
+    groupRef.current.position.y = currentY.current;
+  });
+
+  return (
+    <group ref={groupRef} position={[currentX.current, currentY.current, 0]}>
+      {children}
+    </group>
+  );
 }
 
 /** Load a texture from a URL (data: or http) and cache by URI. */
@@ -83,9 +128,14 @@ function useLayerTexture(uri: string | undefined): Texture | null {
     let cancelled = false;
     loaderRef.current.load(
       uri,
-      (tex) => { if (!cancelled) setTexture(tex); },
+      (tex) => {
+        if (!cancelled) setTexture(tex);
+      },
       undefined,
-      () => { if (!cancelled) setTexture(null); },
+      (err) => {
+        console.error("[useLayerTexture] FAILED", err);
+        if (!cancelled) setTexture(null);
+      },
     );
     return () => { cancelled = true; };
   }, [uri]);
@@ -98,20 +148,24 @@ function TexturedLayerPlane({
   uri,
   width,
   depth,
+  layerIdx,
+  opacity,
 }: {
   uri: string | undefined;
   width: number;
   depth: number;
+  layerIdx: number;
+  opacity: number;
 }): React.JSX.Element | null {
   const texture = useLayerTexture(uri);
   if (!texture) return null;
   return (
-    <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, 0.02, 0]}>
+    <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, 0.02, 0]} renderOrder={1}>
       <planeGeometry args={[width * 0.96, depth * 0.96]} />
       <meshBasicMaterial
         map={texture}
         transparent
-        opacity={0.9}
+        opacity={opacity}
         depthWrite={false}
         side={DoubleSide}
       />
@@ -144,9 +198,30 @@ function CameraRef({ cameraRef }: { cameraRef: React.MutableRefObject<Camera | n
 }
 
 function SpacePrism(props: SpacePrismProps): React.JSX.Element {
-  const { layerCount, selectedLayerIndex, layerVisibility, layerOrder, onSelectLayer, dragOverride, suppressClicks, layerTextures, imageAspect } = props;
+  const { layerCount, selectedLayerIndex, layerVisibility, layerOrder, onSelectLayer, dragOverride, suppressClicks, layerTextures, imageAspect, revealActive, onRevealDone } = props;
   const { prismW, prismD } = prismDims(imageAspect);
   const hiddenSlideX = prismW + 0.5;
+
+  // Track reveal animation progress
+  const revealProgress = useRef(revealActive ? 0 : 1);
+  const revealDoneFired = useRef(!revealActive);
+
+  useFrame((_, delta) => {
+    if (revealProgress.current >= 1) return;
+    revealProgress.current = Math.min(1, revealProgress.current + delta * 1.8);
+    if (revealProgress.current >= 1 && !revealDoneFired.current) {
+      revealDoneFired.current = true;
+      onRevealDone?.();
+    }
+  });
+
+  // Reset reveal on new trigger
+  useEffect(() => {
+    if (revealActive) {
+      revealProgress.current = 0;
+      revealDoneFired.current = false;
+    }
+  }, [revealActive]);
 
   // When a layer is being dragged, compute adjusted Y positions for non-dragged layers
   // so they "make room" without relying on parent re-renders (which cause ghost duplicates).
@@ -189,8 +264,12 @@ function SpacePrism(props: SpacePrismProps): React.JSX.Element {
       {positions.map(({ layerIdx, y, isDragged }) => {
         const vis = layerVisibility[layerIdx];
         const hidden = vis ? !vis.visible : false;
-        // Hidden layers slide to the right — same size, like slides pushed aside
-        const x = hidden ? hiddenSlideX : 0;
+        // Hidden / solo-aside layers slide to the right with smooth animation
+        const targetX = hidden ? hiddenSlideX : 0;
+        // During reveal, lerp Y from center (0) toward final position
+        const t = revealProgress.current;
+        const eased = t < 1 ? t * t * (3 - 2 * t) : 1; // smoothstep
+        const targetY = isDragged ? y : eased * y;
         const selected = layerIdx === selectedLayerIndex;
         const scale: [number, number, number] = selected
           ? [1.02, 1.02, 1.02]
@@ -199,7 +278,7 @@ function SpacePrism(props: SpacePrismProps): React.JSX.Element {
         const opacity = hidden ? Math.max(baseOpacity * 0.35, 0.06) : baseOpacity;
         const color = selected ? "#7ec8e3" : layerHue(layerIdx, layerCount);
         return (
-          <group key={layerIdx} position={[x, y, 0]}>
+          <AnimatedLayerGroup key={layerIdx} targetX={targetX} targetY={targetY}>
             <mesh
               rotation={[Math.PI / 2, 0, 0]}
               scale={scale}
@@ -223,6 +302,8 @@ function SpacePrism(props: SpacePrismProps): React.JSX.Element {
                 uri={layerTextures[layerIdx]}
                 width={prismW}
                 depth={prismD}
+                layerIdx={layerIdx}
+                opacity={vis ? vis.textureOpacity : 1}
               />
             )}
             <Text
@@ -236,7 +317,7 @@ function SpacePrism(props: SpacePrismProps): React.JSX.Element {
             >
               {String(layerIdx)}
             </Text>
-          </group>
+          </AnimatedLayerGroup>
         );
       })}
     </group>
@@ -384,6 +465,8 @@ interface SpaceViewportProps {
   soloIndex: number | null;
   onToggleHidden: (index: number) => void;
   onToggleSolo: (index: number) => void;
+  onToggleMask: (index: number) => void;
+  maskActive: boolean;
   onPreviewOpacity: (value: number | null) => void;
   onCommitOpacity: (index: number, value: number) => void;
   persistedOpacity: number;
@@ -399,6 +482,11 @@ interface SpaceViewportProps {
   peekRail: boolean;
   onClearSelection: () => void;
   layerTextures: Record<number, string>;
+  colorLayerTextures: Record<number, string>;
+  segmentDisplayMode: SegmentDisplayMode;
+  onToggleSegmentDisplay: () => void;
+  revealActive: boolean;
+  onRevealDone: () => void;
   imageAspect: number | null;
   onImportImage: () => void;
   onAiEdit: (prompt: string, strength?: number) => void;
@@ -417,6 +505,8 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
     soloIndex,
     onToggleHidden,
     onToggleSolo,
+    onToggleMask,
+    maskActive,
     onPreviewOpacity,
     onCommitOpacity,
     persistedOpacity,
@@ -431,6 +521,11 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
     peekLayers,
     peekRail,
     layerTextures,
+    colorLayerTextures,
+    segmentDisplayMode,
+    onToggleSegmentDisplay,
+    revealActive,
+    onRevealDone,
     imageAspect,
     onImportImage,
     onAiEdit,
@@ -652,8 +747,10 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
           onSelectLayer={onSelectLayer}
           dragOverride={dragOverride}
           suppressClicks={longPressSelected || dragReorder}
-          layerTextures={layerTextures}
+          layerTextures={segmentDisplayMode === "colored" ? colorLayerTextures : layerTextures}
           imageAspect={imageAspect}
+          revealActive={revealActive}
+          onRevealDone={onRevealDone}
         />
         <ScrubberPlane
           layerCount={layerCount}
@@ -678,6 +775,35 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
         />
       </Canvas>
 
+      {/* Segment display mode toggle (masked original vs colored segments) */}
+      {layerCount > 1 && (
+        <button
+          type="button"
+          onClick={onToggleSegmentDisplay}
+          title={segmentDisplayMode === "masked" ? "Switch to colored segments" : "Switch to masked original"}
+          style={{
+            position: "absolute",
+            top: 12,
+            left: 12,
+            display: "flex",
+            alignItems: "center",
+            gap: 6,
+            padding: "5px 12px",
+            borderRadius: 6,
+            background: "var(--hud-bg)",
+            border: "1px solid var(--hud-border)",
+            color: "var(--hud-text)",
+            fontSize: 11,
+            cursor: "pointer",
+            zIndex: 10,
+            transition: "background 0.15s, border-color 0.15s",
+          }}
+        >
+          <span style={{ fontSize: 14, lineHeight: 1 }}>{segmentDisplayMode === "masked" ? "🖼" : "🎨"}</span>
+          {segmentDisplayMode === "masked" ? "Masked" : "Colored"}
+        </button>
+      )}
+
       {/* Universal: Depth Rail (scrubber with drag-reorder ticks) */}
       {showScrubber && (
         <LayerScrubber
@@ -697,9 +823,11 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
           layerIndex={selectedLayerIndex}
           isHidden={selectedIsHidden}
           isSolo={selectedIsSolo}
+          maskActive={maskActive}
           opacity={persistedOpacity}
           onToggleHidden={onToggleHidden}
           onToggleSolo={onToggleSolo}
+          onToggleMask={onToggleMask}
           onPreviewOpacity={onPreviewOpacity}
           onCommitOpacity={onCommitOpacity}
           hasImage={selectedLayerIndex in layerTextures}

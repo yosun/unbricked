@@ -4,9 +4,11 @@ interface LayerControlsHUDProps {
   layerIndex: number;
   isHidden: boolean;
   isSolo: boolean;
+  maskActive: boolean;
   opacity: number;
   onToggleHidden: (index: number) => void;
   onToggleSolo: (index: number) => void;
+  onToggleMask: (index: number) => void;
   onPreviewOpacity: (value: number | null) => void;
   onCommitOpacity: (index: number, value: number) => void;
   hasImage: boolean;
@@ -26,9 +28,11 @@ export default function LayerControlsHUD(props: LayerControlsHUDProps): React.JS
     layerIndex,
     isHidden,
     isSolo,
+    maskActive,
     opacity,
     onToggleHidden,
     onToggleSolo,
+    onToggleMask,
     onPreviewOpacity,
     onCommitOpacity,
     hasImage,
@@ -153,6 +157,26 @@ export default function LayerControlsHUD(props: LayerControlsHUDProps): React.JS
         }}
       >
         S
+      </button>
+
+      {/* Mask active toggle */}
+      <button
+        type="button"
+        onClick={() => { onToggleMask(layerIndex); }}
+        title={maskActive ? "Disable mask (operations apply to full image)" : "Enable mask (operations constrained to slice region)"}
+        style={{
+          background: maskActive ? "var(--hud-active)" : "none",
+          border: "1px solid var(--hud-border-btn)",
+          color: maskActive ? "var(--scrubber-active)" : "var(--hud-muted)",
+          borderRadius: 4,
+          padding: "2px 7px",
+          cursor: "pointer",
+          fontSize: 11,
+          fontWeight: 600,
+          letterSpacing: 0.3,
+        }}
+      >
+        M
       </button>
 
       {/* Opacity slider — 0..100 integer scale */}
