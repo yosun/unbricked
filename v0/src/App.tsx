@@ -21,10 +21,14 @@ import {
   saveProjectState,
   clearProjectState,
 } from "./core";
-import type { AnnotationId, GraphPatch, GraphPatchOp, JsonObject, PayloadId, ProjectState } from "./core";
+import type { AnnotationId, Edge, GraphPatch, GraphPatchOp, JsonObject, PayloadId, ProjectState, SpaceId } from "./core";
+import { findPortalEdges } from "./core";
 import { runImg2Img, fetchImageBlob } from "./services/falProxy";
 import SpaceViewport from "./ui/SpaceViewport";
+import SpaceAddressHUD from "./ui/SpaceAddressHUD";
+import PortalOverlay from "./ui/PortalOverlay";
 import ViewModeSwitcher from "./ui/ViewModeSwitcher";
+import { useSpaceNav } from "./ui/useSpaceNav";
 import type { AnimPhase } from "./ui/CameraRig";
 import type { ViewMode } from "./ui/ViewMode";
 
@@ -46,6 +50,10 @@ export default function App(): React.JSX.Element {
   const [viewMode, setViewMode] = useState<ViewMode>("universal");
   const [peekLayers, setPeekLayers] = useState(false);
   const [peekRail, setPeekRail] = useState(false);
+
+  const rootSpaceId = state.manifest.rootSpaceId;
+  const spaceNav = useSpaceNav(rootSpaceId);
+  const activeSpaceId = spaceNav.currentSpaceId;
 
   /** Central commit: applies a patch, pushes to undo stack, clears redo, persists. */
   const commitPatch = useCallback(
@@ -106,9 +114,12 @@ export default function App(): React.JSX.Element {
       else if (prev === "toIso" || prev === "intro") setIsTopDown(false);
       // reset ends at iso
       else if (prev === "reset") setIsTopDown(false);
+      // space transition ends at iso
+      else if (prev === "spaceTransition") setIsTopDown(false);
       return "idle";
     });
-  }, []);
+    spaceNav.onTransitionDone();
+  }, [spaceNav]);
 
   const handleResetView = useCallback(() => {
     setAnimPhase("reset");
@@ -126,28 +137,38 @@ export default function App(): React.JSX.Element {
     setViewMode(mode);
   }, []);
 
-  const rootSpaceId = state.manifest.rootSpaceId;
-  const rootSpace = state.spaces[rootSpaceId];
+  /** Navigate to a different space with camera transition. */
+  const handleNavigateToSpace = useCallback(
+    (spaceId: SpaceId) => {
+      if (!state.spaces[spaceId]) return; // target must exist
+      spaceNav.navigateTo(spaceId);
+      setAnimPhase("spaceTransition");
+    },
+    [state.spaces, spaceNav],
+  );
+
+  // activeSpaceId comes from spaceNav (declared above); rootSpaceId also above
+  const activeSpace = state.spaces[activeSpaceId];
 
   const selection = useMemo(
-    () => findLayerSelection(state, rootSpaceId),
-    [state, rootSpaceId],
+    () => findLayerSelection(state, activeSpaceId),
+    [state, activeSpaceId],
   );
 
   const effectiveSelectedIndex = previewLayerIndex ?? selection?.index ?? null;
 
   const layerProps = useMemo(
-    () => findLayerProps(state, rootSpaceId),
-    [state, rootSpaceId],
+    () => findLayerProps(state, activeSpaceId),
+    [state, activeSpaceId],
   );
 
   const persistedLayerOrder = useMemo(() => {
-    const found = findLayerOrder(state, rootSpaceId);
+    const found = findLayerOrder(state, activeSpaceId);
     return found ? found : null;
-  }, [state, rootSpaceId]);
+  }, [state, activeSpaceId]);
 
   // Build per-layer visibility/opacity for SpaceViewport
-  const layerCount = rootSpace?.layerCount ?? 1;
+  const layerCount = activeSpace?.layerCount ?? 1;
   const effectiveOrder = previewOrder ?? persistedLayerOrder?.order ?? defaultLayerOrder(layerCount);
   const solo = soloIndex(layerProps, layerCount);
   const layerVisibility = useMemo(() => {
@@ -179,7 +200,7 @@ export default function App(): React.JSX.Element {
   const emitPropsUpdate = useCallback(
     (updater: (data: Record<string, string>) => Record<string, string>) => {
       commitPatch((prev) => {
-        const existing = findLayerProps(prev, rootSpaceId);
+        const existing = findLayerProps(prev, activeSpaceId);
         const annId: AnnotationId = existing
           ? existing.annotationId
           : makeId("annotation");
@@ -197,7 +218,7 @@ export default function App(): React.JSX.Element {
         const annotationValue: JsonObject = {
           id: annId,
           kind: "Annotation",
-          target: { kind: "Space", id: rootSpaceId },
+          target: { kind: "Space", id: activeSpaceId },
           schema: "ui.layers.props",
           data: newData,
           createdAt: new Date().toISOString(),
@@ -209,7 +230,7 @@ export default function App(): React.JSX.Element {
         });
       });
     },
-    [rootSpaceId, commitPatch],
+    [activeSpaceId, commitPatch],
   );
 
   const handleToggleHidden = useCallback(
@@ -242,7 +263,7 @@ export default function App(): React.JSX.Element {
       // If it's the default order, delete the annotation instead
       const isDefault = order.every((v, i) => v === i);
       commitPatch((prev) => {
-        const existing = findLayerOrder(prev, rootSpaceId);
+        const existing = findLayerOrder(prev, activeSpaceId);
         if (isDefault) {
           if (!existing) return null;
           return newPatch({
@@ -256,7 +277,7 @@ export default function App(): React.JSX.Element {
         const annotationValue: JsonObject = {
           id: annId,
           kind: "Annotation",
-          target: { kind: "Space", id: rootSpaceId },
+          target: { kind: "Space", id: activeSpaceId },
           schema: "ui.layers.order",
           data: { order: serializeOrder(order) },
           createdAt: new Date().toISOString(),
@@ -267,7 +288,7 @@ export default function App(): React.JSX.Element {
         });
       });
     },
-    [rootSpaceId, commitPatch],
+    [activeSpaceId, commitPatch],
   );
 
   const handleCommitOpacity = useCallback(
@@ -288,10 +309,10 @@ export default function App(): React.JSX.Element {
     (index: number) => {
       setPreviewOpacity(null);
       commitPatch((prev) => {
-        const space = prev.spaces[rootSpaceId];
+        const space = prev.spaces[activeSpaceId];
         if (!space || index < 0 || index >= space.layerCount) return null;
 
-        const existing = findLayerSelection(prev, rootSpaceId);
+        const existing = findLayerSelection(prev, activeSpaceId);
         const annId: AnnotationId = existing
           ? existing.annotationId
           : makeId("annotation");
@@ -299,7 +320,7 @@ export default function App(): React.JSX.Element {
         const annotationValue: JsonObject = {
           id: annId,
           kind: "Annotation",
-          target: { kind: "Space", id: rootSpaceId },
+          target: { kind: "Space", id: activeSpaceId },
           schema: "ui.selection.layerIndex",
           data: { layerIndex: String(index) },
           createdAt: new Date().toISOString(),
@@ -311,13 +332,13 @@ export default function App(): React.JSX.Element {
         });
       });
     },
-    [rootSpaceId, commitPatch],
+    [activeSpaceId, commitPatch],
   );
 
   const handleClearSelection = useCallback(() => {
     setPreviewOpacity(null);
     commitPatch((prev) => {
-      const existing = findLayerSelection(prev, rootSpaceId);
+      const existing = findLayerSelection(prev, activeSpaceId);
       if (!existing) return null;
 
       return newPatch({
@@ -325,7 +346,7 @@ export default function App(): React.JSX.Element {
         ops: [delOp("Annotation", existing.annotationId)],
       });
     });
-  }, [rootSpaceId, commitPatch]);
+  }, [activeSpaceId, commitPatch]);
 
   /* ── AI / Import state ───────────────────────────── */
   const [aiRunning, setAiRunning] = useState(false);
@@ -333,8 +354,14 @@ export default function App(): React.JSX.Element {
   const abortRef = useRef<AbortController | null>(null);
 
   const layerRender = useMemo(
-    () => findLayerRender(state, rootSpaceId),
-    [state, rootSpaceId],
+    () => findLayerRender(state, activeSpaceId),
+    [state, activeSpaceId],
+  );
+
+  /** Portal edges from the current space. */
+  const portalEdges: Edge[] = useMemo(
+    () => findPortalEdges(state, activeSpaceId),
+    [state, activeSpaceId],
   );
 
   /** Build a map of layerIndex → payload URI for texture rendering. */
@@ -376,7 +403,7 @@ export default function App(): React.JSX.Element {
       extraOps?: GraphPatchOp[],
     ) => {
       commitPatch((prev) => {
-        const existing = findLayerRender(prev, rootSpaceId);
+        const existing = findLayerRender(prev, activeSpaceId);
         const annId: AnnotationId = existing
           ? existing.annotationId
           : makeId("annotation");
@@ -386,7 +413,7 @@ export default function App(): React.JSX.Element {
         const annotationValue: JsonObject = {
           id: annId,
           kind: "Annotation",
-          target: { kind: "Space", id: rootSpaceId },
+          target: { kind: "Space", id: activeSpaceId },
           schema: "ui.layers.render",
           data: newData,
           createdAt: new Date().toISOString(),
@@ -400,7 +427,7 @@ export default function App(): React.JSX.Element {
         return newPatch({ baseRevision: prev.revision, ops });
       });
     },
-    [rootSpaceId, commitPatch],
+    [activeSpaceId, commitPatch],
   );
 
   /** Import an image file into the selected layer. */
@@ -606,6 +633,24 @@ export default function App(): React.JSX.Element {
       if (e.key === "[") { handleStepLayer(-1); return; }
       if (e.key === "]") { handleStepLayer(1); return; }
 
+      // Spatial back/forward: Alt+Left / Alt+Right
+      if (e.altKey && e.key === "ArrowLeft") {
+        e.preventDefault();
+        if (spaceNav.canGoBack) {
+          spaceNav.goBack();
+          setAnimPhase("spaceTransition");
+        }
+        return;
+      }
+      if (e.altKey && e.key === "ArrowRight") {
+        e.preventDefault();
+        if (spaceNav.canGoForward) {
+          spaceNav.goForward();
+          setAnimPhase("spaceTransition");
+        }
+        return;
+      }
+
       // Peek overlays: hold Tab = layers, hold Shift = rail
       if (e.key === "Tab" && !mod) {
         e.preventDefault();
@@ -633,7 +678,7 @@ export default function App(): React.JSX.Element {
       window.removeEventListener("keydown", onKeyDown);
       window.removeEventListener("keyup", onKeyUp);
     };
-  }, [handleClearSelection, handleUndo, handleRedo, handleStepLayer, handleSetViewMode]);
+  }, [handleClearSelection, handleUndo, handleRedo, handleStepLayer, handleSetViewMode, spaceNav]);
 
   return (
     <div style={{ height: "100%", display: "grid", gridTemplateRows: "48px 1fr" }}>
@@ -749,36 +794,58 @@ export default function App(): React.JSX.Element {
           </button>
         )}
       </header>
-      <SpaceViewport
-        layerCount={layerCount}
-        selectedLayerIndex={effectiveSelectedIndex}
-        onSelectLayer={handleSelectLayer}
-        onPreviewLayer={setPreviewLayerIndex}
-        layerVisibility={layerVisibility}
-        soloIndex={solo}
-        onToggleHidden={handleToggleHidden}
-        onToggleSolo={handleToggleSolo}
-        onPreviewOpacity={setPreviewOpacity}
-        onCommitOpacity={handleCommitOpacity}
-        persistedOpacity={effectiveSelectedIndex !== null ? opacityMultiplier(layerProps, effectiveSelectedIndex, layerCount) : 1.0}
-        persistedOpacityFn={persistedOpacityFn}
-        isHiddenFn={isHiddenFn}
-        layerOrder={effectiveOrder}
-        onPreviewOrder={setPreviewOrder}
-        onCommitOrder={handleCommitOrder}
-        animPhase={animPhase}
-        onAnimDone={handleAnimDone}
-        viewMode={viewMode}
-        peekLayers={peekLayers}
-        peekRail={peekRail}
-        onClearSelection={handleClearSelection}
-        layerTextures={layerTextures}
-        imageAspect={imageAspect}
-        onImportImage={() => { void handleImportImage(); }}
-        onAiEdit={(prompt, strength) => { void handleAiEdit(prompt, strength); }}
-        aiRunning={aiRunning}
-        aiError={aiError}
-      />
+      <div style={{ position: "relative", overflow: "hidden" }}>
+        <SpaceViewport
+          layerCount={layerCount}
+          selectedLayerIndex={effectiveSelectedIndex}
+          onSelectLayer={handleSelectLayer}
+          onPreviewLayer={setPreviewLayerIndex}
+          layerVisibility={layerVisibility}
+          soloIndex={solo}
+          onToggleHidden={handleToggleHidden}
+          onToggleSolo={handleToggleSolo}
+          onPreviewOpacity={setPreviewOpacity}
+          onCommitOpacity={handleCommitOpacity}
+          persistedOpacity={effectiveSelectedIndex !== null ? opacityMultiplier(layerProps, effectiveSelectedIndex, layerCount) : 1.0}
+          persistedOpacityFn={persistedOpacityFn}
+          isHiddenFn={isHiddenFn}
+          layerOrder={effectiveOrder}
+          onPreviewOrder={setPreviewOrder}
+          onCommitOrder={handleCommitOrder}
+          animPhase={animPhase}
+          onAnimDone={handleAnimDone}
+          viewMode={viewMode}
+          peekLayers={peekLayers}
+          peekRail={peekRail}
+          onClearSelection={handleClearSelection}
+          layerTextures={layerTextures}
+          imageAspect={imageAspect}
+          onImportImage={() => { void handleImportImage(); }}
+          onAiEdit={(prompt, strength) => { void handleAiEdit(prompt, strength); }}
+          aiRunning={aiRunning}
+          aiError={aiError}
+        />
+        <SpaceAddressHUD
+          currentSpaceId={activeSpaceId}
+          space={activeSpace}
+          origin={spaceNav.origin}
+          canGoBack={spaceNav.canGoBack}
+          canGoForward={spaceNav.canGoForward}
+          onSetOrigin={spaceNav.setOrigin}
+          onReturnToOrigin={spaceNav.returnToOrigin}
+          onGoBack={() => {
+            if (spaceNav.goBack()) setAnimPhase("spaceTransition");
+          }}
+          onGoForward={() => {
+            if (spaceNav.goForward()) setAnimPhase("spaceTransition");
+          }}
+        />
+        <PortalOverlay
+          portalEdges={portalEdges}
+          spaces={state.spaces}
+          onEnter={handleNavigateToSpace}
+        />
+      </div>
     </div>
   );
 }

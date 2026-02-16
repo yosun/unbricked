@@ -20,7 +20,7 @@ const DONE_THRESHOLD = 0.02; // distance at which animation is "done"
 
 /* ── Types ───────────────────────────────────────── */
 
-export type AnimPhase = "idle" | "intro" | "reset" | "toTopDown" | "toIso";
+export type AnimPhase = "idle" | "intro" | "reset" | "toTopDown" | "toIso" | "spaceTransition";
 
 interface CameraRigProps {
   animPhase: AnimPhase;
@@ -65,6 +65,10 @@ export default function CameraRig(props: CameraRigProps): null {
     } else if (animPhase === "toIso") {
       targetPos.current.copy(ISO);
       targetUp.current.copy(DEFAULT_UP);
+    } else if (animPhase === "spaceTransition") {
+      // Dolly in toward origin, then reset to ISO (like "reset" but faster)
+      targetPos.current.set(0, 3, 0);
+      targetUp.current.copy(TOP_DOWN_UP);
     }
   }, [animPhase, camera]);
 
@@ -111,6 +115,22 @@ export default function CameraRig(props: CameraRigProps): null {
         camera.up.copy(TOP_DOWN_UP);
         camera.lookAt(0, 0, 0);
         onAnimDone();
+      }
+    } else if (animPhase === "spaceTransition") {
+      // Two-phase: dolly in → reset to iso
+      if (!resetMidReached.current) {
+        if (dist < DONE_THRESHOLD) {
+          resetMidReached.current = true;
+          targetPos.current.copy(ISO);
+          targetUp.current.copy(DEFAULT_UP);
+        }
+      } else {
+        if (dist < DONE_THRESHOLD) {
+          camera.position.copy(ISO);
+          camera.up.copy(DEFAULT_UP);
+          camera.lookAt(0, 0, 0);
+          onAnimDone();
+        }
       }
     } else {
       // animPhase === "reset"

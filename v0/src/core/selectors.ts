@@ -1,4 +1,4 @@
-import type { Annotation, AnnotationId, ProjectState, SpaceId } from "./types";
+import type { Annotation, AnnotationId, Edge, ProjectState, SpaceId } from "./types";
 
 export function findLayerSelection(
   state: ProjectState,
@@ -196,4 +196,19 @@ export function layerPayloadId(
   const raw = render.annotation.data[`payload.${String(index)}`];
   if (!raw || raw.length === 0) return null;
   return raw;
+}
+
+/* ── Portal edges ────────────────────────────────── */
+
+/**
+ * Find all portal edges **from** a given Space.
+ * Each portal edge points to a target Space the user can "enter".
+ */
+export function findPortalEdges(
+  state: ProjectState,
+  spaceId: SpaceId,
+): Edge[] {
+  return Object.values(state.edges).filter(
+    (e) => e.edgeKind === "portal" && e.from === spaceId,
+  );
 }
