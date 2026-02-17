@@ -1,5 +1,5 @@
 import { useEffect, useRef } from "react";
-import { useThree, useFrame } from "@react-three/fiber";
+import { useThree, useFrame, invalidate } from "@react-three/fiber";
 import { Vector3 } from "three";
 
 /* ── Presets ─────────────────────────────────────── */
@@ -99,6 +99,7 @@ export default function CameraRig(props: CameraRigProps): null {
     camera.position.lerp(targetPos.current, alpha);
     camera.up.lerp(targetUp.current, alpha).normalize();
     camera.lookAt(0, 0, 0);
+    invalidate();
 
     const dist = camera.position.distanceTo(targetPos.current);
 

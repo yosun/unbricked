@@ -5,7 +5,7 @@ export interface OperationDef {
   label: string;
   kind: "local" | "remote";
   inputs: "image";
-  outputs: "segments" | "edges" | "masks" | "none";
+  outputs: "segments" | "edges" | "masks" | "3d" | "none";
   defaultParams?: Record<string, string>;
 }
 
@@ -16,6 +16,13 @@ export const OPERATIONS: OperationDef[] = [
     kind: "remote",
     inputs: "image",
     outputs: "segments",
+  },
+  {
+    id: "sam3.image-to-3d",
+    label: "Image → 3D Object",
+    kind: "remote",
+    inputs: "image",
+    outputs: "3d",
   },
   {
     id: "canny.edges",

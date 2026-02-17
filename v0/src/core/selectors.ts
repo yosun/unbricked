@@ -227,6 +227,44 @@ export function layerPayloadId(
   return raw;
 }
 
+/* ── GLB 3D model layer data ─────────────────────── */
+
+export interface LayerGlb {
+  annotationId: AnnotationId;
+  annotation: Annotation;
+}
+
+/**
+ * Find the "ui.layers.glb" annotation for a Space.
+ * Maps `glb.{index}` → payload ID whose `uri` is a base64 data URL of the GLB file.
+ */
+export function findLayerGlb(
+  state: ProjectState,
+  spaceId: SpaceId,
+): LayerGlb | null {
+  const ann = Object.values(state.annotations).find(
+    (a) =>
+      a.target.kind === "Space" &&
+      a.target.id === spaceId &&
+      a.schema === "ui.layers.glb",
+  );
+  if (!ann) return null;
+  return { annotationId: ann.id, annotation: ann };
+}
+
+/**
+ * Get the GLB payload ID assigned to a specific layer, or null if none.
+ */
+export function layerGlbPayloadId(
+  glb: LayerGlb | null,
+  index: number,
+): string | null {
+  if (!glb) return null;
+  const raw = glb.annotation.data[`glb.${String(index)}`];
+  if (!raw || raw.length === 0) return null;
+  return raw;
+}
+
 /* ── Portal edges ────────────────────────────────── */
 
 /**

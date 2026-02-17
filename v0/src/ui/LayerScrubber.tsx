@@ -8,6 +8,8 @@ interface LayerScrubberProps {
   onCommit: (index: number) => void;
   onPreviewOrder: (order: number[] | null) => void;
   onCommitOrder: (order: number[]) => void;
+  layerThumbnails: Record<number, string>;
+  layerGlbUrls: Record<number, string>;
 }
 
 /** Distinct hue per logical layer (matches SpaceViewport). */
@@ -29,9 +31,13 @@ export default function LayerScrubber(props: LayerScrubberProps): React.JSX.Elem
     onCommit,
     onPreviewOrder,
     onCommitOrder,
+    layerThumbnails,
+    layerGlbUrls,
   } = props;
   const railRef = useRef<HTMLDivElement>(null);
 
+  // Hover state: which tick is being hovered (by posIdx)
+  const [hoveredPosIdx, setHoveredPosIdx] = useState<number | null>(null);
   // Drag state: which tick is being dragged (by posIdx), and the live order
   const [dragPosIdx, setDragPosIdx] = useState<number | null>(null);
   // Mirror as ref so handlePointerUp never sees a stale closure value
@@ -214,7 +220,7 @@ export default function LayerScrubber(props: LayerScrubberProps): React.JSX.Elem
           bottom: 0,
           width: 4,
           borderRadius: 2,
-          background: "var(--scrubber-rail, rgba(255,255,255,0.1))",
+          background: "var(--scrubber-rail, rgba(0, 0, 0, 0.1))",
           transform: "translateX(-50%)",
           pointerEvents: "none",
         }}
@@ -232,6 +238,8 @@ export default function LayerScrubber(props: LayerScrubberProps): React.JSX.Elem
           <div
             key={logicalIdx}
             onPointerDown={(e) => { handleTickPointerDown(posIdx, e); }}
+            onPointerEnter={() => { setHoveredPosIdx(posIdx); }}
+            onPointerLeave={() => { setHoveredPosIdx((prev) => prev === posIdx ? null : prev); }}
             style={{
               position: "absolute",
               top: `${String(pct)}%`,
@@ -259,26 +267,72 @@ export default function LayerScrubber(props: LayerScrubberProps): React.JSX.Elem
                 background: isSelected ? "var(--scrubber-active, #7ec8e3)" : color,
                 opacity: isDragging ? 1 : (isSelected ? 0.9 : 0.5),
                 transition: isDragging ? "none" : "all 0.15s",
-                boxShadow: isDragging ? "0 0 8px rgba(126, 200, 227, 0.5)" : "none",
+                boxShadow: isDragging ? "0 0 8px rgba(0, 0, 0, 0.25)" : "none",
               }}
             />
-            {/* Layer label on the tick */}
-            <span
+            {/* Layer label + thumbnail on the tick */}
+            <div
               style={{
                 position: "absolute",
                 right: "100%",
                 marginRight: 4,
-                fontSize: 10,
-                color: isSelected ? "var(--scrubber-active)" : "var(--hud-muted)",
-                fontWeight: isSelected ? 600 : 400,
-                whiteSpace: "nowrap",
+                display: "flex",
+                alignItems: "center",
+                gap: 4,
                 pointerEvents: "none",
-                opacity: isDragging || isSelected ? 1 : 0,
+                opacity: isDragging || isSelected || posIdx === hoveredPosIdx ? 1 : 0,
                 transition: "opacity 0.15s",
               }}
             >
-              L{logicalIdx}
-            </span>
+              {/* Thumbnail */}
+              {layerThumbnails[logicalIdx] && (
+                <div style={{ position: "relative", flexShrink: 0 }}>
+                  <img
+                    src={layerThumbnails[logicalIdx]}
+                    alt=""
+                    style={{
+                      width: 24,
+                      height: 24,
+                      borderRadius: 3,
+                      objectFit: "cover",
+                      border: isSelected
+                        ? "1px solid var(--scrubber-active)"
+                        : `1px solid ${color}`,
+                    }}
+                  />
+                  {logicalIdx in layerGlbUrls && (
+                    <span
+                      style={{
+                        position: "absolute",
+                        bottom: -2,
+                        right: -2,
+                        fontSize: 6,
+                        fontWeight: 700,
+                        lineHeight: 1,
+                        padding: "1px 2px",
+                        borderRadius: 2,
+                        background: "var(--scrubber-active)",
+                        color: "#111",
+                      }}
+                    >
+                      3D
+                    </span>
+                  )}
+                </div>
+              )}
+              {/* Label */}
+              <span
+                style={{
+                  fontSize: 10,
+                  color: isSelected ? "var(--scrubber-active)" : "var(--hud-muted)",
+                  fontWeight: isSelected ? 600 : 400,
+                  whiteSpace: "nowrap",
+                }}
+              >
+                L{logicalIdx}
+                {!layerThumbnails[logicalIdx] && logicalIdx in layerGlbUrls ? " 3D" : ""}
+              </span>
+            </div>
           </div>
         );
       })}

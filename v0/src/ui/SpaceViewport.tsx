@@ -1,8 +1,8 @@
-import React, { useCallback, useEffect, useRef, useState } from "react";
-import { Canvas, useThree, useFrame } from "@react-three/fiber";
-import { OrbitControls, Text, Edges } from "@react-three/drei";
-import { DoubleSide, MathUtils, Plane, Raycaster, Vector3, TextureLoader } from "three";
-import type { Camera, Texture } from "three";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Canvas, useThree, useFrame, invalidate } from "@react-three/fiber";
+import { OrbitControls, useGLTF } from "@react-three/drei";
+import { Box3, CanvasTexture, Color, DoubleSide, MathUtils, MeshBasicMaterial, MeshStandardMaterial, PlaneGeometry, Plane, Raycaster, SRGBColorSpace, Vector3, TextureLoader } from "three";
+import type { Camera, Material, Mesh, Texture } from "three";
 import type { ThreeEvent } from "@react-three/fiber";
 
 export type SegmentDisplayMode = "masked" | "colored";
@@ -14,6 +14,7 @@ import RadialMenu from "./RadialMenu";
 import CameraRig from "./CameraRig";
 import type { AnimPhase } from "./CameraRig";
 import type { ViewMode } from "./ViewMode";
+import { useUIStyle } from "./uiStyleStore";
 
 /* ── Shared prism dimensions ──────────────────────── */
 const PRISM_H = 2.5;
@@ -79,6 +80,46 @@ interface SpacePrismProps {
   onRevealDone?: () => void;
   /** Layer index currently being AI-edited (for pulse animation), or null. */
   aiEditingLayer?: number | null | undefined;
+  /** GLB blob URLs keyed by layer index. */
+  layerGlbUrls?: Record<number, string>;
+  /** Layer index currently generating 3D. */
+  generating3DLayer?: number | null;
+}
+
+/** Shared TextureLoader — one instance for the whole module. */
+const sharedTextureLoader = new TextureLoader();
+
+/** Cache of canvas-based number textures for layer labels. */
+const labelTextureCache = new Map<string, CanvasTexture>();
+function getLabelTexture(text: string, color: string): CanvasTexture {
+  const key = `${text}:${color}`;
+  const cached = labelTextureCache.get(key);
+  if (cached) return cached;
+  const size = 64;
+  const canvas = document.createElement("canvas");
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext("2d")!;
+  ctx.clearRect(0, 0, size, size);
+  ctx.fillStyle = color;
+  ctx.font = `bold ${String(size * 0.6)}px sans-serif`;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText(text, size / 2, size / 2);
+  const tex = new CanvasTexture(canvas);
+  tex.colorSpace = SRGBColorSpace;
+  labelTextureCache.set(key, tex);
+  return tex;
+}
+
+/** A lightweight label sprite — replaces the expensive drei <Text> (troika SDF). */
+function LayerLabel({ text, color, opacity, renderOrder }: { text: string; color: string; opacity: number; renderOrder: number }) {
+  const tex = useMemo(() => getLabelTexture(text, color), [text, color]);
+  return (
+    <sprite position={[0, 0.01, 0]} scale={[0.5, 0.5, 0.5]} renderOrder={renderOrder}>
+      <spriteMaterial map={tex} transparent opacity={opacity} depthWrite={false} sizeAttenuation />
+    </sprite>
+  );
 }
 
 /** Lerp speed for position animations (higher = faster). */
@@ -104,12 +145,25 @@ function AnimatedLayerGroup({
 
   useFrame((_, delta) => {
     if (!groupRef.current) return;
+    // Skip if already at target (within threshold)
+    const dx = Math.abs(currentX.current - targetX);
+    const dy = Math.abs(currentY.current - targetY);
+    if (dx < LERP_THRESHOLD && dy < LERP_THRESHOLD) {
+      if (currentX.current !== targetX || currentY.current !== targetY) {
+        currentX.current = targetX;
+        currentY.current = targetY;
+        groupRef.current.position.x = targetX;
+        groupRef.current.position.y = targetY;
+      }
+      return;
+    }
     const dt = Math.min(delta, 0.05); // clamp large dt
     const factor = 1 - Math.exp(-LERP_SPEED * dt);
     currentX.current = MathUtils.lerp(currentX.current, targetX, factor);
     currentY.current = MathUtils.lerp(currentY.current, targetY, factor);
     groupRef.current.position.x = currentX.current;
     groupRef.current.position.y = currentY.current;
+    invalidate();
   });
 
   return (
@@ -122,7 +176,6 @@ function AnimatedLayerGroup({
 /** Load a texture from a URL (data: or http) and cache by URI. */
 function useLayerTexture(uri: string | undefined): Texture | null {
   const [texture, setTexture] = useState<Texture | null>(null);
-  const loaderRef = useRef(new TextureLoader());
 
   useEffect(() => {
     if (!uri) {
@@ -130,10 +183,10 @@ function useLayerTexture(uri: string | undefined): Texture | null {
       return;
     }
     let cancelled = false;
-    loaderRef.current.load(
+    sharedTextureLoader.load(
       uri,
       (tex) => {
-        if (!cancelled) setTexture(tex);
+        if (!cancelled) { setTexture(tex); invalidate(); }
       },
       undefined,
       (err) => {
@@ -156,6 +209,7 @@ function TexturedLayerPlane({
   opacity,
   crop,
   aiEditing,
+  generating3D,
   positionIndex,
   selected,
 }: {
@@ -166,6 +220,7 @@ function TexturedLayerPlane({
   opacity: number;
   crop?: CropInfo | undefined;
   aiEditing?: boolean | undefined;
+  generating3D?: boolean | undefined;
   /** Visual stack position (0 = bottom) for correct render ordering. */
   positionIndex?: number | undefined;
   selected?: boolean | undefined;
@@ -194,20 +249,35 @@ function TexturedLayerPlane({
   }, [aiEditing]);
 
   useFrame((_, delta) => {
+    let needsInvalidate = false;
     // Fade-in animation
     if (fadeProgress.current < 1 && matRef.current) {
       fadeProgress.current = Math.min(1, fadeProgress.current + delta * 2.0); // ~0.5s
       matRef.current.opacity = opacity * fadeProgress.current;
+      needsInvalidate = true;
     }
-    // Pulse glow while AI is editing
+    // Organic glow while AI is editing or generating 3D
     if (glowRef.current) {
-      if (aiEditing) {
-        const t = performance.now() / 600; // cycle period
-        glowRef.current.opacity = 0.12 + 0.18 * Math.sin(t) ** 2;
-      } else {
+      if (aiEditing || generating3D) {
+        const t = performance.now() / 1000;
+        // Multi-frequency breathing for organic feel
+        const breath = 0.5 + 0.5 * Math.sin(t * 1.8) * Math.sin(t * 0.7 + 0.3);
+        glowRef.current.opacity = 0.06 + 0.20 * breath;
+        // Shift hue: cyan→violet for 3D, soft blue for AI edit
+        if (generating3D && !aiEditing) {
+          const hue = 190 + 30 * Math.sin(t * 0.5);
+          glowRef.current.color.setHSL(hue / 360, 0.8, 0.65);
+        } else {
+          const hue = 200 + 15 * Math.sin(t * 0.4);
+          glowRef.current.color.setHSL(hue / 360, 0.6, 0.7);
+        }
+        needsInvalidate = true;
+      } else if (glowRef.current.opacity !== 0) {
         glowRef.current.opacity = 0;
+        needsInvalidate = true;
       }
     }
+    if (needsInvalidate) invalidate();
   });
 
   if (!texture) return null;
@@ -255,14 +325,6 @@ function TexturedLayerPlane({
           side={DoubleSide}
         />
       </mesh>
-      {/* Crisp white border for selected slice */}
-      {selected && (
-        <mesh rotation={[-Math.PI / 2, 0, 0]} position={[offX, 0.04, offZ]} renderOrder={baseOrder + 4}>
-          <planeGeometry args={[planeW, planeD]} />
-          <meshBasicMaterial visible={false} />
-          <Edges color="#ffffff" lineWidth={1.5} threshold={1} />
-        </mesh>
-      )}
     </group>
   );
 }
@@ -291,18 +353,224 @@ function CameraRef({ cameraRef }: { cameraRef: React.MutableRefObject<Camera | n
   return null;
 }
 
+/** Organic breathing glow shown while 3D generation is in progress. */
+function Generating3DPlaceholder({
+  width,
+  depth,
+  crop,
+}: {
+  width: number;
+  depth: number;
+  crop?: CropInfo;
+}): React.JSX.Element {
+  const fullW = width * 0.96;
+  const fullD = depth * 0.96;
+  let offX = 0;
+  let offZ = 0;
+  if (crop) {
+    offX = ((crop.cropX + crop.cropW / 2) / crop.origW - 0.5) * fullW;
+    offZ = ((crop.cropY + crop.cropH / 2) / crop.origH - 0.5) * fullD;
+  }
+  const planeW = crop ? fullW * (crop.cropW / crop.origW) : fullW * 0.5;
+  const planeD = crop ? fullD * (crop.cropH / crop.origH) : fullD * 0.5;
+
+  const innerRef = useRef<import("three").MeshBasicMaterial>(null);
+  const outerRef = useRef<import("three").MeshBasicMaterial>(null);
+  const outerMeshRef = useRef<import("three").Mesh>(null);
+
+  useFrame(() => {
+    const t = performance.now() / 1000;
+    // Organic multi-frequency breathing
+    const breath = 0.5 + 0.5 * Math.sin(t * 1.8) * Math.sin(t * 0.7 + 0.3);
+    // Color shifts between warm cyan and soft violet
+    const hue = 190 + 30 * Math.sin(t * 0.5);
+    const color = `hsl(${String(Math.round(hue))}, 80%, 65%)`;
+
+    if (innerRef.current) {
+      innerRef.current.opacity = 0.08 + 0.22 * breath;
+      innerRef.current.color.set(color);
+    }
+    if (outerRef.current) {
+      outerRef.current.opacity = 0.04 + 0.10 * breath;
+      outerRef.current.color.set(color);
+    }
+    // Soft scale pulse on the outer ring
+    if (outerMeshRef.current) {
+      const s = 1.0 + 0.06 * breath;
+      outerMeshRef.current.scale.set(s, s, 1);
+    }
+    invalidate();
+  });
+
+  return (
+    <group>
+      {/* Inner glow */}
+      <mesh rotation={[-Math.PI / 2, 0, 0]} position={[offX, 0.04, offZ]}>
+        <planeGeometry args={[planeW, planeD]} />
+        <meshBasicMaterial
+          ref={innerRef}
+          transparent
+          opacity={0.15}
+          color="#60d0ff"
+          depthWrite={false}
+          side={DoubleSide}
+        />
+      </mesh>
+      {/* Outer breathing halo */}
+      <mesh ref={outerMeshRef} rotation={[-Math.PI / 2, 0, 0]} position={[offX, 0.035, offZ]}>
+        <planeGeometry args={[planeW * 1.12, planeD * 1.12]} />
+        <meshBasicMaterial
+          ref={outerRef}
+          transparent
+          opacity={0.06}
+          color="#60d0ff"
+          depthWrite={false}
+          side={DoubleSide}
+        />
+      </mesh>
+    </group>
+  );
+}
+
+/** Renders a GLB model on a layer, auto-fitted to the segment's footprint on the prism. */
+function GLBLayerModel({
+  url,
+  width,
+  depth,
+  crop,
+}: {
+  url: string;
+  width: number;
+  depth: number;
+  crop?: CropInfo;
+}): React.JSX.Element | null {
+  const { scene } = useGLTF(url);
+  const groupRef = useRef<import("three").Group>(null);
+  const cloned = useMemo(() => {
+    const c = scene.clone(true);
+    // Fix geometry + materials so they render correctly after clone.
+    c.traverse((node) => {
+      const mesh = node as Mesh;
+      if (!mesh.isMesh) return;
+
+      // SAM-3 GLBs often lack normals — compute them so PBR lighting works.
+      if (!mesh.geometry.attributes["normal"]) {
+        mesh.geometry.computeVertexNormals();
+      }
+
+      const hasVertexColors = !!(mesh.geometry.attributes["color"]);
+      const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+      const fixed = mats.map((mat: Material) => {
+        const m = mat.clone();
+        if (m instanceof MeshStandardMaterial) {
+          // Enable vertex colors if the geometry provides them
+          if (hasVertexColors) {
+            m.vertexColors = true;
+          }
+          // Fix diffuse map colorSpace
+          if (m.map) {
+            m.map = m.map.clone();
+            m.map.colorSpace = SRGBColorSpace;
+            m.map.needsUpdate = true;
+          }
+          // If no texture and no vertex colors, ensure the base color isn't black
+          if (!m.map && !hasVertexColors) {
+            m.color = new Color(0xcccccc);
+          }
+          // PBR with metalness > 0 looks black without an environment map.
+          // Clamp metalness to 0 and ensure roughness is high enough.
+          m.metalness = 0;
+          m.roughness = Math.max(m.roughness, 0.6);
+          m.needsUpdate = true;
+        } else if (m instanceof MeshBasicMaterial) {
+          if (hasVertexColors) {
+            m.vertexColors = true;
+          }
+          if (m.map) {
+            m.map = m.map.clone();
+            m.map.colorSpace = SRGBColorSpace;
+            m.map.needsUpdate = true;
+          }
+          if (!m.map && !hasVertexColors) {
+            m.color = new Color(0xcccccc);
+          }
+          m.needsUpdate = true;
+        }
+        return m;
+      });
+      mesh.material = Array.isArray(mesh.material) ? fixed : fixed[0]!;
+    });
+    return c;
+  }, [scene]);
+
+  // Compute the target footprint from crop info
+  const fullW = width * 0.96;
+  const fullD = depth * 0.96;
+  let offX = 0;
+  let offZ = 0;
+  let targetW = fullW * 0.5;
+  let targetD = fullD * 0.5;
+
+  if (crop) {
+    offX = ((crop.cropX + crop.cropW / 2) / crop.origW - 0.5) * fullW;
+    offZ = ((crop.cropY + crop.cropH / 2) / crop.origH - 0.5) * fullD;
+    targetW = fullW * (crop.cropW / crop.origW);
+    targetD = fullD * (crop.cropH / crop.origH);
+  }
+
+  // Measure the GLB's actual bounding box and compute uniform scale to fit
+  const fitScale = useMemo(() => {
+    const box = new Box3().setFromObject(cloned);
+    const size = new Vector3();
+    box.getSize(size);
+    // Avoid division by zero
+    const modelW = Math.max(size.x, 0.001);
+    const modelH = Math.max(size.y, 0.001);
+    const modelD = Math.max(size.z, 0.001);
+    // Fit so the model fills the target footprint; also cap height to ~1 prism unit
+    const sX = targetW / modelW;
+    const sZ = targetD / modelD;
+    const sY = PRISM_H * 0.35 / modelH;
+    return Math.min(sX, sZ, sY);
+  }, [cloned, targetW, targetD]);
+
+  // Center the model's bounding box at the origin of the group
+  const centerOffset = useMemo(() => {
+    const box = new Box3().setFromObject(cloned);
+    const center = new Vector3();
+    box.getCenter(center);
+    return center.multiplyScalar(-1);
+  }, [cloned]);
+
+  // Force a re-render when the model mounts (frameloop="demand" needs a kick)
+  useEffect(() => { invalidate(); }, [cloned]);
+
+  return (
+    <group ref={groupRef} position={[offX, 0.05, offZ]} scale={[fitScale, fitScale, fitScale]}>
+      <group position={[centerOffset.x, centerOffset.y, centerOffset.z]}>
+        <primitive object={cloned} />
+      </group>
+    </group>
+  );
+}
+
 function SpacePrism(props: SpacePrismProps): React.JSX.Element {
-  const { layerCount, selectedLayerIndex, layerVisibility, layerOrder, onSelectLayer, dragOverride, suppressClicks, layerTextures, layerCropInfo, imageAspect, revealActive, onRevealDone, aiEditingLayer } = props;
+  const { layerCount, selectedLayerIndex, layerVisibility, layerOrder, onSelectLayer, dragOverride, suppressClicks, layerTextures, layerCropInfo, imageAspect, revealActive, onRevealDone, aiEditingLayer, layerGlbUrls, generating3DLayer } = props;
   const { prismW, prismD } = prismDims(imageAspect);
   const hiddenSlideX = prismW + 0.5;
+  const template = useUIStyle((s) => s.template);
 
   // Track reveal animation progress
   const revealProgress = useRef(revealActive ? 0 : 1);
   const revealDoneFired = useRef(!revealActive);
 
+  // Use template animation speed to control reveal pacing (lower = calmer)
+  const revealSpeed = 1.8 * template.ui.animationSpeed;
+
   useFrame((_, delta) => {
     if (revealProgress.current >= 1) return;
-    revealProgress.current = Math.min(1, revealProgress.current + delta * 1.8);
+    revealProgress.current = Math.min(1, revealProgress.current + delta * revealSpeed);
+    invalidate();
     if (revealProgress.current >= 1 && !revealDoneFired.current) {
       revealDoneFired.current = true;
       onRevealDone?.();
@@ -322,8 +590,16 @@ function SpacePrism(props: SpacePrismProps): React.JSX.Element {
   const dragIdx = dragOverride?.layerIdx ?? -1;
   const dragActive = dragOverride !== null && dragOverride !== undefined;
 
-  // Build the visual position for each layer
-  const positions: { layerIdx: number; y: number; isDragged: boolean }[] = [];
+  // Build the visual position for each layer (memoized for the non-drag case)
+  const staticPositions = useMemo(() => {
+    const result: { layerIdx: number; y: number; isDragged: boolean }[] = [];
+    for (let posIdx = 0; posIdx < layerOrder.length; posIdx++) {
+      result.push({ layerIdx: layerOrder[posIdx] ?? posIdx, y: layerY(posIdx, layerCount), isDragged: false });
+    }
+    return result;
+  }, [layerOrder, layerCount]);
+
+  let positions: { layerIdx: number; y: number; isDragged: boolean }[];
   if (dragActive) {
     // Figure out which slot the dragged layer would snap to
     const continuous = yToLayerContinuous(dragOverride.y, layerCount);
@@ -333,26 +609,27 @@ function SpacePrism(props: SpacePrismProps): React.JSX.Element {
     const tempOrder = layerOrder.filter(li => li !== dragIdx);
     tempOrder.splice(targetSlot, 0, dragIdx);
 
+    positions = [];
     for (let posIdx = 0; posIdx < tempOrder.length; posIdx++) {
       const li = tempOrder[posIdx] ?? posIdx;
       if (li === dragIdx) {
-        // Dragged layer renders at the continuous override Y
         positions.push({ layerIdx: li, y: dragOverride.y, isDragged: true });
       } else {
         positions.push({ layerIdx: li, y: layerY(posIdx, layerCount), isDragged: false });
       }
     }
   } else {
-    for (let posIdx = 0; posIdx < layerOrder.length; posIdx++) {
-      positions.push({ layerIdx: layerOrder[posIdx] ?? posIdx, y: layerY(posIdx, layerCount), isDragged: false });
-    }
+    positions = staticPositions;
   }
+
+  // Shared geometry for all brick planes — avoids N allocations per frame
+  const brickGeo = useMemo(() => new PlaneGeometry(prismW * 0.96, prismD * 0.96), [prismW, prismD]);
 
   return (
     <group>
       <mesh>
         <boxGeometry args={[prismW, PRISM_H, prismD]} />
-        <meshBasicMaterial wireframe transparent opacity={0.4} color="#8888aa" />
+        <meshBasicMaterial wireframe transparent opacity={0.15} color={template.colors.foreground} />
       </mesh>
 
       {positions.map(({ layerIdx, y, isDragged }, positionIndex) => {
@@ -365,15 +642,17 @@ function SpacePrism(props: SpacePrismProps): React.JSX.Element {
         const eased = t < 1 ? t * t * (3 - 2 * t) : 1; // smoothstep
         const targetY = isDragged ? y : eased * y;
         const selected = layerIdx === selectedLayerIndex;
-        const scale: [number, number, number] = [1, 1, 1];
+        const scaleVal = selected ? 1.01 : 1.0;
+        const scale: [number, number, number] = [scaleVal, scaleVal, scaleVal];
         const baseOpacity = vis ? vis.opacity : (selected ? 0.30 : 0.10);
         const opacity = hidden ? Math.max(baseOpacity * 0.35, 0.06) : baseOpacity;
-        const color = selected ? "#7ec8e3" : layerHue(layerIdx, layerCount);
+        const color = selected ? template.colors.accent : template.brick.color;
         // Use position in stack for render ordering so upper layers draw on top
         const baseOrder = positionIndex * 10;
         return (
           <AnimatedLayerGroup key={layerIdx} targetX={targetX} targetY={targetY}>
             <mesh
+              geometry={brickGeo}
               rotation={[Math.PI / 2, 0, 0]}
               scale={scale}
               renderOrder={baseOrder}
@@ -382,7 +661,6 @@ function SpacePrism(props: SpacePrismProps): React.JSX.Element {
                 if (!suppressClicks) onSelectLayer(layerIdx);
               }}
             >
-              <planeGeometry args={[prismW * 0.96, prismD * 0.96]} />
               <meshBasicMaterial
                 transparent
                 opacity={isDragged ? Math.max(opacity, 0.5) : opacity}
@@ -390,8 +668,7 @@ function SpacePrism(props: SpacePrismProps): React.JSX.Element {
                 depthWrite={false}
                 side={DoubleSide}
               />
-              {/* White selection border on the colored plane */}
-              {selected && <Edges color="#ffffff" lineWidth={1.5} threshold={1} />}
+
             </mesh>
             {/* Texture overlay if this layer has an image */}
             {layerTextures[layerIdx] && (
@@ -403,22 +680,33 @@ function SpacePrism(props: SpacePrismProps): React.JSX.Element {
                 opacity={vis ? vis.textureOpacity : 1}
                 crop={layerCropInfo[layerIdx]}
                 aiEditing={aiEditingLayer === layerIdx}
+                generating3D={generating3DLayer === layerIdx}
                 positionIndex={positionIndex}
                 selected={selected}
               />
             )}
-            <Text
-              position={[0, 0.01, 0]}
-              rotation={[-Math.PI / 2, 0, 0]}
-              fontSize={0.5}
-              color={color}
-              anchorX="center"
-              anchorY="middle"
-              fillOpacity={hidden ? 0.4 : Math.min(1, opacity * 3)}
+            {/* GLB 3D model overlay */}
+            {generating3DLayer === layerIdx && !layerGlbUrls?.[layerIdx] && (
+              <Generating3DPlaceholder
+                width={prismW}
+                depth={prismD}
+                {...(layerCropInfo[layerIdx] ? { crop: layerCropInfo[layerIdx] } : {})}
+              />
+            )}
+            {layerGlbUrls?.[layerIdx] && (
+              <GLBLayerModel
+                url={layerGlbUrls[layerIdx]}
+                width={prismW}
+                depth={prismD}
+                {...(layerCropInfo[layerIdx] ? { crop: layerCropInfo[layerIdx] } : {})}
+              />
+            )}
+            <LayerLabel
+              text={String(layerIdx)}
+              color={template.colors.foreground}
+              opacity={hidden ? 0.2 : Math.min(0.5, opacity * 2)}
               renderOrder={baseOrder + 1}
-            >
-              {String(layerIdx)}
-            </Text>
+            />
           </AnimatedLayerGroup>
         );
       })}
@@ -534,8 +822,8 @@ function ScrubberPlane(props: ScrubberPlaneProps): React.JSX.Element | null {
         <planeGeometry args={[prismW * 0.98, prismD * 0.02]} />
         <meshBasicMaterial
           transparent
-          opacity={0.6}
-          color="#7ec8e3"
+          opacity={0.4}
+          color="#333333"
           depthWrite={false}
           side={DoubleSide}
         />
@@ -584,6 +872,7 @@ interface SpaceViewportProps {
   peekRail: boolean;
   onClearSelection: () => void;
   layerTextures: Record<number, string>;
+  layerThumbnails: Record<number, string>;
   colorLayerTextures: Record<number, string>;
   layerCropInfo: Record<number, CropInfo>;
   segmentDisplayMode: SegmentDisplayMode;
@@ -602,6 +891,11 @@ interface SpaceViewportProps {
   onInvertMask: (index: number) => void;
   aiEditModelId: string;
   onChangeAiEditModel: (id: string) => void;
+  onGenerate3D: (index: number) => void;
+  generating3DLayer: number | null;
+  layerGlbUrls: Record<number, string>;
+  threeDSourceHidden: Set<number>;
+  onToggle3DSourceImage: (index: number) => void;
 }
 
 export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Element {
@@ -630,6 +924,7 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
     peekLayers,
     peekRail,
     layerTextures,
+    layerThumbnails,
     colorLayerTextures,
     layerCropInfo,
     segmentDisplayMode,
@@ -648,8 +943,33 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
     onInvertMask,
     aiEditModelId,
     onChangeAiEditModel,
+    onGenerate3D,
+    generating3DLayer,
+    layerGlbUrls,
+    threeDSourceHidden,
+    onToggle3DSourceImage,
   } = props;
   const animating = animPhase !== "idle";
+
+  /* ── Way-of-Code style template ─────────────── */
+  const template = useUIStyle((s) => s.template);
+  const chromeVisible = useUIStyle((s) => s.chromeVisible);
+  const setChromeVisible = useUIStyle((s) => s.setChromeVisible);
+
+  // Track whether an interactive panel (AI prompt) is open — pins chrome visible
+  const [promptOpen, setPromptOpen] = useState(false);
+  const wrappedPromptVisibility = useCallback((visible: boolean) => {
+    setPromptOpen(visible);
+    if (visible) setChromeVisible(true);
+    onPromptVisibilityChange?.(visible);
+  }, [onPromptVisibilityChange, setChromeVisible]);
+
+  const toggleChrome = useCallback(() => {
+    setChromeVisible(!chromeVisible);
+  }, [chromeVisible, setChromeVisible]);
+
+  // Whether chrome should render: always if showChrome, toggled on, or pinned by interactive panel
+  const shouldShowChrome = template.ui.showChrome || chromeVisible || promptOpen;
 
   const selectedVis = selectedLayerIndex !== null ? layerVisibility[selectedLayerIndex] : null;
   const selectedIsHidden = selectedVis ? !selectedVis.visible : false;
@@ -852,9 +1172,10 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
       onPointerUp={handleCanvasPointerUp}
       onPointerMove={handleCanvasPointerMove}
     >
-      <Canvas camera={{ position: [0, 10, 0.01], fov: 50 }} style={{ background: "#1a1a2e" }}>
-        <ambientLight intensity={0.8} />
-        <directionalLight position={[10, 10, 5]} intensity={0.6} />
+      <Canvas frameloop="demand" camera={{ position: [0, 10, 0.01], fov: 50 }} style={{ background: template.colors.background }}>
+        <ambientLight intensity={1.0} />
+        <directionalLight position={[10, 10, 5]} intensity={0.8} castShadow={false} />
+        <directionalLight position={[-5, -3, -5]} intensity={0.3} />
         <SpacePrism
           layerCount={layerCount}
           selectedLayerIndex={selectedLayerIndex}
@@ -869,6 +1190,8 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
           revealActive={revealActive}
           onRevealDone={onRevealDone}
           aiEditingLayer={aiRunning ? selectedLayerIndex : null}
+          layerGlbUrls={layerGlbUrls}
+          generating3DLayer={generating3DLayer}
         />
         <ScrubberPlane
           layerCount={layerCount}
@@ -882,6 +1205,7 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
         <CameraRig animPhase={animPhase} onAnimDone={onAnimDone} />
         <OrbitControls
           makeDefault
+          onChange={() => { invalidate(); }}
           enabled={!animating && !longPressSelected && !dragReorder}
           target={[0, 0, 0]}
           enableDamping
@@ -893,8 +1217,18 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
         />
       </Canvas>
 
+      {/* Chrome toggle button — always visible in top-left corner */}
+      <button
+        type="button"
+        onClick={toggleChrome}
+        title={shouldShowChrome ? "Hide toolbar" : "Show toolbar"}
+        className={`chrome-toggle-btn${shouldShowChrome ? " chrome-toggle-open" : ""}`}
+      >
+        {shouldShowChrome ? "✕" : "☰"}
+      </button>
+
       {/* Segment display mode toggle (masked original vs colored segments) */}
-      {layerCount > 1 && (
+      {shouldShowChrome && layerCount > 1 && (
         <button
           type="button"
           onClick={onToggleSegmentDisplay}
@@ -902,7 +1236,7 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
           style={{
             position: "absolute",
             top: 12,
-            left: 12,
+            left: 50,
             display: "flex",
             alignItems: "center",
             gap: 6,
@@ -923,7 +1257,7 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
       )}
 
       {/* Universal: Depth Rail (scrubber with drag-reorder ticks) */}
-      {showScrubber && (
+      {shouldShowChrome && showScrubber && (
         <LayerScrubber
           layerCount={layerCount}
           selectedIndex={selectedLayerIndex}
@@ -932,11 +1266,13 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
           onCommit={onSelectLayer}
           onPreviewOrder={onPreviewOrder}
           onCommitOrder={onCommitOrder}
+          layerThumbnails={layerThumbnails}
+          layerGlbUrls={layerGlbUrls}
         />
       )}
 
       {/* Universal: Context HUD on selection (bottom center) */}
-      {showControlsHUD && selectedLayerIndex !== null && (
+      {shouldShowChrome && showControlsHUD && selectedLayerIndex !== null && (
         <LayerControlsHUD
           layerIndex={selectedLayerIndex}
           isHidden={selectedIsHidden}
@@ -957,12 +1293,17 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
           onAddSlice={onAddSlice}
           aiEditModelId={aiEditModelId}
           onChangeAiEditModel={onChangeAiEditModel}
-          onPromptVisibilityChange={onPromptVisibilityChange}
+          onPromptVisibilityChange={wrappedPromptVisibility}
+          onGenerate3D={onGenerate3D}
+          generating3D={generating3DLayer === selectedLayerIndex}
+          has3DModel={selectedLayerIndex in layerGlbUrls}
+          sourceImageHidden={threeDSourceHidden.has(selectedLayerIndex)}
+          onToggle3DSourceImage={onToggle3DSourceImage}
         />
       )}
 
       {/* Layers view: full Photoshop-inspired panel */}
-      {showLayersPanel && (
+      {shouldShowChrome && showLayersPanel && (
         <LayersPanel
           layerCount={layerCount}
           order={layerOrder}
@@ -988,8 +1329,14 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
           aiError={aiError}
           onAddSlice={onAddSlice}
           layerTextures={layerTextures}
+          layerThumbnails={layerThumbnails}
           aiEditModelId={aiEditModelId}
           onChangeAiEditModel={onChangeAiEditModel}
+          onGenerate3D={onGenerate3D}
+          generating3DLayer={generating3DLayer}
+          layerGlbUrls={layerGlbUrls}
+          threeDSourceHidden={threeDSourceHidden}
+          onToggle3DSourceImage={onToggle3DSourceImage}
         />
       )}
 

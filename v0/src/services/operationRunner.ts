@@ -312,7 +312,6 @@ async function runSam3Segment(
   );
 
   const allMasks = segResult.individual_masks;
-  console.info(`[SAM2] auto-segment returned ${String(allMasks.length)} individual masks`);
 
   // Zero segments is valid — the image simply stays as a single layer.
   if (allMasks.length === 0) {
@@ -402,20 +401,15 @@ async function runSam3Segment(
 
     const frac = fg / totalPixels;
     const touchesAllEdges = touchTop && touchBottom && touchLeft && touchRight;
-    console.info(
-      `[SAM2] mask ${String(idx)}: ${(frac * 100).toFixed(1)}% area` +
-      (touchesAllEdges ? " [touches-all-edges]" : ""),
-    );
 
     if (frac >= MIN_AREA_FRACTION) {
       analyzed.push({
         idx, url: mask.url, fgPixels: fg, fgBitmask, touchesAllEdges,
         blob, width: mask.width ?? w, height: mask.height ?? h,
       });
-    } else {
-      console.info(`[SAM2]   → skipped (below ${(MIN_AREA_FRACTION * 100).toFixed(0)}% area threshold)`);
     }
   }
+  console.info(`[SAM2] analyzed ${String(allMasks.length)} masks → ${String(analyzed.length)} above ${(MIN_AREA_FRACTION * 100).toFixed(0)}% area threshold`);
 
   const isRaw = ctx.segmentMode === "raw";
 
@@ -432,15 +426,18 @@ async function runSam3Segment(
   } else {
     // ── 3. Identify & remove background masks ──
     const BG_AREA_FRACTION = 0.30;
-    const subjects = analyzed.filter((m) => {
+    let subjects = analyzed.filter((m) => {
       if (m.touchesAllEdges && m.fgPixels / totalPixels > BG_AREA_FRACTION) {
         backgroundIdxSet.add(m.idx);
-        console.info(`[SAM2] mask ${String(m.idx)} removed — background (${(m.fgPixels / totalPixels * 100).toFixed(1)}% area, touches all edges)`);
         return false;
       }
       return true;
     });
-    console.info(`[SAM2] ${String(analyzed.length)} → ${String(subjects.length)} after background removal`);
+    // Fallback: if background removal discards ALL masks, keep them all
+    if (subjects.length === 0 && analyzed.length > 0) {
+      backgroundIdxSet.clear();
+      subjects = [...analyzed];
+    }
 
     // ── 4. Sort by area descending ──
     subjects.sort((a, b) => b.fgPixels - a.fgPixels);
@@ -468,18 +465,12 @@ async function runSam3Segment(
           : 0;
         if (candidateContained > CONTAINMENT_THRESHOLD) {
           isDuplicate = true;
-          console.info(
-            `[SAM2] mask ${String(candidate.idx)} is ${(candidateContained * 100).toFixed(0)}% contained in mask ${String(kept.idx)} → skip`,
-          );
           break;
         }
 
         const iou = union > 0 ? intersection / union : 0;
         if (iou > IOU_THRESHOLD) {
           isDuplicate = true;
-          console.info(
-            `[SAM2] mask ${String(candidate.idx)} ≈ mask ${String(kept.idx)} (IoU ${(iou * 100).toFixed(0)}%) → skip`,
-          );
           break;
         }
       }
@@ -487,12 +478,11 @@ async function runSam3Segment(
         deduped.push(candidate);
       }
     }
-    console.info(`[SAM2] ${String(subjects.length)} → ${String(deduped.length)} after dedup`);
 
     // ── 6. Final selection (no hard cap — mask picker lets users refine) ──
     masks = deduped;
     for (const m of masks) autoSelectedIdxSet.add(m.idx);
-    console.info(`[SAM2] keeping ${String(masks.length)} final masks`);
+    console.info(`[SAM2] filter: ${String(analyzed.length)} analyzed → ${String(subjects.length)} after bg removal → ${String(deduped.length)} after dedup`);
   }
 
   // ── 7. Build mask candidates for the picker (ALL analyzed masks) ──
@@ -509,9 +499,8 @@ async function runSam3Segment(
       isBackground: backgroundIdxSet.has(m.idx),
     });
   }
-  console.info(`[SAM2] built ${String(maskCandidates.length)} mask candidates for picker`);
-
   if (masks.length === 0) {
+    console.warn(`[SAM2] all masks filtered out (${String(maskCandidates.length)} candidates available in picker)`);
     const oprunId = makeId("oprun");
     const oprunValue: JsonObject = {
       id: oprunId,

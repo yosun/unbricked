@@ -167,7 +167,7 @@ export default function LayerReorderHUD(
               background: isDragging
                 ? "var(--hud-active)"
                 : isSelected
-                  ? "rgba(126, 200, 227, 0.12)"
+                  ? "var(--hud-active)"
                   : "transparent",
               border: isDragging
                 ? "1px solid var(--scrubber-active)"

@@ -130,6 +130,110 @@ async function proxyFetch(
   return attempt(false);
 }
 
+/* ── fal.ai Queue helpers (submit → poll → result) ── */
+
+interface FalQueueSubmitResponse {
+  request_id: string;
+  response_url: string;
+  status_url: string;
+  cancel_url: string;
+}
+
+interface FalQueueStatus {
+  status: "IN_QUEUE" | "IN_PROGRESS" | "COMPLETED";
+  queue_position?: number;
+  response_url?: string;
+}
+
+/** Submit a request to the fal.ai queue. Returns the request_id + URLs. */
+async function falQueueSubmit(
+  modelPath: string,
+  body: Record<string, unknown>,
+  signal?: AbortSignal,
+): Promise<FalQueueSubmitResponse> {
+  const url = `${PROXY_BASE}/${modelPath}?fal_webhook=`;
+  const resp = await proxyFetch(
+    url,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-fal-target-url": `https://queue.fal.run/${modelPath}`,
+      },
+      body: JSON.stringify(body),
+    },
+    { timeoutMs: 30_000, signal },
+  );
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => "");
+    throw new Error(`fal queue submit error ${String(resp.status)}: ${text}`);
+  }
+  return (await resp.json()) as FalQueueSubmitResponse;
+}
+
+/** Poll the queue status until COMPLETED, then fetch & return the result JSON. */
+async function falQueuePollResult(
+  modelPath: string,
+  requestId: string,
+  opts?: { pollIntervalMs?: number; timeoutMs?: number; signal?: AbortSignal },
+): Promise<unknown> {
+  const pollInterval = opts?.pollIntervalMs ?? 3_000;
+  const timeout = opts?.timeoutMs ?? 300_000;
+  const signal = opts?.signal;
+  const deadline = Date.now() + timeout;
+
+  // Poll status
+  while (Date.now() < deadline) {
+    if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
+
+    const statusUrl = `${PROXY_BASE}/${modelPath}/requests/${requestId}/status`;
+    const statusResp = await proxyFetch(
+      statusUrl,
+      {
+        method: "GET",
+        headers: {
+          "x-fal-target-url": `https://queue.fal.run/${modelPath}/requests/${requestId}/status`,
+        },
+      },
+      { timeoutMs: 15_000, signal },
+    );
+    if (!statusResp.ok) {
+      const text = await statusResp.text().catch(() => "");
+      throw new Error(`fal queue status error ${String(statusResp.status)}: ${text}`);
+    }
+    const status = (await statusResp.json()) as FalQueueStatus;
+    console.info(`[fal-queue] ${modelPath} ${requestId}: ${status.status}${
+      status.queue_position != null ? ` (pos ${String(status.queue_position)})` : ""
+    }`);
+
+    if (status.status === "COMPLETED") break;
+
+    await new Promise((r) => { setTimeout(r, pollInterval); });
+  }
+
+  if (Date.now() >= deadline) {
+    throw new Error(`fal queue timed out after ${String(timeout / 1000)}s for ${modelPath}`);
+  }
+
+  // Fetch the result
+  const resultUrl = `${PROXY_BASE}/${modelPath}/requests/${requestId}`;
+  const resultResp = await proxyFetch(
+    resultUrl,
+    {
+      method: "GET",
+      headers: {
+        "x-fal-target-url": `https://queue.fal.run/${modelPath}/requests/${requestId}`,
+      },
+    },
+    { timeoutMs: 30_000, signal },
+  );
+  if (!resultResp.ok) {
+    const text = await resultResp.text().catch(() => "");
+    throw new Error(`fal queue result error ${String(resultResp.status)}: ${text}`);
+  }
+  return resultResp.json();
+}
+
 /* ── Request ─────────────────────────────────────── */
 
 export interface Img2ImgRequest {
@@ -371,29 +475,10 @@ export async function runSegmentation(
 
   const json: unknown = await response.json();
 
-  // Log the raw response for debugging segmentation issues
   if (json && typeof json === "object") {
     const obj = json as Record<string, unknown>;
-    const keys = Object.keys(obj);
-    console.info("[SAM3] response keys:", keys);
     const rle = obj["rle"];
-    if (Array.isArray(rle)) {
-      console.info(`[SAM3] rle: array of ${String(rle.length)}, types: [${rle.slice(0, 3).map((v) => typeof v === "string" ? `str(${String(v.length)})` : typeof v).join(", ")}${rle.length > 3 ? ", …" : ""}]`);
-    } else if (typeof rle === "string") {
-      console.info(`[SAM3] rle: single string, length=${String(rle.length)}, first 120 chars: ${rle.slice(0, 120)}`);
-    } else {
-      console.warn("[SAM3] rle field unexpected:", typeof rle, JSON.stringify(rle).slice(0, 200));
-    }
-    // Log any other fields that might contain mask data
-    for (const k of keys) {
-      if (k !== "rle") {
-        const v = obj[k];
-        const preview = JSON.stringify(v);
-        console.info(`[SAM3] ${k}:`, preview && preview.length > 200 ? preview.slice(0, 200) + "…" : v);
-      }
-    }
-  } else {
-    console.warn("[SAM3] unexpected response type:", typeof json);
+    console.debug(`[SAM3] response keys: ${Object.keys(obj).join(", ")}, rle: ${Array.isArray(rle) ? `array(${String(rle.length)})` : typeof rle}`);
   }
 
   return FalSam3RleResponseSchema.parse(json);
@@ -1164,4 +1249,104 @@ export async function refitAiResult(
   );
 
   return { dataUrl: croppedUrl, crop: newCrop, wasRefit: true };
+}
+
+/* ── Image-to-3D (fal-ai/sam-3/3d-objects) ───────── */
+
+export interface ImageTo3DRequest {
+  /** URL of the source image. */
+  imageUrl: string;
+  /** Optional mask URL(s) — one per object to reconstruct. */
+  maskUrls?: string[];
+  /** Text prompt for auto-segmentation when no masks provided. */
+  prompt?: string;
+  /** Export GLB with baked texture instead of vertex colors. */
+  exportTexturedGlb?: boolean;
+}
+
+const FalFileSchema = z.object({
+  url: z.string(),
+  content_type: z.string().optional(),
+  file_name: z.string().optional(),
+  file_size: z.number().optional(),
+});
+
+/** Accept both flat `[1,2,3]` and nested `[[1,2,3]]` number arrays from SAM-3. */
+const flexNumArray = z.union([
+  z.array(z.number()),
+  z.array(z.array(z.number())),
+]);
+
+const FalSam3DMetadataSchema = z.object({
+  rotation: flexNumArray.optional(),
+  translation: flexNumArray.optional(),
+  scale: flexNumArray.optional(),
+}).passthrough();
+
+const FalImageTo3DResponseSchema = z.object({
+  gaussian_splat: FalFileSchema,
+  model_glb: z.union([FalFileSchema, z.string()]).optional(),
+  metadata: z.array(FalSam3DMetadataSchema),
+  individual_splats: z.array(FalFileSchema).optional(),
+  individual_glbs: z.array(FalFileSchema).optional(),
+});
+
+export type FalImageTo3DResponse = z.infer<typeof FalImageTo3DResponseSchema>;
+
+/**
+ * Run SAM-3 image-to-3D on an image via the fal.ai proxy queue.
+ * Uses the async queue pattern: submit → poll status → get result.
+ * Endpoint: fal-ai/sam-3/3d-objects
+ * Returns GLB mesh + Gaussian splat + per-object metadata.
+ */
+export async function runImageTo3D(
+  req: ImageTo3DRequest,
+  signal?: AbortSignal,
+): Promise<FalImageTo3DResponse> {
+  const MODEL_PATH = "fal-ai/sam-3/3d-objects";
+
+  const body: Record<string, unknown> = {
+    image_url: req.imageUrl,
+  };
+  if (req.maskUrls !== undefined && req.maskUrls.length > 0) body["mask_urls"] = req.maskUrls;
+  if (req.prompt !== undefined) body["prompt"] = req.prompt;
+  if (req.exportTexturedGlb !== undefined) body["export_textured_glb"] = req.exportTexturedGlb;
+
+  // Compress image_url data URI
+  const overhead = JSON.stringify({ ...body, image_url: "" }).length + 128;
+  body["image_url"] = await compressDataUrl(req.imageUrl, overhead);
+
+  // Compress mask_urls data URIs
+  if (Array.isArray(body["mask_urls"])) {
+    const masks = body["mask_urls"] as string[];
+    const maskBudget = Math.max(1, Math.floor((MAX_BODY_BYTES - overhead) / Math.max(masks.length, 1)));
+    const compressed: string[] = [];
+    for (const m of masks) {
+      compressed.push(await compressDataUrl(m, MAX_BODY_BYTES - maskBudget));
+    }
+    body["mask_urls"] = compressed;
+  }
+
+  // 1. Submit to the queue
+  console.info("[SAM3-3D] Submitting to queue…");
+  const { request_id } = await falQueueSubmit(MODEL_PATH, body, signal);
+  console.info(`[SAM3-3D] Queued: request_id=${request_id}`);
+
+  // 2. Poll until complete, then get the result
+  const json = await falQueuePollResult(MODEL_PATH, request_id, {
+    pollIntervalMs: 4_000,
+    timeoutMs: 300_000,
+    ...(signal ? { signal } : {}),
+  });
+
+  if (json && typeof json === "object") {
+    const obj = json as Record<string, unknown>;
+    console.info("[SAM3-3D] response keys:", Object.keys(obj));
+    const meta = obj["metadata"];
+    if (Array.isArray(meta)) {
+      console.info(`[SAM3-3D] ${String(meta.length)} object(s) in metadata`);
+    }
+  }
+
+  return FalImageTo3DResponseSchema.parse(json);
 }

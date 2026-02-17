@@ -176,7 +176,7 @@ export default function ImageIngestPanel({
   const btnPrimary: React.CSSProperties = {
     ...btnBase,
     background: "var(--scrubber-active)",
-    color: "#111",
+    color: "#fff",
   };
   const btnSecondary: React.CSSProperties = {
     ...btnBase,
@@ -232,7 +232,7 @@ export default function ImageIngestPanel({
             style={{
               flex: 1,
               padding: "4px 8px",
-              background: "#1a1a2e",
+              background: "var(--hud-active)",
               border: "1px solid var(--hud-border-btn)",
               borderRadius: 4,
               color: "var(--hud-text)",
@@ -273,7 +273,7 @@ export default function ImageIngestPanel({
                     ? "1px solid var(--scrubber-active)"
                     : "1px solid var(--hud-border-btn)",
                   background: segmentMode === mode ? "var(--hud-active)" : "transparent",
-                  color: segmentMode === mode ? "#fff" : "var(--hud-muted)",
+                  color: segmentMode === mode ? "var(--hud-text)" : "var(--hud-muted)",
                   cursor: "pointer",
                   fontSize: 11,
                   fontWeight: 600,
@@ -298,7 +298,7 @@ export default function ImageIngestPanel({
                 background: tab === t ? "var(--hud-active)" : "transparent",
                 border: "none",
                 borderBottom: tab === t ? "2px solid var(--scrubber-active)" : "2px solid transparent",
-                color: tab === t ? "#fff" : "var(--hud-muted)",
+                color: tab === t ? "var(--hud-text)" : "var(--hud-muted)",
                 cursor: "pointer",
                 fontSize: 13,
                 fontWeight: 600,
@@ -327,7 +327,7 @@ export default function ImageIngestPanel({
                   style={{
                     width: "100%",
                     padding: "40px 0",
-                    background: "rgba(255,255,255,0.03)",
+                    background: "var(--hud-active)",
                     border: "2px dashed var(--hud-border-btn)",
                     borderRadius: 8,
                     color: "var(--hud-muted)",
@@ -380,7 +380,7 @@ export default function ImageIngestPanel({
                 style={{
                   width: "100%",
                   padding: "8px 10px",
-                  background: "#1a1a2e",
+                  background: "var(--hud-active)",
                   border: "1px solid var(--hud-border-btn)",
                   borderRadius: 6,
                   color: "var(--hud-text)",

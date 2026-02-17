@@ -34,9 +34,9 @@ export default function ViewModeSwitcher(props: ViewModeSwitcherProps): React.JS
             onClick={() => { onChange(mode); }}
             title={`${label} (${key})`}
             style={{
-              background: active ? "rgba(126, 200, 227, 0.2)" : "transparent",
+              background: active ? "var(--hud-active)" : "transparent",
               border: active
-                ? "1px solid rgba(126, 200, 227, 0.4)"
+                ? "1px solid var(--hud-border-btn)"
                 : "1px solid transparent",
               color: active ? "var(--scrubber-active)" : "#888",
               padding: "3px 8px",

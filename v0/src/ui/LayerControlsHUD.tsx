@@ -22,6 +22,11 @@ interface LayerControlsHUDProps {
   aiEditModelId: string;
   onChangeAiEditModel: (id: string) => void;
   onPromptVisibilityChange?: ((visible: boolean) => void) | undefined;
+  onGenerate3D: (index: number) => void;
+  generating3D: boolean;
+  has3DModel: boolean;
+  sourceImageHidden: boolean;
+  onToggle3DSourceImage: (index: number) => void;
 }
 
 function clamp01(v: number): number {
@@ -49,6 +54,11 @@ export default function LayerControlsHUD(props: LayerControlsHUDProps): React.JS
     onAddSlice,
     aiEditModelId,
     onChangeAiEditModel,
+    onGenerate3D,
+    generating3D,
+    has3DModel,
+    sourceImageHidden,
+    onToggle3DSourceImage,
   } = props;
 
   // Local drag value: null when not dragging (use props instead)
@@ -297,6 +307,49 @@ export default function LayerControlsHUD(props: LayerControlsHUDProps): React.JS
         </button>
       )}
 
+      {/* Generate 3D from this slice */}
+      {hasImage && (
+        <button
+          type="button"
+          onClick={() => { onGenerate3D(layerIndex); }}
+          disabled={generating3D}
+          title={has3DModel ? "3D model loaded" : "Generate 3D object from this slice"}
+          style={{
+            background: has3DModel ? "var(--hud-active)" : "none",
+            border: "1px solid var(--hud-border-btn)",
+            color: generating3D ? "var(--hud-muted)" : has3DModel ? "var(--scrubber-active)" : "var(--hud-text)",
+            borderRadius: 4,
+            padding: "2px 7px",
+            cursor: generating3D ? "wait" : "pointer",
+            fontSize: 11,
+            fontWeight: 600,
+          }}
+        >
+          {generating3D ? "⏳" : "3D"}
+        </button>
+      )}
+
+      {/* Toggle source image visibility when 3D model is present */}
+      {has3DModel && (
+        <button
+          type="button"
+          onClick={() => { onToggle3DSourceImage(layerIndex); }}
+          title={sourceImageHidden ? "Show source image" : "Hide source image"}
+          style={{
+            background: sourceImageHidden ? "var(--hud-active)" : "none",
+            border: "1px solid var(--hud-border-btn)",
+            color: sourceImageHidden ? "var(--scrubber-active)" : "var(--hud-text)",
+            borderRadius: 4,
+            padding: "2px 7px",
+            cursor: "pointer",
+            fontSize: 11,
+            fontWeight: 600,
+          }}
+        >
+          {sourceImageHidden ? "🖼" : "🖼̶"}
+        </button>
+      )}
+
       {/* AI prompt panel (shows above the HUD row) */}
       {showPrompt && (
         <div
@@ -326,7 +379,7 @@ export default function LayerControlsHUD(props: LayerControlsHUDProps): React.JS
               value={aiEditModelId}
               onChange={(e) => { onChangeAiEditModel(e.target.value); }}
               style={{
-                background: "rgba(255,255,255,0.08)",
+                background: "var(--hud-active)",
                 border: "1px solid var(--hud-border-btn)",
                 borderRadius: 4,
                 padding: "4px 6px",
@@ -354,7 +407,7 @@ export default function LayerControlsHUD(props: LayerControlsHUDProps): React.JS
               }}
               placeholder="Describe the edit..."
               style={{
-                background: "rgba(255,255,255,0.08)",
+                background: "var(--hud-active)",
                 border: "1px solid var(--hud-border-btn)",
                 borderRadius: 4,
                 padding: "4px 6px",

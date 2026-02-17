@@ -68,8 +68,8 @@ export default function PortalOverlay(props: PortalOverlayProps): React.JSX.Elem
               type="button"
               onClick={() => { onEnter(edge.to); }}
               style={{
-                background: "rgba(126, 200, 227, 0.15)",
-                border: "1px solid rgba(126, 200, 227, 0.3)",
+                background: "var(--hud-active)",
+                border: "1px solid var(--hud-border-btn)",
                 color: "var(--scrubber-active)",
                 padding: "3px 10px",
                 borderRadius: 4,

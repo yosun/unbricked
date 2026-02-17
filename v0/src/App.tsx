@@ -5,7 +5,9 @@ import {
   findLayerProps,
   findLayerOrder,
   findLayerRender,
+  findLayerGlb,
   layerPayloadId,
+  layerGlbPayloadId,
   defaultLayerOrder,
   serializeOrder,
   isHidden,
@@ -19,6 +21,7 @@ import {
   delOp,
   sha256Hex,
   sampleProject,
+  createSampleProject,
   loadProjectState,
   saveProjectState,
   clearProjectState,
@@ -29,7 +32,7 @@ import {
 import type { AnnotationId, Edge, GraphPatch, GraphPatchOp, JsonObject, PayloadId, ProjectState, SpaceId } from "./core";
 import type { ProjectPreferences } from "./core/preferences";
 import { findPortalEdges } from "./core";
-import { runImg2Img, runTextToImg, runNanoBananaEdit, fetchImageBlob, applyAlphaMask, invertAlpha, invertMaskWithOriginal, getAiEditModel, combineMasksToOriginal, refitAiResult } from "./services/falProxy";
+import { runImg2Img, runTextToImg, runNanoBananaEdit, fetchImageBlob, applyAlphaMask, invertAlpha, invertMaskWithOriginal, getAiEditModel, combineMasksToOriginal, refitAiResult, runImageTo3D } from "./services/falProxy";
 import type { CropInfo } from "./services/falProxy";
 import { runOperation } from "./services/operationRunner";
 import type { OperationProgress, MaskCandidate } from "./services/operationRunner";
@@ -48,6 +51,7 @@ import SettingsPanel from "./ui/SettingsPanel";
 import MaskPickerPanel from "./ui/MaskPickerPanel";
 import type { AnimPhase } from "./ui/CameraRig";
 import type { ViewMode } from "./ui/ViewMode";
+import { useUIStyle } from "./ui/uiStyleStore";
 
 const MAX_UNDO = 100;
 
@@ -101,10 +105,33 @@ export default function App(): React.JSX.Element {
   /** Whether a combine operation is in progress. */
   const [combining, setCombining] = useState(false);
 
+  /** Layer index currently generating 3D (null when idle). */
+  const [generating3DLayer, setGenerating3DLayer] = useState<number | null>(null);
+  /** GLB data URLs keyed by layer index — when a layer has a 3D model. */
+  const [layerGlbUrls, setLayerGlbUrls] = useState<Record<number, string>>({});
+  /** Set of layer indices whose source image is hidden during/after 3D generation. */
+  const [threeDSourceHidden, setThreeDSourceHidden] = useState<Set<number>>(new Set());
+
   /** Is the project in "tabula rasa" state — no meaningful content yet? */
   const isTabulaRasa = useMemo(() => {
     return Object.keys(state.payloads).length === 0;
   }, [state.payloads]);
+
+  /* ── Way-of-Code style template ─────────────── */
+  const template = useUIStyle((s) => s.template);
+  // Chrome visibility is driven via DOM class to avoid re-rendering the entire App
+  const headerRef = useRef<HTMLElement>(null);
+  useEffect(() => {
+    const unsub = useUIStyle.subscribe((s) => {
+      const show = s.template.ui.showChrome || s.chromeVisible;
+      headerRef.current?.parentElement?.classList.toggle("chrome-visible", show);
+    });
+    // Set initial state
+    const s = useUIStyle.getState();
+    const show = s.template.ui.showChrome || s.chromeVisible;
+    headerRef.current?.parentElement?.classList.toggle("chrome-visible", show);
+    return unsub;
+  }, []);
 
   const rootSpaceId = state.manifest.rootSpaceId;
   const spaceNav = useSpaceNav(rootSpaceId);
@@ -499,6 +526,44 @@ export default function App(): React.JSX.Element {
     [state, activeSpaceId],
   );
 
+  /** Restore persisted GLB 3D models on load / space change. */
+  const layerGlbAnnotation = useMemo(
+    () => findLayerGlb(state, activeSpaceId),
+    [state, activeSpaceId],
+  );
+  useEffect(() => {
+    const glb = layerGlbAnnotation;
+    if (!glb) return;
+    const urls: Record<number, string> = {};
+    const hiddenSet = new Set<number>();
+    for (const [key, payloadId] of Object.entries(glb.annotation.data)) {
+      if (!key.startsWith("glb.")) continue;
+      const idx = Number(key.slice(4));
+      if (!Number.isFinite(idx)) continue;
+      const payload = state.payloads[payloadId as PayloadId];
+      if (!payload) continue;
+      // Convert the data URL to a blob URL for Three.js
+      fetch(payload.uri)
+        .then((r) => r.blob())
+        .then((blob) => {
+          const blobUrl = URL.createObjectURL(blob);
+          setLayerGlbUrls((prev) => ({ ...prev, [idx]: blobUrl }));
+          setThreeDSourceHidden((prev) => new Set(prev).add(idx));
+        })
+        .catch((err) => {
+          console.warn(`[3D] Failed to restore GLB for layer ${String(idx)}:`, err);
+        });
+      urls[idx] = "pending"; // mark as known so we don't lose track
+      hiddenSet.add(idx);
+    }
+    // Immediately set the hidden set so source textures are suppressed
+    if (hiddenSet.size > 0) {
+      setThreeDSourceHidden(hiddenSet);
+    }
+  // Only run when the annotation identity changes (load / space switch)
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [layerGlbAnnotation?.annotationId]);
+
   /** Portal edges from the current space. */
   const portalEdges: Edge[] = useMemo(
     () => findPortalEdges(state, activeSpaceId),
@@ -507,19 +572,46 @@ export default function App(): React.JSX.Element {
 
   /** Build a map of layerIndex → payload URI for texture rendering.
    *  When maskActive is false for a slice layer, fall back to the
-   *  original image (layer 0) so the user sees the unmasked original. */
+   *  original image (layer 0) so the user sees the unmasked original.
+   *  When a layer's source image is hidden (3D mode), skip its texture. */
   const layerTextures = useMemo(() => {
     const result: Record<number, string> = {};
     // Resolve the original image URI from layer 0 for mask-off fallback
     const origPid = layerPayloadId(layerRender, 0);
     const origUri = origPid ? state.payloads[origPid as PayloadId]?.uri : undefined;
     for (let i = 0; i < layerCount; i++) {
+      // Skip texture for layers whose source image is hidden (3D model visible instead)
+      if (threeDSourceHidden.has(i)) continue;
+
       const pid = layerPayloadId(layerRender, i);
       const payload = pid ? state.payloads[pid as PayloadId] : undefined;
       const maskOn = isMaskActive(layerProps, i, layerCount);
       // When mask is OFF on a slice layer whose payload is still the
       // original segmentation mask, show the full original image instead.
       // AI-edited payloads (no segmentIndex) always show their own URI.
+      const isOriginalMask = payload?.meta.segmentIndex !== undefined;
+      if (!maskOn && i > 0 && origUri && isOriginalMask) {
+        result[i] = origUri;
+        continue;
+      }
+      if (payload) {
+        result[i] = payload.uri;
+      }
+    }
+    return result;
+  }, [layerCount, layerRender, state.payloads, layerProps, threeDSourceHidden]);
+
+  /** Build a map of layerIndex → payload URI for panel thumbnails.
+   *  Unlike layerTextures, this always includes textures even when
+   *  the source image is hidden (3D mode) so thumbnails stay visible. */
+  const layerThumbnails = useMemo(() => {
+    const result: Record<number, string> = {};
+    const origPid = layerPayloadId(layerRender, 0);
+    const origUri = origPid ? state.payloads[origPid as PayloadId]?.uri : undefined;
+    for (let i = 0; i < layerCount; i++) {
+      const pid = layerPayloadId(layerRender, i);
+      const payload = pid ? state.payloads[pid as PayloadId] : undefined;
+      const maskOn = isMaskActive(layerProps, i, layerCount);
       const isOriginalMask = payload?.meta.segmentIndex !== undefined;
       if (!maskOn && i > 0 && origUri && isOriginalMask) {
         result[i] = origUri;
@@ -826,6 +918,205 @@ export default function App(): React.JSX.Element {
       }
     },
     [layerRender, state.payloads, activeSpaceId, commitPatch],
+  );
+
+  /** Toggle source-image visibility for a layer that has a 3D model. */
+  const handleToggle3DSourceImage = useCallback(
+    (index: number) => {
+      setThreeDSourceHidden((prev) => {
+        const next = new Set(prev);
+        if (next.has(index)) {
+          next.delete(index);
+        } else {
+          next.add(index);
+        }
+        return next;
+      });
+    },
+    [],
+  );
+
+  /** Generate a 3D object from a segmented layer using SAM-3. */
+  const handleGenerate3D = useCallback(
+    async (index: number) => {
+      if (generating3DLayer !== null) return; // already running
+
+      const pid = layerPayloadId(layerRender, index);
+      if (!pid) return;
+      const payload = state.payloads[pid as PayloadId];
+      if (!payload) return;
+
+      // Get the original (full) image from layer 0 for context
+      const origPid = layerPayloadId(layerRender, 0);
+      const origPayload = origPid ? state.payloads[origPid as PayloadId] : undefined;
+      if (!origPayload) return;
+
+      setGenerating3DLayer(index);
+      // Hide the source image by default during generation
+      setThreeDSourceHidden((prev) => new Set(prev).add(index));
+
+      abortRef.current?.abort();
+      const controller = new AbortController();
+      abortRef.current = controller;
+
+      try {
+        // Build a full-size binary mask from the segment layer's cropped+alpha payload.
+        // SAM-3 expects image_url = full scene, mask_urls = binary (white=object, black=bg).
+        const meta = payload.meta;
+        const cropX = Number(meta["cropX"] ?? 0);
+        const cropY = Number(meta["cropY"] ?? 0);
+        const origW = Number(meta["origW"] ?? 0);
+        const origH = Number(meta["origH"] ?? 0);
+
+        let maskDataUrl: string;
+        if (origW > 0 && origH > 0) {
+          // Load the cropped+alpha segment image
+          const segImg = await new Promise<HTMLImageElement>((resolve, reject) => {
+            const img = new Image();
+            img.onload = () => { resolve(img); };
+            img.onerror = reject;
+            img.src = payload.uri;
+          });
+
+          // Create full-size canvas, fill black, draw segment at crop position
+          const maskCanvas = document.createElement("canvas");
+          maskCanvas.width = origW;
+          maskCanvas.height = origH;
+          const mCtx = maskCanvas.getContext("2d")!;
+          mCtx.fillStyle = "#000000";
+          mCtx.fillRect(0, 0, origW, origH);
+
+          // Draw segment onto a temp canvas to read alpha
+          const tmpCanvas = document.createElement("canvas");
+          tmpCanvas.width = segImg.naturalWidth;
+          tmpCanvas.height = segImg.naturalHeight;
+          const tCtx = tmpCanvas.getContext("2d")!;
+          tCtx.drawImage(segImg, 0, 0);
+          const segData = tCtx.getImageData(0, 0, tmpCanvas.width, tmpCanvas.height);
+
+          // Build full-size mask: white where segment alpha > 128
+          const fullData = mCtx.getImageData(0, 0, origW, origH);
+          const fd = fullData.data;
+          const sd = segData.data;
+          for (let sy = 0; sy < tmpCanvas.height; sy++) {
+            for (let sx = 0; sx < tmpCanvas.width; sx++) {
+              const sIdx = (sy * tmpCanvas.width + sx) * 4;
+              if (sd[sIdx + 3]! > 128) {
+                const fx = cropX + sx;
+                const fy = cropY + sy;
+                if (fx >= 0 && fx < origW && fy >= 0 && fy < origH) {
+                  const fIdx = (fy * origW + fx) * 4;
+                  fd[fIdx] = 255;
+                  fd[fIdx + 1] = 255;
+                  fd[fIdx + 2] = 255;
+                  fd[fIdx + 3] = 255;
+                }
+              }
+            }
+          }
+          mCtx.putImageData(fullData, 0, 0);
+          maskDataUrl = maskCanvas.toDataURL("image/png");
+        } else {
+          // No crop info — send segment as-is (fallback)
+          maskDataUrl = payload.uri;
+        }
+
+        const imageUrl = origPayload.uri;
+
+        const result = await runImageTo3D(
+          {
+            imageUrl,
+            maskUrls: [maskDataUrl],
+            exportTexturedGlb: true,
+          },
+          controller.signal,
+        );
+
+        // Get the GLB URL from the response
+        const glbRef = result.model_glb;
+        let glbUrl: string | undefined;
+        if (typeof glbRef === "string") {
+          glbUrl = glbRef;
+        } else if (glbRef && typeof glbRef === "object" && "url" in glbRef) {
+          glbUrl = glbRef.url;
+        }
+
+        if (!glbUrl) {
+          console.warn("[3D] No GLB returned; falling back to splat");
+          // Could use gaussian_splat as a fallback here, but GLB is preferred
+          setGenerating3DLayer(null);
+          return;
+        }
+
+        // Fetch GLB and convert to base64 data URL for persistence
+        const glbResponse = await fetch(glbUrl, { signal: controller.signal });
+        const glbBlob = await glbResponse.blob();
+        const glbDataUrl = await new Promise<string>((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => { resolve(reader.result as string); };
+          reader.onerror = reject;
+          reader.readAsDataURL(glbBlob);
+        });
+
+        // Create a blob URL for Three.js rendering
+        const glbBlobUrl = URL.createObjectURL(glbBlob);
+        setLayerGlbUrls((prev) => ({ ...prev, [index]: glbBlobUrl }));
+
+        // Persist the GLB as a Payload + annotation in project state
+        const encoder = new TextEncoder();
+        const glbBytes = encoder.encode(glbDataUrl);
+        const glbHash = await sha256Hex(glbBytes.buffer as ArrayBuffer);
+        const glbPayloadId = makeId("payload");
+        const glbPayloadValue: JsonObject = {
+          id: glbPayloadId,
+          kind: "Payload",
+          mediaType: "model/gltf-binary",
+          uri: glbDataUrl,
+          sha256: glbHash,
+          bytes: glbBytes.byteLength,
+          meta: {
+            source: "sam3-image-to-3d",
+            layerIndex: String(index),
+          },
+        };
+
+        commitPatch((prev) => {
+          const ops: GraphPatchOp[] = [];
+          ops.push(putOp("Payload", glbPayloadId, glbPayloadValue));
+
+          const existing = findLayerGlb(prev, activeSpaceId);
+          const annId = existing ? existing.annotationId : makeId("annotation");
+          const currentData = existing ? { ...existing.annotation.data } : {};
+          currentData[`glb.${String(index)}`] = glbPayloadId;
+          ops.push(putOp("Annotation", annId, {
+            id: annId,
+            kind: "Annotation",
+            target: { kind: "Space", id: activeSpaceId },
+            schema: "ui.layers.glb",
+            data: currentData,
+            createdAt: new Date().toISOString(),
+          }));
+
+          return newPatch({ baseRevision: prev.revision, ops });
+        });
+
+        console.info(`[3D] GLB model loaded and persisted for layer ${String(index)}`);
+      } catch (err: unknown) {
+        if (err instanceof DOMException && err.name === "AbortError") return;
+        const msg = err instanceof Error ? err.message : "3D generation failed";
+        console.error("[3D] failed:", msg);
+        // Un-hide source on failure
+        setThreeDSourceHidden((prev) => {
+          const next = new Set(prev);
+          next.delete(index);
+          return next;
+        });
+      } finally {
+        setGenerating3DLayer(null);
+        abortRef.current = null;
+      }
+    },
+    [generating3DLayer, layerRender, state.payloads, commitPatch, activeSpaceId],
   );
 
   /** Import an image file into the selected layer. */
@@ -1333,15 +1624,19 @@ export default function App(): React.JSX.Element {
   }, [handleClearSelection, handleUndo, handleRedo, handleStepLayer, handleSetViewMode]);
 
   return (
-    <div style={{ height: "100%", display: "grid", gridTemplateRows: "48px 1fr" }}>
+    <div className="app-shell" style={{ height: "100%", display: "grid", gridTemplateRows: "0px 1fr" }}>
       <header
+        ref={headerRef}
         style={{
           display: "flex",
           alignItems: "center",
           padding: "0 12px",
-          background: "#16162a",
-          color: "#ccc",
-          borderBottom: "1px solid rgba(255,255,255,0.08)",
+          background: template.colors.background,
+          color: template.colors.foreground,
+          borderBottom: `1px solid ${template.colors.accent}22`,
+          overflow: "hidden",
+          opacity: 0,
+          pointerEvents: "none",
         }}
       >
         <strong style={{ color: "#eee" }}>Unbricked</strong>
@@ -1355,8 +1650,8 @@ export default function App(): React.JSX.Element {
           style={{
             marginLeft: "auto",
             background: "none",
-            border: "1px solid rgba(255,255,255,0.15)",
-            color: undoCount === 0 ? "#555" : "#aaa",
+            border: "1px solid var(--hud-border-btn)",
+            color: undoCount === 0 ? "var(--hud-muted)" : "var(--hud-text)",
             padding: "4px 10px",
             borderRadius: 4,
             cursor: undoCount === 0 ? "default" : "pointer",
@@ -1372,8 +1667,8 @@ export default function App(): React.JSX.Element {
           style={{
             marginLeft: 6,
             background: "none",
-            border: "1px solid rgba(255,255,255,0.15)",
-            color: redoCount === 0 ? "#555" : "#aaa",
+            border: "1px solid var(--hud-border-btn)",
+            color: redoCount === 0 ? "var(--hud-muted)" : "var(--hud-text)",
             padding: "4px 10px",
             borderRadius: 4,
             cursor: redoCount === 0 ? "default" : "pointer",
@@ -1389,8 +1684,8 @@ export default function App(): React.JSX.Element {
           style={{
             marginLeft: 6,
             background: "none",
-            border: "1px solid rgba(255,255,255,0.15)",
-            color: "#aaa",
+            border: "1px solid var(--hud-border-btn)",
+            color: "var(--hud-text)",
             padding: "4px 10px",
             borderRadius: 4,
             cursor: "pointer",
@@ -1406,8 +1701,8 @@ export default function App(): React.JSX.Element {
           style={{
             marginLeft: 6,
             background: "none",
-            border: "1px solid rgba(255,255,255,0.15)",
-            color: "#aaa",
+            border: "1px solid var(--hud-border-btn)",
+            color: "var(--hud-text)",
             padding: "4px 10px",
             borderRadius: 4,
             cursor: "pointer",
@@ -1422,8 +1717,8 @@ export default function App(): React.JSX.Element {
           style={{
             marginLeft: 6,
             background: showSettings ? "var(--hud-active)" : "none",
-            border: "1px solid rgba(255,255,255,0.15)",
-            color: "#aaa",
+            border: "1px solid var(--hud-border-btn)",
+            color: "var(--hud-text)",
             padding: "4px 10px",
             borderRadius: 4,
             cursor: "pointer",
@@ -1436,8 +1731,11 @@ export default function App(): React.JSX.Element {
           type="button"
           onClick={() => {
             clearProjectState();
-            setState(sampleProject.state);
-            void spaceNav.navigateTo(sampleProject.state.manifest.rootSpaceId);
+            const fresh = createSampleProject();
+            setState(fresh.state);
+            const newRoot = fresh.state.manifest.rootSpaceId;
+            void spaceNav.navigateTo(newRoot, { replace: true });
+            spaceNav.setOrigin(newRoot);
             pastRef.current = [];
             futureRef.current = [];
             setUndoCount(0);
@@ -1450,12 +1748,15 @@ export default function App(): React.JSX.Element {
             setSlicingImageUrl(null);
             setMaskCandidates([]);
             setShowMaskPicker(false);
+            setGenerating3DLayer(null);
+            setLayerGlbUrls({});
+            setThreeDSourceHidden(new Set());
           }}
           style={{
             marginLeft: 6,
             background: "none",
-            border: "1px solid rgba(255,255,255,0.15)",
-            color: "#aaa",
+            border: "1px solid var(--hud-border-btn)",
+            color: "var(--hud-text)",
             padding: "4px 10px",
             borderRadius: 4,
             cursor: "pointer",
@@ -1493,6 +1794,7 @@ export default function App(): React.JSX.Element {
           peekRail={peekRail}
           onClearSelection={handleClearSelection}
           layerTextures={layerTextures}
+          layerThumbnails={layerThumbnails}
           colorLayerTextures={colorLayerTextures}
           layerCropInfo={layerCropInfo}
           segmentDisplayMode={segmentDisplayMode}
@@ -1511,6 +1813,11 @@ export default function App(): React.JSX.Element {
           onInvertMask={(index) => { void handleInvertMask(index); }}
           aiEditModelId={preferences.defaultAiEditModelId}
           onChangeAiEditModel={(id) => { handleChangePreference("defaultAiEditModelId", id); }}
+          onGenerate3D={(index) => { void handleGenerate3D(index); }}
+          generating3DLayer={generating3DLayer}
+          layerGlbUrls={layerGlbUrls}
+          threeDSourceHidden={threeDSourceHidden}
+          onToggle3DSourceImage={handleToggle3DSourceImage}
         />
         <SpaceAddressHUD
           fallbackSpaceId={rootSpaceId}

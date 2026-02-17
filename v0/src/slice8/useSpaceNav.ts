@@ -58,7 +58,8 @@ export function useSpaceNav(fallbackSpaceId: SpaceId): SpaceNavApi {
     async function navigateTo(spaceId: SpaceId, opts: NavigateOptions = {}): Promise<void> {
       if (opts.beforeNavigate) await opts.beforeNavigate(spaceId);
       setHashSpace(spaceId, opts.replace ? "replace" : "push");
-      // hashchange listener will update `current`
+      // Also set directly — hashchange won't fire if the hash value is unchanged
+      setCurrent(spaceId);
     }
 
     function setOrigin(spaceId: SpaceId): void {

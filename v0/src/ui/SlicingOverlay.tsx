@@ -43,7 +43,7 @@ export default function SlicingOverlay({
             position: "absolute",
             inset: -12,
             borderRadius: 12,
-            background: "rgba(126, 200, 227, 0.15)",
+            background: "rgba(0, 0, 0, 0.06)",
             filter: "blur(24px)",
             animation: "slicingGlow 2s ease-in-out infinite",
           }}
@@ -57,7 +57,7 @@ export default function SlicingOverlay({
             maxWidth: "100%",
             maxHeight: "55vh",
             borderRadius: 8,
-            boxShadow: "0 0 40px rgba(126, 200, 227, 0.3)",
+            boxShadow: "0 0 40px rgba(0, 0, 0, 0.12)",
             animation: "slicingGlow 2s ease-in-out infinite",
           }}
         />

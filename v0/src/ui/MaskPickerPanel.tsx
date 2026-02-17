@@ -137,8 +137,8 @@ export default function MaskPickerPanel(props: MaskPickerPanelProps): React.JSX.
               style={{
                 position: "relative",
                 background: isSelected
-                  ? "rgba(126, 200, 227, 0.18)"
-                  : "rgba(255,255,255,0.04)",
+                  ? "rgba(0, 0, 0, 0.08)"
+                  : "rgba(0, 0, 0, 0.03)",
                 border: isSelected
                   ? "2px solid var(--scrubber-active)"
                   : "2px solid transparent",
