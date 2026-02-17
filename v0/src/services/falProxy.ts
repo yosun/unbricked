@@ -3,7 +3,6 @@ import { z } from "zod";
 /**
  * fal.ai drop-in proxy client.
  *
- * Base URL: https://e23fygjvzd.execute-api.us-east-1.amazonaws.com/prod/
  * The proxy mirrors fal.ai's REST API.
  *
  * img2img route (fal-ai/flux/dev/image-to-image):
@@ -12,14 +11,20 @@ import { z } from "zod";
  *   Response: { images: [{ url, content_type?, width?, height? }], ... }
  */
 
-const PROXY_BASE = "https://e23fygjvzd.execute-api.us-east-1.amazonaws.com/prod";
+const PROXY_BASE = import.meta.env.VITE_FAL_PROXY_URL;
+if (!PROXY_BASE) {
+  throw new Error(
+    "VITE_FAL_PROXY_URL environment variable is required. " +
+    "Please create a .env file with VITE_FAL_PROXY_URL set to your proxy endpoint."
+  );
+}
 
 /**
  * Max JSON body size (bytes) we allow for proxy requests.
  * API Gateway has a 10 MB limit; we stay well under to leave room for the rest
  * of the JSON payload besides the image.
  */
-const MAX_BODY_BYTES = 6 * 1024 * 1024; // 6 MB
+const MAX_BODY_BYTES = 7 * 1024 * 1024; // 7 MB
 
 /** Max edge (px) when downscaling an image for the proxy. */
 const MAX_IMAGE_EDGE = 2048;
