@@ -23,7 +23,7 @@ export default function SlicingOverlay({
         flexDirection: "column",
         alignItems: "center",
         justifyContent: "center",
-        background: "#1a1a2e",
+        background: "var(--overlay-bg)",
         zIndex: 70,
         pointerEvents: "none",
         animation: "slicingFadeIn 0.3s ease-out",
@@ -41,10 +41,11 @@ export default function SlicingOverlay({
         <div
           style={{
             position: "absolute",
-            inset: -12,
-            borderRadius: 12,
-            background: "rgba(0, 0, 0, 0.06)",
-            filter: "blur(24px)",
+            inset: -16,
+            borderRadius: 16,
+            background: "var(--processing-glow)",
+            opacity: 0.4,
+            filter: "blur(32px)",
             animation: "slicingGlow 2s ease-in-out infinite",
           }}
         />
@@ -57,7 +58,7 @@ export default function SlicingOverlay({
             maxWidth: "100%",
             maxHeight: "55vh",
             borderRadius: 8,
-            boxShadow: "0 0 40px rgba(0, 0, 0, 0.12)",
+            boxShadow: "0 0 50px var(--processing-glow)",
             animation: "slicingGlow 2s ease-in-out infinite",
           }}
         />

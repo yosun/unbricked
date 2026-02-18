@@ -11,7 +11,15 @@
 			"npx tsc": true,
 			"npx eslint": true,
 			"npx vitest": true,
-			"npx vite": true
+			"npx vite": true,
+			"/^\\./node_modules/\\.bin/vitest run$/": {
+				"approve": true,
+				"matchCommandLine": true
+			},
+			"/^\\./node_modules/\\.bin/vitest run 2>&1$/": {
+				"approve": true,
+				"matchCommandLine": true
+			}
 		}
 	}
 }

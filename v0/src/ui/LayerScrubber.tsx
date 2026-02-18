@@ -220,7 +220,7 @@ export default function LayerScrubber(props: LayerScrubberProps): React.JSX.Elem
           bottom: 0,
           width: 4,
           borderRadius: 2,
-          background: "var(--scrubber-rail, rgba(0, 0, 0, 0.1))",
+          background: "var(--control-bg)",
           transform: "translateX(-50%)",
           pointerEvents: "none",
         }}
@@ -264,10 +264,10 @@ export default function LayerScrubber(props: LayerScrubberProps): React.JSX.Elem
                 right: 2,
                 height: isSelected ? 6 : 4,
                 borderRadius: 3,
-                background: isSelected ? "var(--scrubber-active, #7ec8e3)" : color,
+                background: isSelected ? "var(--scrubber-active)" : color,
                 opacity: isDragging ? 1 : (isSelected ? 0.9 : 0.5),
                 transition: isDragging ? "none" : "all 0.15s",
-                boxShadow: isDragging ? "0 0 8px rgba(0, 0, 0, 0.25)" : "none",
+                boxShadow: isDragging ? "0 0 8px var(--shadow-medium)" : "none",
               }}
             />
             {/* Layer label + thumbnail on the tick */}
@@ -312,7 +312,7 @@ export default function LayerScrubber(props: LayerScrubberProps): React.JSX.Elem
                         padding: "1px 2px",
                         borderRadius: 2,
                         background: "var(--scrubber-active)",
-                        color: "#111",
+                        color: "var(--btn-primary-text)",
                       }}
                     >
                       3D

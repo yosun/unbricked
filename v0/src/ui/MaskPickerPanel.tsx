@@ -137,8 +137,8 @@ export default function MaskPickerPanel(props: MaskPickerPanelProps): React.JSX.
               style={{
                 position: "relative",
                 background: isSelected
-                  ? "rgba(0, 0, 0, 0.08)"
-                  : "rgba(0, 0, 0, 0.03)",
+                  ? "var(--hud-active)"
+                  : "var(--control-bg)",
                 border: isSelected
                   ? "2px solid var(--scrubber-active)"
                   : "2px solid transparent",
@@ -162,7 +162,7 @@ export default function MaskPickerPanel(props: MaskPickerPanelProps): React.JSX.
               <div
                 style={{
                   fontSize: 10,
-                  color: c.isBackground ? "#fb4" : "var(--hud-muted)",
+                  color: c.isBackground ? "var(--color-warning)" : "var(--hud-muted)",
                   marginTop: 2,
                   textAlign: "center",
                 }}
@@ -214,7 +214,7 @@ export default function MaskPickerPanel(props: MaskPickerPanelProps): React.JSX.
             border: "none",
             borderRadius: 6,
             padding: "6px 16px",
-            color: "#111",
+            color: "var(--btn-primary-text)",
             cursor: selected.size === 0 || combining ? "default" : "pointer",
             fontWeight: 600,
             fontSize: 12,

@@ -1,5 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { AI_EDIT_MODELS, getAiEditModel } from "../services/falProxy";
+import type { Object3DTransform, PivotFace } from "./SpaceViewport";
+import { PIVOT_FACES, PIVOT_FACE_LABELS } from "./SpaceViewport";
 
 interface LayerControlsHUDProps {
   layerIndex: number;
@@ -27,10 +29,147 @@ interface LayerControlsHUDProps {
   has3DModel: boolean;
   sourceImageHidden: boolean;
   onToggle3DSourceImage: (index: number) => void;
+  transformPivot: PivotFace;
+  onSetTransformPivot: (face: PivotFace) => void;
+  transformMode: "translate" | "rotate" | "scale";
+  onSetTransformMode: (mode: "translate" | "rotate" | "scale") => void;
+  snapEnabled: boolean;
+  onToggleSnap: () => void;
+  modelTransform?: Object3DTransform | undefined;
+  onApplyTransform: (t: Object3DTransform) => void;
 }
 
 function clamp01(v: number): number {
   return Math.max(0, Math.min(1, v));
+}
+
+const txInputStyle: React.CSSProperties = {
+  width: 48,
+  background: "var(--hud-active)",
+  border: "1px solid var(--hud-border-btn)",
+  borderRadius: 3,
+  padding: "1px 3px",
+  color: "var(--hud-text)",
+  fontSize: 10,
+  fontFamily: "monospace",
+  textAlign: "right",
+  outline: "none",
+};
+
+function TransformInput({
+  value,
+  step,
+  suffix,
+  onChange,
+}: {
+  value: number;
+  step: number;
+  suffix?: string;
+  onChange: (v: number) => void;
+}): React.JSX.Element {
+  const [editing, setEditing] = useState(false);
+  const [text, setText] = useState("");
+
+  const display = suffix ? `${value.toFixed(step < 1 ? 2 : 1)}${suffix}` : value.toFixed(step < 1 ? 2 : 1);
+
+  if (!editing) {
+    return (
+      <span
+        style={{ ...txInputStyle, cursor: "text", userSelect: "none" }}
+        onClick={() => { setEditing(true); setText(String(value)); }}
+        title="Click to edit"
+      >
+        {display}
+      </span>
+    );
+  }
+
+  return (
+    <input
+      type="number"
+      step={step}
+      value={text}
+      autoFocus
+      style={txInputStyle}
+      onChange={(e) => { setText(e.target.value); }}
+      onKeyDown={(e) => {
+        e.stopPropagation();
+        if (e.key === "Enter") {
+          const v = parseFloat(text);
+          if (Number.isFinite(v)) onChange(v);
+          setEditing(false);
+        } else if (e.key === "Escape") {
+          setEditing(false);
+        }
+      }}
+      onBlur={() => {
+        const v = parseFloat(text);
+        if (Number.isFinite(v)) onChange(v);
+        setEditing(false);
+      }}
+    />
+  );
+}
+
+/** Editable transform panel showing position, rotation, scale. */
+export function TransformPanel({
+  transform,
+  onApply,
+  style,
+}: {
+  transform: Object3DTransform;
+  onApply: (t: Object3DTransform) => void;
+  style?: React.CSSProperties;
+}): React.JSX.Element {
+  const update = (field: "position" | "rotation" | "scale", axis: 0 | 1 | 2, value: number): void => {
+    const next = { ...transform, [field]: [...transform[field]] as [number, number, number] };
+    next[field][axis] = parseFloat(value.toFixed(3));
+    onApply(next);
+  };
+
+  return (
+    <div
+      style={{
+        position: "absolute",
+        bottom: "calc(100% + 6px)",
+        right: 0,
+        display: "grid",
+        gridTemplateColumns: "auto 1fr 1fr 1fr",
+        gap: "2px 4px",
+        padding: "6px 8px",
+        borderRadius: 6,
+        background: "var(--hud-bg)",
+        border: "1px solid var(--hud-border)",
+        color: "var(--hud-text)",
+        fontSize: 10,
+        fontFamily: "monospace",
+        whiteSpace: "nowrap",
+        zIndex: 14,
+        pointerEvents: "auto",
+        ...style,
+      }}
+    >
+      <span style={{ opacity: 0.5 }} />
+      <span style={{ opacity: 0.5, textAlign: "center" }}>X</span>
+      <span style={{ opacity: 0.5, textAlign: "center" }}>Y</span>
+      <span style={{ opacity: 0.5, textAlign: "center" }}>Z</span>
+
+      <span style={{ opacity: 0.5 }}>Pos</span>
+      {([0, 1, 2] as const).map((i) => (
+        <TransformInput key={`p${String(i)}`} value={transform.position[i]} step={0.05} onChange={(v) => { update("position", i, v); }} />
+      ))}
+
+      <span style={{ opacity: 0.5 }}>Rot</span>
+      {([0, 1, 2] as const).map((i) => (
+        <TransformInput key={`r${String(i)}`} value={transform.rotation[i]} step={1} suffix="°" onChange={(v) => { update("rotation", i, v); }} />
+      ))}
+
+      <span style={{ opacity: 0.5 }}>Scl</span>
+      {([0, 1, 2] as const).map((i) => (
+        <TransformInput key={`s${String(i)}`} value={transform.scale[i]} step={0.05} onChange={(v) => { update("scale", i, v); }} />
+      ))}
+    </div>
+  );
 }
 
 export default function LayerControlsHUD(props: LayerControlsHUDProps): React.JSX.Element {
@@ -59,6 +198,14 @@ export default function LayerControlsHUD(props: LayerControlsHUDProps): React.JS
     has3DModel,
     sourceImageHidden,
     onToggle3DSourceImage,
+    transformPivot,
+    onSetTransformPivot,
+    transformMode,
+    onSetTransformMode,
+    snapEnabled,
+    onToggleSnap,
+    modelTransform,
+    onApplyTransform,
   } = props;
 
   // Local drag value: null when not dragging (use props instead)
@@ -350,6 +497,81 @@ export default function LayerControlsHUD(props: LayerControlsHUDProps): React.JS
         </button>
       )}
 
+      {/* Pivot mode toggle for 3D model transform */}
+      {has3DModel && (
+        <button
+          type="button"
+          onClick={() => { onSetTransformPivot(transformPivot === "center" ? "+z" : "center"); }}
+          title={transformPivot === "center" ? "Switch to Pivot mode" : "Switch to Center mode"}
+          style={{
+            background: transformPivot !== "center" ? "var(--hud-active)" : "none",
+            border: "1px solid var(--hud-border-btn)",
+            color: transformPivot !== "center" ? "var(--scrubber-active)" : "var(--hud-text)",
+            borderRadius: 4,
+            padding: "2px 7px",
+            cursor: "pointer",
+            fontSize: 9,
+            fontWeight: 600,
+          }}
+        >
+          {transformPivot === "center" ? "Center" : PIVOT_FACE_LABELS[transformPivot]}
+        </button>
+      )}
+
+      {/* Transform mode buttons (Translate / Rotate / Scale) */}
+      {has3DModel && (
+        <>
+          <span style={{ width: 1, height: 16, background: "var(--hud-border)", margin: "0 2px" }} />
+          {(["translate", "rotate", "scale"] as const).map((mode) => {
+            const label = mode === "translate" ? "T" : mode === "rotate" ? "R" : "S";
+            const active = transformMode === mode;
+            return (
+              <button
+                key={mode}
+                type="button"
+                onClick={() => { onSetTransformMode(mode); }}
+                title={`${mode.charAt(0).toUpperCase()}${mode.slice(1)} mode`}
+                style={{
+                  background: active ? "var(--hud-active)" : "none",
+                  border: "1px solid var(--hud-border-btn)",
+                  color: active ? "var(--scrubber-active)" : "var(--hud-text)",
+                  borderRadius: 4,
+                  padding: "2px 7px",
+                  cursor: "pointer",
+                  fontSize: 11,
+                  fontWeight: 600,
+                }}
+              >
+                {label}
+              </button>
+            );
+          })}
+          {/* Snap toggle */}
+          <button
+            type="button"
+            onClick={onToggleSnap}
+            title={snapEnabled ? "Disable snapping" : "Enable snapping"}
+            style={{
+              background: snapEnabled ? "var(--hud-active)" : "none",
+              border: "1px solid var(--hud-border-btn)",
+              color: snapEnabled ? "var(--scrubber-active)" : "var(--hud-muted)",
+              borderRadius: 4,
+              padding: "2px 7px",
+              cursor: "pointer",
+              fontSize: 9,
+              fontWeight: 600,
+            }}
+          >
+            ⊞
+          </button>
+        </>
+      )}
+
+      {/* Transform values panel (editable, shows above HUD when 3D model present) */}
+      {has3DModel && modelTransform && (
+        <TransformPanel transform={modelTransform} onApply={onApplyTransform} />
+      )}
+
       {/* AI prompt panel (shows above the HUD row) */}
       {showPrompt && (
         <div
@@ -446,7 +668,7 @@ export default function LayerControlsHUD(props: LayerControlsHUDProps): React.JS
               border: "none",
               borderRadius: 4,
               padding: "5px 10px",
-              color: "#111",
+              color: "var(--btn-primary-text)",
               cursor: aiRunning ? "wait" : "pointer",
               fontWeight: 600,
               fontSize: 12,
@@ -457,7 +679,7 @@ export default function LayerControlsHUD(props: LayerControlsHUDProps): React.JS
           {aiError && (
             <div
               style={{
-                color: "#e55",
+                color: "var(--color-error)",
                 fontSize: 11,
                 wordBreak: "break-word",
                 userSelect: "text",

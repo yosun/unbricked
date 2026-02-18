@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Canvas, useThree, useFrame, invalidate } from "@react-three/fiber";
-import { OrbitControls, useGLTF } from "@react-three/drei";
-import { Box3, CanvasTexture, Color, DoubleSide, MathUtils, MeshBasicMaterial, MeshStandardMaterial, PlaneGeometry, Plane, Raycaster, SRGBColorSpace, Vector3, TextureLoader } from "three";
+import { OrbitControls, TransformControls, useGLTF } from "@react-three/drei";
+import { Box3, CanvasTexture, Color, DoubleSide, Euler, GridHelper as ThreeGridHelper, Group, MathUtils, MeshBasicMaterial, MeshStandardMaterial, PlaneGeometry, Plane, Raycaster, SRGBColorSpace, Vector3, TextureLoader, BufferGeometry, Float32BufferAttribute, LineBasicMaterial } from "three";
 import type { Camera, Material, Mesh, Texture } from "three";
 import type { ThreeEvent } from "@react-three/fiber";
 
@@ -84,6 +84,22 @@ interface SpacePrismProps {
   layerGlbUrls?: Record<number, string>;
   /** Layer index currently generating 3D. */
   generating3DLayer?: number | null;
+  /** Transform pivot face for 3D models. */
+  transformPivot?: PivotFace;
+  /** Transform gizmo mode. */
+  transformMode?: "translate" | "rotate" | "scale";
+  /** Snap values (null = no snap). */
+  snapTranslation?: number | undefined;
+  snapRotation?: number | undefined;
+  snapScale?: number | undefined;
+  /** Whether snapping is currently enabled (for visual helpers). */
+  snapEnabled?: boolean | undefined;
+  /** Callback when model transform changes. */
+  onTransformChange?: ((t: Object3DTransform) => void) | undefined;
+  /** Externally-set transform to apply to the model. */
+  appliedTransform?: Object3DTransform | undefined;
+  /** Current model transform state (for grid alignment). */
+  modelTransform?: Object3DTransform | undefined;
 }
 
 /** Shared TextureLoader — one instance for the whole module. */
@@ -233,6 +249,7 @@ function TexturedLayerPlane({
   const fadeProgress = useRef(1); // 1 = fully visible
   // Track AI editing state to trigger fade-in when it stops
   const wasEditing = useRef(false);
+  const glowColor = useUIStyle((s) => s.template.colors.glowAi);
 
   useEffect(() => {
     if (uri !== prevUri.current) {
@@ -262,14 +279,14 @@ function TexturedLayerPlane({
         const t = performance.now() / 1000;
         // Multi-frequency breathing for organic feel
         const breath = 0.5 + 0.5 * Math.sin(t * 1.8) * Math.sin(t * 0.7 + 0.3);
-        glowRef.current.opacity = 0.06 + 0.20 * breath;
+        glowRef.current.opacity = 0.15 + 0.35 * breath;
         // Shift hue: cyan→violet for 3D, soft blue for AI edit
         if (generating3D && !aiEditing) {
           const hue = 190 + 30 * Math.sin(t * 0.5);
-          glowRef.current.color.setHSL(hue / 360, 0.8, 0.65);
+          glowRef.current.color.setHSL(hue / 360, 0.85, 0.55);
         } else {
           const hue = 200 + 15 * Math.sin(t * 0.4);
-          glowRef.current.color.setHSL(hue / 360, 0.6, 0.7);
+          glowRef.current.color.setHSL(hue / 360, 0.7, 0.6);
         }
         needsInvalidate = true;
       } else if (glowRef.current.opacity !== 0) {
@@ -320,7 +337,7 @@ function TexturedLayerPlane({
           ref={glowRef}
           transparent
           opacity={0}
-          color="#7ec8e3"
+          color={glowColor}
           depthWrite={false}
           side={DoubleSide}
         />
@@ -363,6 +380,7 @@ function Generating3DPlaceholder({
   depth: number;
   crop?: CropInfo;
 }): React.JSX.Element {
+  const glowColor = useUIStyle((s) => s.template.colors.glowAi);
   const fullW = width * 0.96;
   const fullD = depth * 0.96;
   let offX = 0;
@@ -384,14 +402,14 @@ function Generating3DPlaceholder({
     const breath = 0.5 + 0.5 * Math.sin(t * 1.8) * Math.sin(t * 0.7 + 0.3);
     // Color shifts between warm cyan and soft violet
     const hue = 190 + 30 * Math.sin(t * 0.5);
-    const color = `hsl(${String(Math.round(hue))}, 80%, 65%)`;
+    const color = `hsl(${String(Math.round(hue))}, 85%, 55%)`;
 
     if (innerRef.current) {
-      innerRef.current.opacity = 0.08 + 0.22 * breath;
+      innerRef.current.opacity = 0.15 + 0.35 * breath;
       innerRef.current.color.set(color);
     }
     if (outerRef.current) {
-      outerRef.current.opacity = 0.04 + 0.10 * breath;
+      outerRef.current.opacity = 0.08 + 0.18 * breath;
       outerRef.current.color.set(color);
     }
     // Soft scale pulse on the outer ring
@@ -411,7 +429,7 @@ function Generating3DPlaceholder({
           ref={innerRef}
           transparent
           opacity={0.15}
-          color="#60d0ff"
+          color={glowColor}
           depthWrite={false}
           side={DoubleSide}
         />
@@ -423,7 +441,7 @@ function Generating3DPlaceholder({
           ref={outerRef}
           transparent
           opacity={0.06}
-          color="#60d0ff"
+          color={glowColor}
           depthWrite={false}
           side={DoubleSide}
         />
@@ -432,68 +450,96 @@ function Generating3DPlaceholder({
   );
 }
 
+/** Standardized 3D object transform state. */
+export interface Object3DTransform {
+  position: [number, number, number];
+  rotation: [number, number, number]; // degrees
+  scale: [number, number, number];
+}
+
+/**
+ * Which face of the bounding rectangular prism the gizmo pivot sits on.
+ * "center" = volumetric center.  The six faces correspond to the axis-aligned
+ * planes of the oriented bounding box *after* the −90° X rotation.
+ * Because the rotation maps raw (x,y,z) → (x, z, -y):
+ *   +Z = bottom (base/feet), −Z = top (head), ±X = left/right, ±Y = front/back.
+ */
+export type PivotFace = "center" | "-y" | "+y" | "-x" | "+x" | "-z" | "+z";
+export const PIVOT_FACES: PivotFace[] = ["center", "+z", "-z", "-x", "+x", "-y", "+y"];
+export const PIVOT_FACE_LABELS: Record<PivotFace, string> = {
+  "center": "Center",
+  "+z": "Bottom",
+  "-z": "Top",
+  "-x": "Left",
+  "+x": "Right",
+  "-y": "Front",
+  "+y": "Back",
+};
+
+const DEFAULT_TRANSFORM: Object3DTransform = {
+  position: [0, 0, 0],
+  rotation: [0, 0, 0],
+  scale: [1, 1, 1],
+};
+
 /** Renders a GLB model on a layer, auto-fitted to the segment's footprint on the prism. */
 function GLBLayerModel({
   url,
   width,
   depth,
   crop,
+  selected,
+  transformPivot,
+  transformMode,
+  snapTranslation,
+  snapRotation,
+  snapScale,
+  onTransformChange,
+  appliedTransform,
 }: {
   url: string;
   width: number;
   depth: number;
-  crop?: CropInfo;
+  crop?: CropInfo | undefined;
+  selected?: boolean | undefined;
+  transformPivot?: PivotFace | undefined;
+  transformMode?: "translate" | "rotate" | "scale" | undefined;
+  snapTranslation?: number | undefined;
+  snapRotation?: number | undefined;
+  snapScale?: number | undefined;
+  onTransformChange?: ((t: Object3DTransform) => void) | undefined;
+  appliedTransform?: Object3DTransform | undefined;
 }): React.JSX.Element | null {
   const { scene } = useGLTF(url);
-  const groupRef = useRef<import("three").Group>(null);
+  const selectionWireframe = useUIStyle((s) => s.template.colors.selectionWireframe);
+  const pivotColor = useUIStyle((s) => s.template.colors.pivotColor);
+  const tcTargetRef = useRef<import("three").Group>(null);
+  const contentRef = useRef<import("three").Group>(null);
+  const [tcReady, setTcReady] = useState(false);
+
   const cloned = useMemo(() => {
     const c = scene.clone(true);
-    // Fix geometry + materials so they render correctly after clone.
     c.traverse((node) => {
       const mesh = node as Mesh;
       if (!mesh.isMesh) return;
-
-      // SAM-3 GLBs often lack normals — compute them so PBR lighting works.
       if (!mesh.geometry.attributes["normal"]) {
         mesh.geometry.computeVertexNormals();
       }
-
       const hasVertexColors = !!(mesh.geometry.attributes["color"]);
       const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
       const fixed = mats.map((mat: Material) => {
         const m = mat.clone();
         if (m instanceof MeshStandardMaterial) {
-          // Enable vertex colors if the geometry provides them
-          if (hasVertexColors) {
-            m.vertexColors = true;
-          }
-          // Fix diffuse map colorSpace
-          if (m.map) {
-            m.map = m.map.clone();
-            m.map.colorSpace = SRGBColorSpace;
-            m.map.needsUpdate = true;
-          }
-          // If no texture and no vertex colors, ensure the base color isn't black
-          if (!m.map && !hasVertexColors) {
-            m.color = new Color(0xcccccc);
-          }
-          // PBR with metalness > 0 looks black without an environment map.
-          // Clamp metalness to 0 and ensure roughness is high enough.
+          if (hasVertexColors) m.vertexColors = true;
+          if (m.map) { m.map = m.map.clone(); m.map.colorSpace = SRGBColorSpace; m.map.needsUpdate = true; }
+          if (!m.map && !hasVertexColors) m.color = new Color(0xcccccc);
           m.metalness = 0;
           m.roughness = Math.max(m.roughness, 0.6);
           m.needsUpdate = true;
         } else if (m instanceof MeshBasicMaterial) {
-          if (hasVertexColors) {
-            m.vertexColors = true;
-          }
-          if (m.map) {
-            m.map = m.map.clone();
-            m.map.colorSpace = SRGBColorSpace;
-            m.map.needsUpdate = true;
-          }
-          if (!m.map && !hasVertexColors) {
-            m.color = new Color(0xcccccc);
-          }
+          if (hasVertexColors) m.vertexColors = true;
+          if (m.map) { m.map = m.map.clone(); m.map.colorSpace = SRGBColorSpace; m.map.needsUpdate = true; }
+          if (!m.map && !hasVertexColors) m.color = new Color(0xcccccc);
           m.needsUpdate = true;
         }
         return m;
@@ -503,13 +549,33 @@ function GLBLayerModel({
     return c;
   }, [scene]);
 
-  // Compute the target footprint from crop info
+  // ── Compute bbox metrics in the ROTATED space (as the model will actually be displayed).
+  // We apply the -90° X rotation to a temporary group, then compute the AABB directly.
+  const rotatedMetrics = useMemo(() => {
+    const tempGroup = new Group();
+    tempGroup.rotation.set(-Math.PI / 2, 0, 0);
+    tempGroup.add(cloned);
+    tempGroup.updateMatrixWorld(true);
+
+    const box = new Box3().setFromObject(tempGroup);
+    const size = new Vector3();
+    box.getSize(size);
+    const center = new Vector3();
+    box.getCenter(center);
+
+    // Remove cloned from temp group so it can be used normally in the scene
+    tempGroup.remove(cloned);
+
+    return { center, size, min: box.min.clone(), max: box.max.clone() };
+  }, [cloned]);
+
+  // ── Target footprint on the prism ──
   const fullW = width * 0.96;
   const fullD = depth * 0.96;
   let offX = 0;
   let offZ = 0;
-  let targetW = fullW * 0.5;
-  let targetD = fullD * 0.5;
+  let targetW = fullW;
+  let targetD = fullD;
 
   if (crop) {
     offX = ((crop.cropX + crop.cropW / 2) / crop.origW - 0.5) * fullW;
@@ -518,44 +584,281 @@ function GLBLayerModel({
     targetD = fullD * (crop.cropH / crop.origH);
   }
 
-  // Measure the GLB's actual bounding box and compute uniform scale to fit
+  // ── Fit scale: match XZ footprint (top-down view) to the segment area.
   const fitScale = useMemo(() => {
-    const box = new Box3().setFromObject(cloned);
-    const size = new Vector3();
-    box.getSize(size);
-    // Avoid division by zero
-    const modelW = Math.max(size.x, 0.001);
-    const modelH = Math.max(size.y, 0.001);
-    const modelD = Math.max(size.z, 0.001);
-    // Fit so the model fills the target footprint; also cap height to ~1 prism unit
-    const sX = targetW / modelW;
-    const sZ = targetD / modelD;
-    const sY = PRISM_H * 0.35 / modelH;
-    return Math.min(sX, sZ, sY);
-  }, [cloned, targetW, targetD]);
+    const sX = targetW / Math.max(rotatedMetrics.size.x, 0.001);
+    const sZ = targetD / Math.max(rotatedMetrics.size.z, 0.001);
+    return Math.min(sX, sZ);
+  }, [rotatedMetrics, targetW, targetD]);
 
-  // Center the model's bounding box at the origin of the group
-  const centerOffset = useMemo(() => {
-    const box = new Box3().setFromObject(cloned);
-    const center = new Vector3();
-    box.getCenter(center);
-    return center.multiplyScalar(-1);
-  }, [cloned]);
+  // ── Single content offset: positions content so the desired pivot point
+  //    (center or face) lands at tcTarget origin [0,0,0].
+  //    All values are in POST-scale space (applied after scale group).
+  const pivotFace: PivotFace = transformPivot ?? "center";
+  const contentOffset = useMemo<[number, number, number]>(() => {
+    const { center, min, max } = rotatedMetrics;
+    const s = fitScale;
+    // Base offset puts bbox center at origin
+    const cx = -center.x * s;
+    const cy = -center.y * s;
+    const cz = -center.z * s;
+    if (pivotFace === "center") return [cx, cy, cz];
+    // For face modes: shift so the face center is at origin instead of bbox center
+    switch (pivotFace) {
+      case "-y": return [cx, -min.y * s, cz];
+      case "+y": return [cx, -max.y * s, cz];
+      case "-x": return [-min.x * s, cy, cz];
+      case "+x": return [-max.x * s, cy, cz];
+      case "-z": return [cx, cy, -min.z * s];
+      case "+z": return [cx, cy, -max.z * s];
+    }
+  }, [rotatedMetrics, pivotFace, fitScale]);
 
-  // Force a re-render when the model mounts (frameloop="demand" needs a kick)
+  // ── Bounding box size (scaled) for wireframe ──
+  const bboxSize = useMemo<[number, number, number]>(() => {
+    const { size } = rotatedMetrics;
+    return [size.x * fitScale, size.y * fitScale, size.z * fitScale];
+  }, [rotatedMetrics, fitScale]);
+
+  // ── Bounding box center offset from pivot point (for wireframe positioning) ──
+  // This is the vector from the pivot point to the bbox center in tcTarget space.
+  const bboxCenterOffset = useMemo<[number, number, number]>(() => {
+    const { center, min, max } = rotatedMetrics;
+    const s = fitScale;
+    if (pivotFace === "center") return [0, 0, 0];
+    // Bbox center in tcTarget space = center*s + contentOffset
+    // For face modes, the face coordinate is at 0, so the center is offset from that.
+    switch (pivotFace) {
+      case "-y": return [0, (center.y - min.y) * s, 0];
+      case "+y": return [0, (center.y - max.y) * s, 0];
+      case "-x": return [(center.x - min.x) * s, 0, 0];
+      case "+x": return [(center.x - max.x) * s, 0, 0];
+      case "-z": return [0, 0, (center.z - min.z) * s];
+      case "+z": return [0, 0, (center.z - max.z) * s];
+    }
+  }, [rotatedMetrics, pivotFace, fitScale]);
+
+  // Mark tcTarget ready after first render
+  useEffect(() => {
+    if (tcTargetRef.current && !tcReady) setTcReady(true);
+  });
+
   useEffect(() => { invalidate(); }, [cloned]);
 
+  const orbitControls = useThree((s) => s.controls) as { enabled: boolean } | null;
+
+  const reportTransform = useCallback(() => {
+    if (!tcTargetRef.current || !onTransformChange) return;
+    const g = tcTargetRef.current;
+    const euler = new Euler().setFromQuaternion(g.quaternion, "XYZ");
+    onTransformChange({
+      position: [
+        parseFloat(g.position.x.toFixed(3)),
+        parseFloat(g.position.y.toFixed(3)),
+        parseFloat(g.position.z.toFixed(3)),
+      ],
+      rotation: [
+        parseFloat(MathUtils.radToDeg(euler.x).toFixed(1)),
+        parseFloat(MathUtils.radToDeg(euler.y).toFixed(1)),
+        parseFloat(MathUtils.radToDeg(euler.z).toFixed(1)),
+      ],
+      scale: [
+        parseFloat(g.scale.x.toFixed(3)),
+        parseFloat(g.scale.y.toFixed(3)),
+        parseFloat(g.scale.z.toFixed(3)),
+      ],
+    });
+  }, [onTransformChange]);
+
+  useEffect(() => { reportTransform(); }, [reportTransform]);
+
+  // ── When pivotFace changes, adjust tcTarget.position to compensate
+  //    for the contentOffset change, so the model stays in place.
+  const prevOffsetRef = useRef<[number, number, number]>(contentOffset);
+  useEffect(() => {
+    if (!tcTargetRef.current) return;
+    const prev = prevOffsetRef.current;
+    const next = contentOffset;
+    if (prev[0] === next[0] && prev[1] === next[1] && prev[2] === next[2]) return;
+    prevOffsetRef.current = next;
+    tcTargetRef.current.position.x -= (next[0] - prev[0]);
+    tcTargetRef.current.position.y -= (next[1] - prev[1]);
+    tcTargetRef.current.position.z -= (next[2] - prev[2]);
+    invalidate();
+    reportTransform();
+  }, [contentOffset, reportTransform]);
+
+  // Apply externally-set transform (from editable panel inputs)
+  const lastAppliedRef = useRef<Object3DTransform | null>(null);
+  useEffect(() => {
+    if (!appliedTransform || !tcTargetRef.current) return;
+    if (lastAppliedRef.current === appliedTransform) return;
+    lastAppliedRef.current = appliedTransform;
+    const g = tcTargetRef.current;
+    g.position.set(...appliedTransform.position);
+    g.rotation.set(
+      MathUtils.degToRad(appliedTransform.rotation[0]),
+      MathUtils.degToRad(appliedTransform.rotation[1]),
+      MathUtils.degToRad(appliedTransform.rotation[2]),
+    );
+    g.scale.set(...appliedTransform.scale);
+    invalidate();
+  }, [appliedTransform]);
+
+  const effectiveMode = transformMode ?? "rotate";
+
   return (
-    <group ref={groupRef} position={[offX, 0.05, offZ]} scale={[fitScale, fitScale, fitScale]}>
-      <group position={[centerOffset.x, centerOffset.y, centerOffset.z]}>
-        <primitive object={cloned} />
+    <>
+      <group ref={tcTargetRef} position={[offX, 0.05, offZ]}>
+        {/* Content offset: positions model so desired pivot point is at tcTarget origin */}
+        <group ref={contentRef} position={contentOffset}>
+          <group scale={[fitScale, fitScale, fitScale]}>
+            <group rotation={[-Math.PI / 2, 0, 0]}>
+              <primitive object={cloned} />
+            </group>
+          </group>
+        </group>
+        {/* Bounding box wireframe — centered on bbox, offset from pivot point */}
+        {selected && (
+          <mesh position={bboxCenterOffset}>
+            <boxGeometry args={bboxSize} />
+            <meshBasicMaterial wireframe transparent opacity={0.25} color={selectionWireframe} depthWrite={false} />
+          </mesh>
+        )}
+        {/* Pivot indicator at gizmo origin (tcTarget space) */}
+        {selected && (
+          <mesh rotation={[0, Math.PI / 4, 0]} position={[0, 0, 0]}>
+            <boxGeometry args={[0.06, 0.06, 0.06]} />
+            <meshBasicMaterial color={pivotColor} depthTest={false} transparent opacity={0.9} />
+          </mesh>
+        )}
       </group>
+      {selected && tcReady && tcTargetRef.current && (
+        <TransformControls
+          object={tcTargetRef.current}
+          mode={effectiveMode}
+          size={0.6}
+          space={pivotFace !== "center" ? "local" : "world"}
+          translationSnap={snapTranslation ?? null}
+          rotationSnap={snapRotation != null ? MathUtils.degToRad(snapRotation) : null}
+          scaleSnap={snapScale ?? null}
+          onChange={() => { invalidate(); reportTransform(); }}
+          onMouseDown={() => { if (orbitControls) orbitControls.enabled = false; }}
+          onMouseUp={() => { if (orbitControls) orbitControls.enabled = true; invalidate(); reportTransform(); }}
+        />
+      )}
+    </>
+  );
+}
+
+/** Visual snap helpers: shows mode-specific guides centered at the transform tool position.
+ *  - translate: XZ grid with spacing matching snapTranslation
+ *  - rotate: Radial angle lines matching snapRotation degrees
+ *  - scale: Axis ticks along X, Y, Z at snap scale intervals
+ */
+function SnapHelpers({
+  mode,
+  position,
+  snapTranslation,
+  snapRotation,
+  snapScale,
+  radius,
+}: {
+  mode: "translate" | "rotate" | "scale";
+  position: [number, number, number];
+  snapTranslation?: number | undefined;
+  snapRotation?: number | undefined;
+  snapScale?: number | undefined;
+  radius: number;
+}): React.JSX.Element {
+  const colors = useUIStyle((s) => s.template.colors);
+
+  // Translation grid: XZ plane grid with snap-aligned spacing
+  const translationGrid = useMemo(() => {
+    if (mode !== "translate") return null;
+    const step = snapTranslation ?? 0.25;
+    const divisions = Math.max(2, Math.round((radius * 2) / step));
+    const size = divisions * step;
+    const c = new Color(colors.gridColor);
+    const grid = new ThreeGridHelper(size, divisions, c, c);
+    grid.material = new LineBasicMaterial({ color: c, transparent: true, opacity: 0.35, depthWrite: false });
+    return grid;
+  }, [mode, snapTranslation, radius, colors.gridColor]);
+
+  // Rotation angle lines: radial lines from center at snap intervals
+  const rotationLines = useMemo(() => {
+    if (mode !== "rotate") return null;
+    const step = snapRotation ?? 15;
+    const count = Math.round(360 / step);
+    const r = radius;
+    const positions: number[] = [];
+    for (let i = 0; i < count; i++) {
+      const angle = MathUtils.degToRad(i * step);
+      positions.push(0, 0, 0, Math.cos(angle) * r, 0, Math.sin(angle) * r);
+    }
+    const geo = new BufferGeometry();
+    geo.setAttribute("position", new Float32BufferAttribute(positions, 3));
+    return geo;
+  }, [mode, snapRotation, radius]);
+
+  // Scale ticks: tick marks along X, Y, Z axes at snap intervals
+  const scaleTicks = useMemo(() => {
+    if (mode !== "scale") return null;
+    const step = snapScale ?? 0.1;
+    const positions: number[] = [];
+    const tickLength = 0.03; // perpendicular tick size
+    const axisLength = radius;
+    const tickCount = Math.ceil(axisLength / step);
+
+    // Draw ticks along positive and negative X, Y, Z axes
+    const axes: [number, number, number][] = [
+      [1, 0, 0], [-1, 0, 0], // X axis
+      [0, 1, 0], [0, -1, 0], // Y axis
+      [0, 0, 1], [0, 0, -1], // Z axis
+    ];
+
+    for (const [ax, ay, az] of axes) {
+      // Main axis line
+      positions.push(0, 0, 0, ax * axisLength, ay * axisLength, az * axisLength);
+      // Tick marks at snap intervals
+      for (let i = 1; i <= tickCount; i++) {
+        const d = i * step;
+        const px = ax * d, py = ay * d, pz = az * d;
+        // Perpendicular tick: choose a perpendicular direction
+        let tx = 0, ty = 0, tz = 0;
+        if (ax !== 0) { ty = tickLength; } // X-axis: tick in Y
+        else if (ay !== 0) { tx = tickLength; } // Y-axis: tick in X
+        else { tx = tickLength; } // Z-axis: tick in X
+        positions.push(px - tx, py - ty, pz - tz, px + tx, py + ty, pz + tz);
+      }
+    }
+    const geo = new BufferGeometry();
+    geo.setAttribute("position", new Float32BufferAttribute(positions, 3));
+    return geo;
+  }, [mode, snapScale, radius]);
+
+  return (
+    <group position={position}>
+      {/* Translation grid */}
+      {translationGrid && <primitive object={translationGrid} />}
+      {/* Rotation angle lines */}
+      {rotationLines && (
+        <lineSegments geometry={rotationLines}>
+          <lineBasicMaterial color={colors.snapLineColor} transparent opacity={0.3} depthWrite={false} />
+        </lineSegments>
+      )}
+      {/* Scale axis ticks */}
+      {scaleTicks && (
+        <lineSegments geometry={scaleTicks}>
+          <lineBasicMaterial color={colors.gridColor} transparent opacity={0.4} depthWrite={false} />
+        </lineSegments>
+      )}
     </group>
   );
 }
 
 function SpacePrism(props: SpacePrismProps): React.JSX.Element {
-  const { layerCount, selectedLayerIndex, layerVisibility, layerOrder, onSelectLayer, dragOverride, suppressClicks, layerTextures, layerCropInfo, imageAspect, revealActive, onRevealDone, aiEditingLayer, layerGlbUrls, generating3DLayer } = props;
+  const { layerCount, selectedLayerIndex, layerVisibility, layerOrder, onSelectLayer, dragOverride, suppressClicks, layerTextures, layerCropInfo, imageAspect, revealActive, onRevealDone, aiEditingLayer, layerGlbUrls, generating3DLayer, transformPivot, transformMode, snapTranslation, snapRotation, snapScale, snapEnabled, onTransformChange, appliedTransform, modelTransform } = props;
   const { prismW, prismD } = prismDims(imageAspect);
   const hiddenSlideX = prismW + 0.5;
   const template = useUIStyle((s) => s.template);
@@ -632,6 +935,28 @@ function SpacePrism(props: SpacePrismProps): React.JSX.Element {
         <meshBasicMaterial wireframe transparent opacity={0.15} color={template.colors.foreground} />
       </mesh>
 
+      {/* Snap helpers: mode-specific guides centered at transform tool */}
+      {snapEnabled && selectedLayerIndex !== null && layerGlbUrls?.[selectedLayerIndex] && (() => {
+        // Use the live modelTransform position (which tracks the gizmo's actual position
+        // in AnimatedLayerGroup-local space). Add the layer's Y offset to get root-space position.
+        const posIdx = layerOrder.indexOf(selectedLayerIndex);
+        const layerYOffset = posIdx >= 0 ? layerY(posIdx, layerCount) : 0;
+        const posX = modelTransform?.position[0] ?? 0;
+        const posY = layerYOffset + (modelTransform?.position[1] ?? 0.05);
+        const posZ = modelTransform?.position[2] ?? 0;
+        const mode = transformMode ?? "rotate";
+        return (
+          <SnapHelpers
+            mode={mode}
+            position={[posX, posY, posZ]}
+            snapTranslation={snapTranslation}
+            snapRotation={snapRotation}
+            snapScale={snapScale}
+            radius={Math.max(prismW, prismD) * 0.6}
+          />
+        );
+      })()}
+
       {positions.map(({ layerIdx, y, isDragged }, positionIndex) => {
         const vis = layerVisibility[layerIdx];
         const hidden = vis ? !vis.visible : false;
@@ -698,6 +1023,14 @@ function SpacePrism(props: SpacePrismProps): React.JSX.Element {
                 url={layerGlbUrls[layerIdx]}
                 width={prismW}
                 depth={prismD}
+                selected={selected}
+                transformPivot={transformPivot}
+                transformMode={transformMode}
+                snapTranslation={snapTranslation}
+                snapRotation={snapRotation}
+                snapScale={snapScale}
+                onTransformChange={selected ? onTransformChange : undefined}
+                appliedTransform={selected ? appliedTransform : undefined}
                 {...(layerCropInfo[layerIdx] ? { crop: layerCropInfo[layerIdx] } : {})}
               />
             )}
@@ -733,6 +1066,7 @@ function ScrubberPlane(props: ScrubberPlaneProps): React.JSX.Element | null {
   const { layerCount, selectedLayerIndex, layerOrder, onPreviewLayer, onCommitLayer, imageAspect } = props;
   const { prismW, prismD } = prismDims(imageAspect);
   const { camera, controls } = useThree();
+  const scrubber3d = useUIStyle((s) => s.template.colors.scrubber3d);
   const dragging = useRef(false);
   const startY = useRef(0);
   const startLayerY = useRef(0);
@@ -823,7 +1157,7 @@ function ScrubberPlane(props: ScrubberPlaneProps): React.JSX.Element | null {
         <meshBasicMaterial
           transparent
           opacity={0.4}
-          color="#333333"
+          color={scrubber3d}
           depthWrite={false}
           side={DoubleSide}
         />
@@ -950,6 +1284,54 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
     onToggle3DSourceImage,
   } = props;
   const animating = animPhase !== "idle";
+
+  // Transform pivot face for 3D models: which bbox face the gizmo anchors to
+  const [transformPivot, setTransformPivot] = useState<PivotFace>("center");
+  // Transform gizmo mode
+  const [transformMode, setTransformMode] = useState<"translate" | "rotate" | "scale">("rotate");
+  // Snap settings
+  const [snapEnabled, setSnapEnabled] = useState(false);
+  const snapTranslation = snapEnabled ? 0.25 : undefined;
+  const snapRotation = snapEnabled ? 15 : undefined;
+  const snapScale = snapEnabled ? 0.1 : undefined;
+  // Current 3D model transform values for display
+  const [modelTransform, setModelTransform] = useState<Object3DTransform>(DEFAULT_TRANSFORM);
+  // Externally-applied transform (from editable panel) — uses object identity to trigger effect
+  const [appliedTransform, setAppliedTransform] = useState<Object3DTransform | undefined>(undefined);
+  const handleApplyTransform = useCallback((t: Object3DTransform) => {
+    // Create a new object so React state change triggers the effect even if values are same
+    setAppliedTransform({ ...t });
+    setModelTransform(t);
+  }, []);
+
+  // Keyboard shortcuts for transform modes (T/R/S) when a 3D model layer is selected
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent): void => {
+      // Skip when typing in text fields
+      const tag = (e.target as HTMLElement)?.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+      if ((e.target as HTMLElement)?.isContentEditable) return;
+      // Only active when a 3D model layer is selected
+      if (selectedLayerIndex === null || !(selectedLayerIndex in layerGlbUrls)) return;
+
+      switch (e.key.toLowerCase()) {
+        case "t":
+          e.preventDefault();
+          setTransformMode("translate");
+          break;
+        case "r":
+          e.preventDefault();
+          setTransformMode("rotate");
+          break;
+        case "s":
+          e.preventDefault();
+          setTransformMode("scale");
+          break;
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => { window.removeEventListener("keydown", handleKeyDown); };
+  }, [selectedLayerIndex, layerGlbUrls]);
 
   /* ── Way-of-Code style template ─────────────── */
   const template = useUIStyle((s) => s.template);
@@ -1192,6 +1574,15 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
           aiEditingLayer={aiRunning ? selectedLayerIndex : null}
           layerGlbUrls={layerGlbUrls}
           generating3DLayer={generating3DLayer}
+          transformPivot={transformPivot}
+          transformMode={transformMode}
+          snapTranslation={snapTranslation}
+          snapRotation={snapRotation}
+          snapScale={snapScale}
+          snapEnabled={snapEnabled}
+          onTransformChange={setModelTransform}
+          appliedTransform={appliedTransform}
+          modelTransform={modelTransform}
         />
         <ScrubberPlane
           layerCount={layerCount}
@@ -1299,6 +1690,14 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
           has3DModel={selectedLayerIndex in layerGlbUrls}
           sourceImageHidden={threeDSourceHidden.has(selectedLayerIndex)}
           onToggle3DSourceImage={onToggle3DSourceImage}
+          transformPivot={transformPivot}
+          onSetTransformPivot={setTransformPivot}
+          transformMode={transformMode}
+          onSetTransformMode={setTransformMode}
+          snapEnabled={snapEnabled}
+          onToggleSnap={() => { setSnapEnabled((s) => !s); }}
+          modelTransform={selectedLayerIndex in layerGlbUrls ? modelTransform : undefined}
+          onApplyTransform={handleApplyTransform}
         />
       )}
 
@@ -1337,6 +1736,14 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
           layerGlbUrls={layerGlbUrls}
           threeDSourceHidden={threeDSourceHidden}
           onToggle3DSourceImage={onToggle3DSourceImage}
+          transformPivot={transformPivot}
+          onSetTransformPivot={setTransformPivot}
+          transformMode={transformMode}
+          onSetTransformMode={setTransformMode}
+          snapEnabled={snapEnabled}
+          onToggleSnap={() => { setSnapEnabled((s) => !s); }}
+          modelTransform={selectedLayerIndex !== null && selectedLayerIndex in layerGlbUrls ? modelTransform : undefined}
+          onApplyTransform={handleApplyTransform}
         />
       )}
 

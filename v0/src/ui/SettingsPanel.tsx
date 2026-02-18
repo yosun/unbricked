@@ -2,6 +2,8 @@ import React from "react";
 import { OPERATIONS } from "../core/operations";
 import { AI_EDIT_MODELS } from "../services/falProxy";
 import type { ProjectPreferences } from "../core/preferences";
+import { useUIStyle } from "./uiStyleStore";
+import { ALL_TEMPLATES } from "./styleTemplates";
 
 interface SettingsPanelProps {
   preferences: ProjectPreferences;
@@ -14,6 +16,9 @@ export default function SettingsPanel({
   onChangePreference,
   onClose,
 }: SettingsPanelProps): React.JSX.Element {
+  const currentTemplate = useUIStyle((s) => s.template);
+  const setTemplate = useUIStyle((s) => s.setTemplate);
+
   return (
     <div
       style={{
@@ -68,7 +73,7 @@ export default function SettingsPanel({
           style={{
             width: "100%",
             padding: "6px 8px",
-            background: "#1a1a2e",
+            background: "var(--control-bg)",
             border: "1px solid var(--hud-border-btn)",
             borderRadius: 4,
             color: "var(--hud-text)",
@@ -93,7 +98,7 @@ export default function SettingsPanel({
           style={{
             width: "100%",
             padding: "6px 8px",
-            background: "#1a1a2e",
+            background: "var(--control-bg)",
             border: "1px solid var(--hud-border-btn)",
             borderRadius: 4,
             color: "var(--hud-text)",
@@ -103,6 +108,34 @@ export default function SettingsPanel({
           {AI_EDIT_MODELS.map((m) => (
             <option key={m.id} value={m.id}>
               {m.label}
+            </option>
+          ))}
+        </select>
+
+        <label
+          style={{ display: "block", fontSize: 12, color: "var(--hud-muted)", marginBottom: 6, marginTop: 16 }}
+        >
+          Theme
+        </label>
+        <select
+          value={currentTemplate.id}
+          onChange={(e) => {
+            const t = ALL_TEMPLATES.find((t) => t.id === e.target.value);
+            if (t) setTemplate(t);
+          }}
+          style={{
+            width: "100%",
+            padding: "6px 8px",
+            background: "var(--control-bg)",
+            border: "1px solid var(--hud-border-btn)",
+            borderRadius: 4,
+            color: "var(--hud-text)",
+            fontSize: 13,
+          }}
+        >
+          {ALL_TEMPLATES.map((t) => (
+            <option key={t.id} value={t.id}>
+              {t.id === "way-of-code" ? "Light (Minimalist)" : "Dark"}
             </option>
           ))}
         </select>

@@ -176,7 +176,7 @@ export default function ImageIngestPanel({
   const btnPrimary: React.CSSProperties = {
     ...btnBase,
     background: "var(--scrubber-active)",
-    color: "#fff",
+    color: "var(--btn-primary-text)",
   };
   const btnSecondary: React.CSSProperties = {
     ...btnBase,
@@ -194,7 +194,7 @@ export default function ImageIngestPanel({
         alignItems: "center",
         justifyContent: "center",
         zIndex: 100,
-        background: "rgba(0,0,0,0.5)",
+        background: "var(--overlay-scrim)",
         backdropFilter: "blur(4px)",
       }}
       onClick={(e) => {
@@ -409,7 +409,7 @@ export default function ImageIngestPanel({
                     padding: "8px 12px",
                     background: "rgba(255,80,80,0.15)",
                     borderRadius: 6,
-                    color: "#f88",
+                    color: "var(--color-error)",
                     fontSize: 12,
                   }}
                 >

@@ -1,5 +1,8 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { AI_EDIT_MODELS, getAiEditModel } from "../services/falProxy";
+import type { Object3DTransform, PivotFace } from "./SpaceViewport";
+import { PIVOT_FACES, PIVOT_FACE_LABELS } from "./SpaceViewport";
+import { TransformPanel } from "./LayerControlsHUD";
 
 interface LayersPanelProps {
   layerCount: number;
@@ -34,6 +37,14 @@ interface LayersPanelProps {
   layerGlbUrls: Record<number, string>;
   threeDSourceHidden: Set<number>;
   onToggle3DSourceImage: (index: number) => void;
+  transformPivot: PivotFace;
+  onSetTransformPivot: (face: PivotFace) => void;
+  transformMode: "translate" | "rotate" | "scale";
+  onSetTransformMode: (mode: "translate" | "rotate" | "scale") => void;
+  snapEnabled: boolean;
+  onToggleSnap: () => void;
+  modelTransform?: Object3DTransform | undefined;
+  onApplyTransform: (t: Object3DTransform) => void;
 }
 
 const ITEM_H = 56;
@@ -80,6 +91,14 @@ export default function LayersPanel(props: LayersPanelProps): React.JSX.Element 
     layerGlbUrls,
     threeDSourceHidden,
     onToggle3DSourceImage,
+    transformPivot,
+    onSetTransformPivot,
+    transformMode,
+    onSetTransformMode,
+    snapEnabled,
+    onToggleSnap,
+    modelTransform,
+    onApplyTransform,
   } = props;
 
   /* ── Drag reorder state ──────────────────────── */
@@ -183,7 +202,7 @@ export default function LayersPanel(props: LayersPanelProps): React.JSX.Element 
       style={{
         position: "absolute",
         right: 12,
-        top: 12,
+        top: 56,
         bottom: 12,
         width: 240,
         display: "flex",
@@ -327,7 +346,7 @@ export default function LayersPanel(props: LayersPanelProps): React.JSX.Element 
                       padding: "1px 3px",
                       borderRadius: 3,
                       background: "var(--scrubber-active)",
-                      color: "#111",
+                      color: "var(--btn-primary-text)",
                       pointerEvents: "none",
                     }}
                   >
@@ -373,7 +392,7 @@ export default function LayersPanel(props: LayersPanelProps): React.JSX.Element 
                 </div>
 
                 {/* Bottom: action buttons */}
-                <div style={{ display: "flex", alignItems: "center", gap: 2 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 2, justifyContent: "flex-end" }}>
                   {/* Visibility toggle */}
                   <button
                     type="button"
@@ -510,6 +529,180 @@ export default function LayersPanel(props: LayersPanelProps): React.JSX.Element 
         })}
       </div>
 
+      {/* ── 3D Transform panel (docked inside layers panel) ── */}
+      {selectedLayerIndex !== null && selectedLayerIndex in layerGlbUrls && (
+        <div style={{ flexShrink: 0, borderTop: "1px solid var(--hud-border)" }}>
+          {/* Section header */}
+          <div style={{
+            padding: "5px 10px 4px",
+            fontSize: 9,
+            textTransform: "uppercase",
+            letterSpacing: 1,
+            color: "var(--hud-muted)",
+            borderBottom: "1px solid var(--hud-border)",
+          }}>
+            Transform
+          </div>
+
+          {/* Tool row: T / R / S */}
+          <div style={{ display: "flex", gap: 0, borderBottom: "1px solid var(--hud-border)" }}>
+            {(["translate", "rotate", "scale"] as const).map((mode) => {
+              const label = mode === "translate" ? "Move" : mode === "rotate" ? "Rotate" : "Scale";
+              const icon = mode === "translate" ? "⤡" : mode === "rotate" ? "↻" : "⤢";
+              const active = transformMode === mode;
+              return (
+                <button
+                  key={mode}
+                  type="button"
+                  onClick={() => { onSetTransformMode(mode); }}
+                  title={`${label} (${mode[0]!.toUpperCase()})`}
+                  style={{
+                    flex: 1,
+                    display: "flex",
+                    flexDirection: "column",
+                    alignItems: "center",
+                    gap: 1,
+                    background: active ? "var(--hud-active)" : "none",
+                    border: "none",
+                    borderRight: "1px solid var(--hud-border)",
+                    color: active ? "var(--scrubber-active)" : "var(--hud-text)",
+                    padding: "5px 2px 4px",
+                    cursor: "pointer",
+                    fontSize: 13,
+                  }}
+                >
+                  <span>{icon}</span>
+                  <span style={{ fontSize: 7, fontWeight: 600, letterSpacing: 0.5 }}>{label}</span>
+                </button>
+              );
+            })}
+          </div>
+
+          {/* Pivot: Center / Pivot toggle + face picker */}
+          <div style={{ borderBottom: "1px solid var(--hud-border)", padding: "5px 10px" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+              <span style={{ fontSize: 9, color: "var(--hud-muted)", fontWeight: 600, textTransform: "uppercase", letterSpacing: 0.5, flexShrink: 0 }}>Pivot</span>
+              <div style={{ display: "flex", gap: 0, flex: 1, borderRadius: 4, overflow: "hidden", border: "1px solid var(--hud-border-btn)" }}>
+                <button
+                  type="button"
+                  onClick={() => { onSetTransformPivot("center"); }}
+                  style={{
+                    flex: 1,
+                    background: transformPivot === "center" ? "var(--hud-active)" : "none",
+                    border: "none",
+                    color: transformPivot === "center" ? "var(--scrubber-active)" : "var(--hud-text)",
+                    padding: "3px 0",
+                    cursor: "pointer",
+                    fontSize: 9,
+                    fontWeight: 600,
+                  }}
+                >
+                  Center
+                </button>
+                <button
+                  type="button"
+                  onClick={() => { if (transformPivot === "center") onSetTransformPivot("+z"); }}
+                  style={{
+                    flex: 1,
+                    background: transformPivot !== "center" ? "var(--hud-active)" : "none",
+                    border: "none",
+                    borderLeft: "1px solid var(--hud-border-btn)",
+                    color: transformPivot !== "center" ? "var(--scrubber-active)" : "var(--hud-text)",
+                    padding: "3px 0",
+                    cursor: "pointer",
+                    fontSize: 9,
+                    fontWeight: 600,
+                  }}
+                >
+                  Pivot
+                </button>
+              </div>
+            </div>
+
+            {/* Face picker — only visible in Pivot mode */}
+            {transformPivot !== "center" && (
+              <div style={{ marginTop: 6 }}>
+                <div style={{ fontSize: 8, color: "var(--hud-muted)", marginBottom: 4, fontStyle: "italic" }}>
+                  Select bounding box face for pivot:
+                </div>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 2 }}>
+                  {(PIVOT_FACES.filter((f): f is Exclude<PivotFace, "center"> => f !== "center")).map((f) => {
+                    const active = transformPivot === f;
+                    return (
+                      <button
+                        key={f}
+                        type="button"
+                        onClick={() => { onSetTransformPivot(f); }}
+                        style={{
+                          background: active ? "var(--hud-active)" : "none",
+                          border: active ? "1px solid var(--scrubber-active)" : "1px solid var(--hud-border-btn)",
+                          color: active ? "var(--scrubber-active)" : "var(--hud-text)",
+                          borderRadius: 3,
+                          padding: "3px 2px",
+                          cursor: "pointer",
+                          fontSize: 8,
+                          fontWeight: active ? 700 : 500,
+                        }}
+                      >
+                        {PIVOT_FACE_LABELS[f]}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* Snap toggle */}
+          <button
+            type="button"
+            onClick={onToggleSnap}
+            title={snapEnabled ? "Disable snapping" : "Enable snapping"}
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 6,
+              width: "100%",
+              background: "none",
+              border: "none",
+              borderBottom: modelTransform ? "1px solid var(--hud-border)" : "none",
+              color: snapEnabled ? "var(--scrubber-active)" : "var(--hud-muted)",
+              padding: "5px 10px",
+              cursor: "pointer",
+              fontSize: 10,
+              fontWeight: 600,
+            }}
+          >
+            <span style={{
+              width: 14,
+              height: 14,
+              borderRadius: 3,
+              border: `1.5px solid ${snapEnabled ? "var(--scrubber-active)" : "var(--hud-muted)"}`,
+              background: snapEnabled ? "var(--hud-active)" : "none",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              fontSize: 8,
+              flexShrink: 0,
+            }}>
+              {snapEnabled ? "✓" : ""}
+            </span>
+            Snap to Grid
+          </button>
+
+          {/* Editable transform values */}
+          {modelTransform && (
+            <div style={{ padding: "4px 6px 6px" }}>
+              <TransformPanel
+                transform={modelTransform}
+                onApply={onApplyTransform}
+                style={{ position: "static", bottom: "auto", right: "auto", padding: "2px 4px", border: "none", background: "none" }}
+              />
+            </div>
+          )}
+        </div>
+      )}
+
       {/* Inline opacity slider when editing */}
       {editingOpacityLayer !== null && (
         <div
@@ -553,49 +746,27 @@ export default function LayersPanel(props: LayersPanelProps): React.JSX.Element 
       )}
     </div>
 
-    {/* ── Floating action panel (left of layers panel) ── */}
+    {/* ── Floating action panel (right-aligned, above layers panel) ── */}
     {selectedLayerIndex !== null && (
       <div
         style={{
           position: "absolute",
-          right: 260,
+          right: 12,
           top: 12,
           display: "flex",
           flexDirection: "column",
           gap: 6,
           zIndex: 10,
+          alignItems: "flex-end",
         }}
       >
-        {/* Import image button */}
-        <button
-          type="button"
-          onClick={onImportImage}
-          title="Import image onto this layer"
-          style={{
-            width: 36,
-            height: 36,
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            borderRadius: 8,
-            background: "var(--hud-bg)",
-            border: "1px solid var(--hud-border)",
-            color: "var(--hud-text)",
-            cursor: "pointer",
-            fontSize: 16,
-            backdropFilter: "blur(8px)",
-          }}
-        >
-          📥
-        </button>
-
-        {/* Generate 3D button (only when layer has an image) */}
-        {selectedLayerIndex in layerTextures && (
+        {/* Action buttons row */}
+        <div style={{ display: "flex", gap: 4 }}>
+          {/* Import image button */}
           <button
             type="button"
-            onClick={() => { onGenerate3D(selectedLayerIndex); }}
-            disabled={generating3DLayer === selectedLayerIndex}
-            title={selectedLayerIndex in layerGlbUrls ? "3D model loaded" : "Generate 3D from this slice"}
+            onClick={onImportImage}
+            title="Import image onto this layer"
             style={{
               width: 36,
               height: 36,
@@ -603,79 +774,107 @@ export default function LayersPanel(props: LayersPanelProps): React.JSX.Element 
               alignItems: "center",
               justifyContent: "center",
               borderRadius: 8,
-              background: selectedLayerIndex in layerGlbUrls ? "var(--hud-active)" : "var(--hud-bg)",
-              border: selectedLayerIndex in layerGlbUrls
-                ? "1px solid var(--scrubber-active)"
-                : "1px solid var(--hud-border)",
-              color: generating3DLayer === selectedLayerIndex
-                ? "var(--hud-muted)"
-                : selectedLayerIndex in layerGlbUrls
-                  ? "var(--scrubber-active)"
-                  : "var(--hud-text)",
-              cursor: generating3DLayer === selectedLayerIndex ? "wait" : "pointer",
-              fontSize: 12,
-              fontWeight: 700,
-              backdropFilter: "blur(8px)",
-            }}
-          >
-            {generating3DLayer === selectedLayerIndex ? "⏳" : "3D"}
-          </button>
-        )}
-
-        {/* Toggle source image when 3D model present */}
-        {selectedLayerIndex in layerGlbUrls && (
-          <button
-            type="button"
-            onClick={() => { onToggle3DSourceImage(selectedLayerIndex); }}
-            title={threeDSourceHidden.has(selectedLayerIndex) ? "Show source image" : "Hide source image"}
-            style={{
-              width: 36,
-              height: 36,
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
-              borderRadius: 8,
-              background: threeDSourceHidden.has(selectedLayerIndex) ? "var(--hud-active)" : "var(--hud-bg)",
-              border: threeDSourceHidden.has(selectedLayerIndex)
-                ? "1px solid var(--scrubber-active)"
-                : "1px solid var(--hud-border)",
-              color: threeDSourceHidden.has(selectedLayerIndex) ? "var(--scrubber-active)" : "var(--hud-text)",
+              background: "var(--hud-bg)",
+              border: "1px solid var(--hud-border)",
+              color: "var(--hud-text)",
               cursor: "pointer",
               fontSize: 16,
               backdropFilter: "blur(8px)",
             }}
           >
-            🖼
+            📥
           </button>
-        )}
 
-        {/* AI Edit button (only when layer has an image) */}
-        {selectedLayerIndex in layerTextures && (
-          <button
-            type="button"
-            onClick={() => { setShowAiPromptLayer(showAiPromptLayer === selectedLayerIndex ? null : selectedLayerIndex); }}
-            disabled={aiRunning}
-            title="AI Edit (img2img)"
-            style={{
-              width: 36,
-              height: 36,
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
-              borderRadius: 8,
-              background: showAiPromptLayer === selectedLayerIndex ? "var(--hud-active)" : "var(--hud-bg)",
-              border: showAiPromptLayer === selectedLayerIndex
-                ? "1px solid var(--scrubber-active)"
-                : "1px solid var(--hud-border)",
-              color: aiRunning ? "var(--hud-muted)" : "var(--scrubber-active)",
-              cursor: aiRunning ? "wait" : "pointer",
-              fontSize: 16,
-              backdropFilter: "blur(8px)",
-            }}
-          >
-            {aiRunning ? "⏳" : "✨"}
-          </button>
-        )}
+          {/* Generate 3D button (only when layer has an image) */}
+          {selectedLayerIndex in layerTextures && (
+            <button
+              type="button"
+              onClick={() => { onGenerate3D(selectedLayerIndex); }}
+              disabled={generating3DLayer === selectedLayerIndex}
+              title={selectedLayerIndex in layerGlbUrls ? "3D model loaded" : "Generate 3D from this slice"}
+              style={{
+                width: 36,
+                height: 36,
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                borderRadius: 8,
+                background: selectedLayerIndex in layerGlbUrls ? "var(--hud-active)" : "var(--hud-bg)",
+                border: selectedLayerIndex in layerGlbUrls
+                  ? "1px solid var(--scrubber-active)"
+                  : "1px solid var(--hud-border)",
+                color: generating3DLayer === selectedLayerIndex
+                  ? "var(--hud-muted)"
+                  : selectedLayerIndex in layerGlbUrls
+                    ? "var(--scrubber-active)"
+                    : "var(--hud-text)",
+                cursor: generating3DLayer === selectedLayerIndex ? "wait" : "pointer",
+                fontSize: 12,
+                fontWeight: 700,
+                backdropFilter: "blur(8px)",
+              }}
+            >
+              {generating3DLayer === selectedLayerIndex ? "⏳" : "3D"}
+            </button>
+          )}
+
+          {/* Toggle source image when 3D model present */}
+          {selectedLayerIndex in layerGlbUrls && (
+            <button
+              type="button"
+              onClick={() => { onToggle3DSourceImage(selectedLayerIndex); }}
+              title={threeDSourceHidden.has(selectedLayerIndex) ? "Show source image" : "Hide source image"}
+              style={{
+                width: 36,
+                height: 36,
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                borderRadius: 8,
+                background: threeDSourceHidden.has(selectedLayerIndex) ? "var(--hud-active)" : "var(--hud-bg)",
+                border: threeDSourceHidden.has(selectedLayerIndex)
+                  ? "1px solid var(--scrubber-active)"
+                  : "1px solid var(--hud-border)",
+                color: threeDSourceHidden.has(selectedLayerIndex) ? "var(--scrubber-active)" : "var(--hud-text)",
+                cursor: "pointer",
+                fontSize: 16,
+                backdropFilter: "blur(8px)",
+              }}
+            >
+              🖼
+            </button>
+          )}
+
+          {/* AI Edit button (only when layer has an image) */}
+          {selectedLayerIndex in layerTextures && (
+            <button
+              type="button"
+              onClick={() => { setShowAiPromptLayer(showAiPromptLayer === selectedLayerIndex ? null : selectedLayerIndex); }}
+              disabled={aiRunning}
+              title="AI Edit (img2img)"
+              style={{
+                width: 36,
+                height: 36,
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                borderRadius: 8,
+                background: showAiPromptLayer === selectedLayerIndex ? "var(--hud-active)" : "var(--hud-bg)",
+                border: showAiPromptLayer === selectedLayerIndex
+                  ? "1px solid var(--scrubber-active)"
+                  : "1px solid var(--hud-border)",
+                color: aiRunning ? "var(--hud-muted)" : "var(--scrubber-active)",
+                cursor: aiRunning ? "wait" : "pointer",
+                fontSize: 16,
+                backdropFilter: "blur(8px)",
+              }}
+            >
+              {aiRunning ? "⏳" : "✨"}
+            </button>
+          )}
+        </div>
+
+        {/* 3D transform panel removed from floating area — now docked inside layers panel */}
 
         {/* AI prompt flyout (anchored below the buttons) */}
         {showAiPromptLayer !== null && (
@@ -766,7 +965,7 @@ export default function LayersPanel(props: LayersPanelProps): React.JSX.Element 
                 border: "none",
                 borderRadius: 4,
                 padding: "5px 10px",
-                color: "#111",
+                color: "var(--btn-primary-text)",
                 cursor: aiRunning ? "wait" : "pointer",
                 fontWeight: 600,
                 fontSize: 12,
@@ -775,7 +974,7 @@ export default function LayersPanel(props: LayersPanelProps): React.JSX.Element 
               {aiRunning ? "Running…" : "Run AI Edit"}
             </button>
             {aiError && (
-              <div style={{ color: "#e55", fontSize: 11, wordBreak: "break-word" }}>
+              <div style={{ color: "var(--color-error)", fontSize: 11, wordBreak: "break-word" }}>
                 {aiError}
               </div>
             )}

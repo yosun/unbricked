@@ -32,7 +32,7 @@ import {
 import type { AnnotationId, Edge, GraphPatch, GraphPatchOp, JsonObject, PayloadId, ProjectState, SpaceId } from "./core";
 import type { ProjectPreferences } from "./core/preferences";
 import { findPortalEdges } from "./core";
-import { runImg2Img, runTextToImg, runNanoBananaEdit, fetchImageBlob, applyAlphaMask, invertAlpha, invertMaskWithOriginal, getAiEditModel, combineMasksToOriginal, refitAiResult, runImageTo3D } from "./services/falProxy";
+import { runImg2Img, runTextToImg, runNanoBananaEdit, fetchImageBlob, applyAlphaMask, invertAlpha, invertMaskWithOriginal, getAiEditModel, combineMasksToOriginal, refitAiResult, runImageTo3D, runBackgroundRemoval } from "./services/falProxy";
 import type { CropInfo } from "./services/falProxy";
 import { runOperation } from "./services/operationRunner";
 import type { OperationProgress, MaskCandidate } from "./services/operationRunner";
@@ -580,8 +580,9 @@ export default function App(): React.JSX.Element {
     const origPid = layerPayloadId(layerRender, 0);
     const origUri = origPid ? state.payloads[origPid as PayloadId]?.uri : undefined;
     for (let i = 0; i < layerCount; i++) {
-      // Skip texture for layers whose source image is hidden (3D model visible instead)
-      if (threeDSourceHidden.has(i)) continue;
+      // Skip texture for layers whose source image is hidden (3D model visible instead),
+      // but always include the selected layer's texture so the segment is visible when editing.
+      if (threeDSourceHidden.has(i) && i !== effectiveSelectedIndex) continue;
 
       const pid = layerPayloadId(layerRender, i);
       const payload = pid ? state.payloads[pid as PayloadId] : undefined;
@@ -599,7 +600,7 @@ export default function App(): React.JSX.Element {
       }
     }
     return result;
-  }, [layerCount, layerRender, state.payloads, layerProps, threeDSourceHidden]);
+  }, [layerCount, layerRender, state.payloads, layerProps, threeDSourceHidden, effectiveSelectedIndex]);
 
   /** Build a map of layerIndex → payload URI for panel thumbnails.
    *  Unlike layerTextures, this always includes textures even when
@@ -1023,6 +1024,64 @@ export default function App(): React.JSX.Element {
 
         const imageUrl = origPayload.uri;
 
+        // SAM-3 requires image_url = full scene, mask_urls = binary masks.
+        // When mask is active, rebuild the binary mask from the current
+        // layer's visible texture (which reflects AI edits and mask changes)
+        // so 3D generation always uses up-to-date boundaries.
+        const maskOn = isMaskActive(layerProps, index, layerCount);
+        const visibleUri = layerTextures[index] ?? payload.uri;
+
+        if (maskOn && index > 0) {
+          // The visible texture already has alpha from segmentation / AI edits.
+          // Rebuild a full-size binary mask from it.
+          const segImg = await new Promise<HTMLImageElement>((resolve, reject) => {
+            const img = new Image();
+            img.onload = () => { resolve(img); };
+            img.onerror = reject;
+            img.src = visibleUri;
+          });
+
+          const visW = segImg.naturalWidth;
+          const visH = segImg.naturalHeight;
+          const tmpC = document.createElement("canvas");
+          tmpC.width = visW;
+          tmpC.height = visH;
+          const tCtx = tmpC.getContext("2d");
+          if (!tCtx) throw new Error("Canvas 2D context unavailable");
+          tCtx.drawImage(segImg, 0, 0);
+          const visData = tCtx.getImageData(0, 0, visW, visH);
+
+          const reMaskCanvas = document.createElement("canvas");
+          reMaskCanvas.width = origW > 0 ? origW : visW;
+          reMaskCanvas.height = origH > 0 ? origH : visH;
+          const rmCtx = reMaskCanvas.getContext("2d");
+          if (!rmCtx) throw new Error("Canvas 2D context unavailable");
+          rmCtx.fillStyle = "#000000";
+          rmCtx.fillRect(0, 0, reMaskCanvas.width, reMaskCanvas.height);
+
+          const fullMaskData = rmCtx.getImageData(0, 0, reMaskCanvas.width, reMaskCanvas.height);
+          const fmd = fullMaskData.data;
+          const vd = visData.data;
+          for (let sy = 0; sy < visH; sy++) {
+            for (let sx = 0; sx < visW; sx++) {
+              const sIdx = (sy * visW + sx) * 4;
+              if ((vd[sIdx + 3] ?? 0) > 128) {
+                const fx = cropX + sx;
+                const fy = cropY + sy;
+                if (fx >= 0 && fx < reMaskCanvas.width && fy >= 0 && fy < reMaskCanvas.height) {
+                  const fIdx = (fy * reMaskCanvas.width + fx) * 4;
+                  fmd[fIdx] = 255;
+                  fmd[fIdx + 1] = 255;
+                  fmd[fIdx + 2] = 255;
+                  fmd[fIdx + 3] = 255;
+                }
+              }
+            }
+          }
+          rmCtx.putImageData(fullMaskData, 0, 0);
+          maskDataUrl = reMaskCanvas.toDataURL("image/png");
+        }
+
         const result = await runImageTo3D(
           {
             imageUrl,
@@ -1116,7 +1175,7 @@ export default function App(): React.JSX.Element {
         abortRef.current = null;
       }
     },
-    [generating3DLayer, layerRender, state.payloads, commitPatch, activeSpaceId],
+    [generating3DLayer, layerRender, state.payloads, commitPatch, activeSpaceId, layerProps, layerCount, layerTextures],
   );
 
   /** Import an image file into the selected layer. */
@@ -1218,6 +1277,8 @@ export default function App(): React.JSX.Element {
         const firstImage = result.images[0];
         if (!firstImage) throw new Error("fal.ai returned no images");
         let outputImageUrl = firstImage.url;
+        // Preserve the raw AI output URL for mask regeneration
+        const rawAiOutputUrl = outputImageUrl;
 
         // If the visible input was the masked payload (not the full original
         // fallback), check if the AI result still fits the original mask shape.
@@ -1306,7 +1367,7 @@ export default function App(): React.JSX.Element {
           },
         };
 
-        // Create OperatorRun for provenance
+        // Create OperatorRun for AI edit provenance
         const oprunId = makeId("oprun");
         const oprunValue: JsonObject = {
           id: oprunId,
@@ -1326,13 +1387,145 @@ export default function App(): React.JSX.Element {
           },
         };
 
+        const patchOps: GraphPatchOp[] = [
+          putOp("Payload", outPayloadId, outPayloadValue),
+          putOp("OperatorRun", oprunId, oprunValue),
+        ];
+        let finalPayloadId = outPayloadId;
+
+        // Mask regeneration: run BiRefNet on the raw AI output to produce
+        // a fresh segmentation mask. This prevents stale mask halos when
+        // the AI shifts object boundaries.
+        if (sentMaskedInput) {
+          console.info("[Mask Regen] Running BiRefNet on raw AI output for fresh mask…");
+          const bgRemovedUrl = await runBackgroundRemoval(rawAiOutputUrl, controller.signal);
+
+          // Tight-crop the bg-removed result
+          const { blob: bgBlob } = await fetchImageBlob(bgRemovedUrl, controller.signal);
+          const bgBitmap = await createImageBitmap(bgBlob);
+          const bgW = bgBitmap.width;
+          const bgH = bgBitmap.height;
+          const bgCanvas = document.createElement("canvas");
+          bgCanvas.width = bgW;
+          bgCanvas.height = bgH;
+          const bgCtx = bgCanvas.getContext("2d");
+          if (!bgCtx) throw new Error("Canvas 2D context unavailable");
+          bgCtx.drawImage(bgBitmap, 0, 0);
+          const bgImgData = bgCtx.getImageData(0, 0, bgW, bgH);
+          const bgData = bgImgData.data;
+          bgBitmap.close();
+
+          let minX = bgW, minY = bgH, maxX = 0, maxY = 0;
+          for (let i = 3; i < bgData.length; i += 4) {
+            if ((bgData[i] ?? 0) > 10) {
+              const pIdx = (i - 3) / 4;
+              const px = pIdx % bgW;
+              const py = Math.floor(pIdx / bgW);
+              if (px < minX) minX = px;
+              if (px > maxX) maxX = px;
+              if (py < minY) minY = py;
+              if (py > maxY) maxY = py;
+            }
+          }
+
+          let regenUrl: string;
+          let regenCrop: CropInfo | undefined;
+
+          if (maxX >= minX && maxY >= minY) {
+            const cX = minX, cY = minY;
+            const cW = maxX - minX + 1, cH = maxY - minY + 1;
+            const cropCanvas = document.createElement("canvas");
+            cropCanvas.width = cW;
+            cropCanvas.height = cH;
+            const cropCtx = cropCanvas.getContext("2d");
+            if (!cropCtx) throw new Error("Canvas 2D context unavailable");
+            cropCtx.drawImage(bgCanvas, cX, cY, cW, cH, 0, 0, cW, cH);
+            regenUrl = cropCanvas.toDataURL("image/png");
+
+            // Map crop back to original image coordinates if source had crop
+            if (srcCrop) {
+              const scaleX = srcCrop.cropW / bgW;
+              const scaleY = srcCrop.cropH / bgH;
+              regenCrop = {
+                cropX: srcCrop.cropX + Math.round(cX * scaleX),
+                cropY: srcCrop.cropY + Math.round(cY * scaleY),
+                cropW: Math.round(cW * scaleX),
+                cropH: Math.round(cH * scaleY),
+                origW: srcCrop.origW,
+                origH: srcCrop.origH,
+              };
+            } else {
+              regenCrop = { cropX: cX, cropY: cY, cropW: cW, cropH: cH, origW: bgW, origH: bgH };
+            }
+          } else {
+            regenUrl = bgRemovedUrl;
+            regenCrop = srcCrop;
+          }
+
+          // Build mask-regen payload
+          const regenEncoder = new TextEncoder();
+          const regenBytes = regenEncoder.encode(regenUrl);
+          const regenHash = await sha256Hex(regenBytes.buffer);
+          const regenPayloadId = makeId("payload");
+
+          const regenCropMeta: Record<string, string> = {};
+          if (regenCrop) {
+            regenCropMeta.cropX = String(regenCrop.cropX);
+            regenCropMeta.cropY = String(regenCrop.cropY);
+            regenCropMeta.cropW = String(regenCrop.cropW);
+            regenCropMeta.cropH = String(regenCrop.cropH);
+            regenCropMeta.origW = String(regenCrop.origW);
+            regenCropMeta.origH = String(regenCrop.origH);
+          }
+
+          const { blob: regenBlob } = await fetchImageBlob(regenUrl, controller.signal);
+          const regenBitmap = await createImageBitmap(regenBlob);
+          const regenW = regenBitmap.width;
+          const regenH = regenBitmap.height;
+          regenBitmap.close();
+
+          const regenPayloadValue: JsonObject = {
+            id: regenPayloadId,
+            kind: "Payload",
+            mediaType: "image/png",
+            uri: regenUrl,
+            sha256: regenHash,
+            bytes: regenBytes.byteLength,
+            meta: {
+              width: String(regenW),
+              height: String(regenH),
+              sourcePayloadId: outPayloadId,
+              ...regenCropMeta,
+            },
+          };
+
+          // OperatorRun for mask regeneration (separate from AI edit)
+          const maskRegenOprunId = makeId("oprun");
+          const maskRegenOprunValue: JsonObject = {
+            id: maskRegenOprunId,
+            kind: "OperatorRun",
+            operator: "birefnet.mask-regen",
+            status: "succeeded",
+            createdAt: new Date().toISOString(),
+            finishedAt: new Date().toISOString(),
+            inputs: [{ kind: "Payload", id: outPayloadId }],
+            outputs: [{ kind: "Payload", id: regenPayloadId }],
+            params: {
+              proxyRoute: "fal-ai/birefnet",
+              sourceOperatorRunId: oprunId,
+            },
+          };
+
+          patchOps.push(putOp("Payload", regenPayloadId, regenPayloadValue));
+          patchOps.push(putOp("OperatorRun", maskRegenOprunId, maskRegenOprunValue));
+          finalPayloadId = regenPayloadId;
+          console.info("[Mask Regen] Fresh mask generated and recorded as separate operation");
+        }
+
         const layerIdx = effectiveSelectedIndex;
         emitRenderUpdate(
-          (data) => ({ ...data, [`payload.${String(layerIdx)}`]: outPayloadId }),
-          [
-            putOp("Payload", outPayloadId, outPayloadValue),
-            putOp("OperatorRun", oprunId, oprunValue),
-          ],
+          (data) => ({ ...data, [`payload.${String(layerIdx)}`]: finalPayloadId }),
+          patchOps,
         );
       } catch (err: unknown) {
         if (err instanceof DOMException && err.name === "AbortError") return;
@@ -1639,7 +1832,7 @@ export default function App(): React.JSX.Element {
           pointerEvents: "none",
         }}
       >
-        <strong style={{ color: "#eee" }}>Unbricked</strong>
+        <strong style={{ color: "var(--hud-text)" }}>Unbricked</strong>
         <span style={{ marginLeft: 10 }}>
           <ViewModeSwitcher current={viewMode} onChange={handleSetViewMode} />
         </span>
@@ -1975,7 +2168,7 @@ export default function App(): React.JSX.Element {
               background: "var(--hud-bg)",
               border: "1px solid var(--hud-border)",
               borderRadius: 6,
-              color: lastOpResult.maskCount === 0 ? "#fb4" : "#6e6",
+              color: lastOpResult.maskCount === 0 ? "var(--color-warning)" : "var(--color-success)",
               fontSize: 12,
               cursor: "pointer",
               zIndex: 79,
@@ -2006,7 +2199,7 @@ export default function App(): React.JSX.Element {
               background: "var(--hud-bg)",
               border: "1px solid var(--hud-border)",
               borderRadius: 6,
-              color: "#8cf",
+              color: "var(--scrubber-active)",
               fontSize: 12,
               cursor: "pointer",
               zIndex: 79,

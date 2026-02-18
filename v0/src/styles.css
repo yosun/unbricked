@@ -1,3 +1,5 @@
+/* --- Theme CSS variables (defaults match light/WayOfCode).
+       These are overridden at runtime by uiStyleStore.applyCSSVariables(). --- */
 :root {
   --hud-bg: rgba(245, 244, 240, 0.92);
   --hud-border: rgba(0, 0, 0, 0.18);
@@ -6,6 +8,21 @@
   --hud-muted: #999;
   --hud-active: rgba(0, 0, 0, 0.08);
   --scrubber-active: #333;
+  --btn-primary-text: #fff;
+  --control-bg: rgba(0, 0, 0, 0.06);
+  --overlay-scrim: rgba(0, 0, 0, 0.5);
+  --overlay-bg: #1a1a2e;
+  --color-dimmed: #888;
+  --color-success: #6e6;
+  --color-warning: #fb4;
+  --color-error: #e55;
+  --glow-ai: #7ec8e3;
+  --processing-glow: #0077aa;
+  --chrome-toggle-hover: rgba(0, 0, 0, 0.06);
+  --shadow-light: rgba(0, 0, 0, 0.12);
+  --shadow-medium: rgba(0, 0, 0, 0.25);
+  --body-bg: #FAF9F6;
+  --body-fg: #111;
 }
 
 html,
@@ -17,8 +34,8 @@ body,
 
 body {
   font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
-  background: #FAF9F6;
-  color: #111;
+  background: var(--body-bg);
+  color: var(--body-fg);
 }
 
 /* Chrome header show/hide — driven by JS class toggle, no React re-render */
@@ -59,7 +76,7 @@ body {
 }
 .chrome-toggle-btn:hover {
   opacity: 1;
-  background: rgba(0, 0, 0, 0.06);
+  background: var(--chrome-toggle-hover);
 }
 .chrome-toggle-btn.chrome-toggle-open {
   opacity: 0.7;
@@ -85,12 +102,12 @@ body {
 @keyframes slicingGlow {
   0%,
   100% {
-    opacity: 0.7;
-    box-shadow: 0 0 30px rgba(0, 0, 0, 0.1);
+    opacity: 0.85;
+    box-shadow: 0 0 40px var(--processing-glow);
   }
   50% {
     opacity: 1;
-    box-shadow: 0 0 60px rgba(0, 0, 0, 0.18);
+    box-shadow: 0 0 80px var(--processing-glow), 0 0 120px var(--processing-glow);
   }
 }
 

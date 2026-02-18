@@ -73,16 +73,16 @@ export default function OperationProgressHUD({
       )}
       {isSucceeded && (
         <>
-          <span style={{ color: "#6e6", fontSize: 16 }}>✓</span>
-          <span style={{ color: "#aaa" }}>
+          <span style={{ color: "var(--color-success)", fontSize: 16 }}>✓</span>
+          <span style={{ color: "var(--hud-muted)" }}>
             Segmented into {String(progress.maskCount)} {progress.maskCount === 1 ? "slice" : "slices"}
           </span>
         </>
       )}
       {progress.phase === "succeeded-warning" && (
         <>
-          <span style={{ color: "#fb4", fontSize: 18, flexShrink: 0 }}>⚠</span>
-          <span style={{ color: "#fb4", lineHeight: 1.4 }}>
+          <span style={{ color: "var(--color-warning)", fontSize: 18, flexShrink: 0 }}>⚠</span>
+          <span style={{ color: "var(--color-warning)", lineHeight: 1.4 }}>
             {progress.warning}
           </span>
           <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
@@ -95,7 +95,7 @@ export default function OperationProgressHUD({
                   background: "rgba(255,180,40,0.15)",
                   border: "1px solid rgba(255,180,40,0.4)",
                   borderRadius: 4,
-                  color: "#fb4",
+                  color: "var(--color-warning)",
                   cursor: "pointer",
                   fontSize: 12,
                   fontWeight: 600,
@@ -126,7 +126,7 @@ export default function OperationProgressHUD({
       )}
       {isFailed && (
         <>
-          <span style={{ color: "#f88", maxWidth: 360, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+          <span style={{ color: "var(--color-error)", maxWidth: 360, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
             ⚠ {progress.error}
           </span>
           <button
@@ -136,7 +136,7 @@ export default function OperationProgressHUD({
             style={{
               background: "none",
               border: "none",
-              color: copied ? "#8f8" : "var(--hud-muted)",
+              color: copied ? "var(--color-success)" : "var(--hud-muted)",
               cursor: "pointer",
               fontSize: 13,
               padding: "0 4px",

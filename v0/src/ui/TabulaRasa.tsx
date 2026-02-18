@@ -42,7 +42,7 @@ export default function TabulaRasa({ onTap }: TabulaRasaProps): React.JSX.Elemen
           opacity: visible ? 0.9 : 0.15,
           transition: "opacity 0.15s ease",
           marginBottom: 16,
-          boxShadow: visible ? "0 0 12px rgba(126,200,227,0.3)" : "none",
+          boxShadow: visible ? "0 0 12px var(--shadow-medium)" : "none",
         }}
       />
       <span

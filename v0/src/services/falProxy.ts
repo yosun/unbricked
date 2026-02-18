@@ -19,6 +19,15 @@ if (!PROXY_BASE) {
   );
 }
 
+/** Default fal.ai endpoint paths for common operations. */
+export const FAL_ENDPOINTS = {
+  bgRemoval: "fal-ai/birefnet",
+  autoSegment: "fal-ai/sam2/auto-segment",
+  imageTo3D: "fal-ai/sam-3/3d-objects",
+  img2img: "fal-ai/flux/dev/image-to-image",
+  textToImg: "fal-ai/flux/dev",
+} as const;
+
 /**
  * Max JSON body size (bytes) we allow for proxy requests.
  * API Gateway has a 10 MB limit; we stay well under to leave room for the rest
@@ -1024,6 +1033,43 @@ export async function runTextToImg(
   const json: unknown = await response.json();
   return FalTextToImgResponseSchema.parse(json);
 }
+/* ── Layer Composite Rendering ───────────────────── */
+
+/**
+ * Render a composited layer image: draws the source image at the given
+ * opacity, preserving the existing alpha (mask) channel.
+ * Returns a PNG data URL.
+ */
+export async function renderLayerComposite(
+  imageUrl: string,
+  opacity: number,
+  signal?: AbortSignal,
+): Promise<string> {
+  const { blob } = await fetchImageBlob(imageUrl, signal);
+  const bitmap = await createImageBitmap(blob);
+  const w = bitmap.width;
+  const h = bitmap.height;
+  const canvas = document.createElement("canvas");
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) throw new Error("Canvas 2D context unavailable");
+  ctx.drawImage(bitmap, 0, 0);
+  bitmap.close();
+
+  // Scale alpha channel by opacity
+  if (opacity < 1) {
+    const imgData = ctx.getImageData(0, 0, w, h);
+    const data = imgData.data;
+    for (let i = 3; i < data.length; i += 4) {
+      data[i] = Math.round(data[i]! * opacity);
+    }
+    ctx.putImageData(imgData, 0, 0);
+  }
+
+  return canvas.toDataURL("image/png");
+}
+
 /* ── Background Removal (fal-ai/birefnet) ───────── */
 
 const FalBirefnetResponseSchema = z.object({

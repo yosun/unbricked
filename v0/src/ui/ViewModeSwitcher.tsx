@@ -20,7 +20,7 @@ export default function ViewModeSwitcher(props: ViewModeSwitcherProps): React.JS
       style={{
         display: "flex",
         gap: 2,
-        background: "rgba(0,0,0,0.35)",
+        background: "var(--control-bg)",
         borderRadius: 6,
         padding: 2,
       }}
@@ -38,7 +38,7 @@ export default function ViewModeSwitcher(props: ViewModeSwitcherProps): React.JS
               border: active
                 ? "1px solid var(--hud-border-btn)"
                 : "1px solid transparent",
-              color: active ? "var(--scrubber-active)" : "#888",
+              color: active ? "var(--scrubber-active)" : "var(--color-dimmed)",
               padding: "3px 8px",
               borderRadius: 4,
               cursor: "pointer",
