@@ -172,6 +172,10 @@ function AnimatedLayerGroup({
         currentY.current = targetY;
         groupRef.current.position.x = targetX;
         groupRef.current.position.y = targetY;
+        // In demand-render mode, this final snap can otherwise leave dependents
+        // (e.g. TransformControls) one frame behind and then never catch up.
+        groupRef.current.updateMatrixWorld(true);
+        invalidate();
       }
       return;
     }
@@ -181,6 +185,7 @@ function AnimatedLayerGroup({
     currentY.current = MathUtils.lerp(currentY.current, targetY, factor);
     groupRef.current.position.x = currentX.current;
     groupRef.current.position.y = currentY.current;
+    groupRef.current.updateMatrixWorld(true);
     invalidate();
   });
 
@@ -518,6 +523,10 @@ function GLBLayerModel({
   const { scene } = useGLTF(url);
   const selectionWireframe = useUIStyle((s) => s.template.colors.selectionWireframe);
   const pivotColor = useUIStyle((s) => s.template.colors.pivotColor);
+  // Base offset positions the model over the selected prism segment (crop offset etc).
+  // `pivotCompRef` is an INTERNAL compensation group used to keep the model stationary
+  // when the pivot face changes, without modifying the persisted user transform.
+  const pivotCompRef = useRef<import("three").Group>(null);
   const tcTargetRef = useRef<import("three").Group>(null);
   const contentRef = useRef<import("three").Group>(null);
   const scaleGroupRef = useRef<import("three").Group>(null);
@@ -784,7 +793,7 @@ function GLBLayerModel({
   const prevPivotRef = useRef<PivotFace>(pivotFace);
   const prevOffsetRef = useRef<[number, number, number]>(contentOffset);
   useEffect(() => {
-    if (!tcTargetRef.current) return;
+    if (!tcTargetRef.current || !pivotCompRef.current) return;
     const prev = prevOffsetRef.current;
     const next = contentOffset;
     prevOffsetRef.current = next;
@@ -792,16 +801,21 @@ function GLBLayerModel({
     if (prevPivotRef.current === pivotFace) return;
     prevPivotRef.current = pivotFace;
     if (prev[0] === next[0] && prev[1] === next[1] && prev[2] === next[2]) return;
-    const dx = -(next[0] - prev[0]);
-    const dy = -(next[1] - prev[1]);
-    const dz = -(next[2] - prev[2]);
-    console.log('[GLBLayerModel] pivot toggle → compensating tcTarget (model stays put)', {
+    // `contentOffset` is in tcTarget-local space. Because child translations are affected by
+    // tcTarget's rotation and scale, the compensation must be applied in the parent space.
+    // To keep the MODEL stationary in world while pivot changes, we translate `pivotCompRef`
+    // by -(R * (S * deltaLocal)). This keeps persisted tcTarget transforms unchanged.
+    const deltaLocal = new Vector3(next[0] - prev[0], next[1] - prev[1], next[2] - prev[2]);
+    const g = tcTargetRef.current;
+    const deltaParent = deltaLocal.clone().multiply(g.scale).applyQuaternion(g.quaternion);
+    pivotCompRef.current.position.sub(deltaParent);
+    console.log('[GLBLayerModel] pivot changed → compensating pivotComp (tcTarget unchanged, model stays put)', {
       pivotFace,
-      'tcTarget delta': `(${dx.toFixed(4)}, ${dy.toFixed(4)}, ${dz.toFixed(4)})`,
+      deltaLocal: `(${deltaLocal.x.toFixed(4)}, ${deltaLocal.y.toFixed(4)}, ${deltaLocal.z.toFixed(4)})`,
+      deltaParent: `(${deltaParent.x.toFixed(4)}, ${deltaParent.y.toFixed(4)}, ${deltaParent.z.toFixed(4)})`,
+      tcTargetPosition: `(${g.position.x.toFixed(4)}, ${g.position.y.toFixed(4)}, ${g.position.z.toFixed(4)})`,
+      pivotCompPosition: `(${pivotCompRef.current.position.x.toFixed(4)}, ${pivotCompRef.current.position.y.toFixed(4)}, ${pivotCompRef.current.position.z.toFixed(4)})`,
     });
-    tcTargetRef.current.position.x += dx;
-    tcTargetRef.current.position.y += dy;
-    tcTargetRef.current.position.z += dz;
     invalidate();
     reportTransform();
   }, [contentOffset, pivotFace, reportTransform]);
@@ -827,48 +841,52 @@ function GLBLayerModel({
 
   return (
     <>
-      <group ref={tcTargetRef} position={[offX, 0.05, offZ]}>
-        {/* Content offset: positions model so desired pivot point is at tcTarget origin */}
-        <group ref={contentRef} position={contentOffset}>
-          <group ref={scaleGroupRef} scale={[fitScale, fitScale, fitScale]}>
-            <group quaternion={orientationQuat}>
-              <primitive object={cloned} />
+      <group position={[offX, 0.05, offZ]}>
+        <group ref={pivotCompRef}>
+          <group ref={tcTargetRef}>
+            {/* Content offset: positions model so desired pivot point is at tcTarget origin */}
+            <group ref={contentRef} position={contentOffset}>
+              <group ref={scaleGroupRef} scale={[fitScale, fitScale, fitScale]}>
+                <group quaternion={orientationQuat}>
+                  <primitive object={cloned} />
+                </group>
+              </group>
             </group>
+            {/* Bounding box wireframe — centered on bbox, offset from pivot point */}
+            {selected && (
+              <mesh position={bboxCenterOffset}>
+                <boxGeometry args={bboxSize} />
+                <meshBasicMaterial wireframe transparent opacity={0.25} color={selectionWireframe} depthWrite={false} />
+              </mesh>
+            )}
+            {/* Pivot indicator at gizmo origin (tcTarget space) */}
+            {selected && (
+              <mesh rotation={[0, Math.PI / 4, 0]} position={[0, 0, 0]}>
+                <boxGeometry args={[0.06, 0.06, 0.06]} />
+                <meshBasicMaterial color={pivotColor} depthTest={false} transparent opacity={0.9} />
+              </mesh>
+            )}
+            {/* Clickable bbox face proxies for pivot selection */}
+            {selected && onSetTransformPivot && (
+              <BBoxFaceProxies
+                size={bboxSize}
+                centerOffset={bboxCenterOffset}
+                currentFace={pivotFace}
+                onSelectFace={onSetTransformPivot}
+              />
+            )}
+            {/* Snap helpers — parented to gizmo target so they follow position */}
+            {selected && snapEnabled && (
+              <GizmoChildSnapHelpers
+                mode={effectiveMode}
+                snapTranslation={snapTranslation}
+                snapRotation={snapRotation}
+                snapScale={snapScale}
+                radius={Math.max(width, depth) * 0.6}
+              />
+            )}
           </group>
         </group>
-        {/* Bounding box wireframe — centered on bbox, offset from pivot point */}
-        {selected && (
-          <mesh position={bboxCenterOffset}>
-            <boxGeometry args={bboxSize} />
-            <meshBasicMaterial wireframe transparent opacity={0.25} color={selectionWireframe} depthWrite={false} />
-          </mesh>
-        )}
-        {/* Pivot indicator at gizmo origin (tcTarget space) */}
-        {selected && (
-          <mesh rotation={[0, Math.PI / 4, 0]} position={[0, 0, 0]}>
-            <boxGeometry args={[0.06, 0.06, 0.06]} />
-            <meshBasicMaterial color={pivotColor} depthTest={false} transparent opacity={0.9} />
-          </mesh>
-        )}
-        {/* Clickable bbox face proxies for pivot selection */}
-        {selected && onSetTransformPivot && (
-          <BBoxFaceProxies
-            size={bboxSize}
-            centerOffset={bboxCenterOffset}
-            currentFace={pivotFace}
-            onSelectFace={onSetTransformPivot}
-          />
-        )}
-        {/* Snap helpers — parented to gizmo target so they follow position */}
-        {selected && snapEnabled && (
-          <GizmoChildSnapHelpers
-            mode={effectiveMode}
-            snapTranslation={snapTranslation}
-            snapRotation={snapRotation}
-            snapScale={snapScale}
-            radius={Math.max(width, depth) * 0.6}
-          />
-        )}
       </group>
       {selected && tcReady && tcTargetRef.current && (
         <TransformControls
@@ -895,14 +913,12 @@ function GLBLayerModel({
  */
 function SnapHelpers({
   mode,
-  position,
   snapTranslation,
   snapRotation,
   snapScale,
   radius,
 }: {
   mode: "translate" | "rotate" | "scale";
-  position: [number, number, number];
   snapTranslation?: number | undefined;
   snapRotation?: number | undefined;
   snapScale?: number | undefined;
@@ -975,7 +991,7 @@ function SnapHelpers({
   }, [mode, snapScale, radius]);
 
   return (
-    <group position={position}>
+    <group>
       {/* Translation grid */}
       {translationGrid && <primitive object={translationGrid} />}
       {/* Rotation angle lines */}
@@ -1080,7 +1096,6 @@ function GizmoChildSnapHelpers({
     <group ref={counterRef}>
       <SnapHelpers
         mode={mode}
-        position={[0, 0, 0]}
         snapTranslation={snapTranslation}
         snapRotation={snapRotation}
         snapScale={snapScale}

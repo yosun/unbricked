@@ -55,7 +55,10 @@ async function compressDataUrl(dataUrl: string, bodyOverhead: number): Promise<s
   return new Promise<string>((resolve, reject) => {
     const img = new Image();
     img.onload = () => {
-      let { naturalWidth: w, naturalHeight: h } = img;
+      const origW = img.naturalWidth;
+      const origH = img.naturalHeight;
+      let w = origW;
+      let h = origH;
       const longest = Math.max(w, h);
       if (longest > MAX_IMAGE_EDGE) {
         const scale = MAX_IMAGE_EDGE / longest;
@@ -70,16 +73,27 @@ async function compressDataUrl(dataUrl: string, bodyOverhead: number): Promise<s
       if (!ctx) { reject(new Error("Canvas 2D context unavailable")); return; }
       ctx.drawImage(img, 0, 0, w, h);
 
-      // Try progressively lower quality until we fit
-      for (const quality of [0.85, 0.7, 0.5]) {
+      // Try PNG first (lossless) — important for segmentation quality
+      const pngUrl = canvas.toDataURL("image/png");
+      if (pngUrl.length + bodyOverhead <= MAX_BODY_BYTES) {
+        console.info(`[compressDataUrl] ${origW}×${origH} → ${String(w)}×${String(h)} PNG (${(pngUrl.length / 1024).toFixed(0)} KB)`);
+        resolve(pngUrl);
+        return;
+      }
+
+      // Fall back to JPEG at progressively lower quality
+      for (const quality of [0.92, 0.85, 0.7, 0.5]) {
         const compressed = canvas.toDataURL("image/jpeg", quality);
         if (compressed.length + bodyOverhead <= MAX_BODY_BYTES) {
+          console.info(`[compressDataUrl] ${origW}×${origH} → ${String(w)}×${String(h)} JPEG q=${String(quality)} (${(compressed.length / 1024).toFixed(0)} KB)`);
           resolve(compressed);
           return;
         }
       }
       // Last resort — use lowest quality result even if still large
-      resolve(canvas.toDataURL("image/jpeg", 0.5));
+      const fallback = canvas.toDataURL("image/jpeg", 0.5);
+      console.warn(`[compressDataUrl] ${origW}×${origH} → ${String(w)}×${String(h)} JPEG q=0.5 OVERSIZE (${(fallback.length / 1024).toFixed(0)} KB)`);
+      resolve(fallback);
     };
     img.onerror = () => { reject(new Error("Failed to load image for compression")); };
     img.src = dataUrl;

@@ -304,10 +304,15 @@ async function runSam3Segment(
   if (!space) throw new Error("Space not found");
 
   // 1. Run SAM2 auto-segmentation.
-  //    We use default SAM2 params (which may produce many masks) and rely on
-  //    smart post-processing to select the best segments.
+  //    Lower stability/IoU thresholds from fal defaults (0.95/0.88) to capture
+  //    more segments in complex compositions (collages, overlapping cutouts).
   const segResult = await runAutoSegment(
-    { imageUrl: payload.uri },
+    {
+      imageUrl: payload.uri,
+      stabilityScoreThresh: 0.80,
+      predIouThresh: 0.80,
+      pointsPerSide: 32,
+    },
     signal,
   );
 
