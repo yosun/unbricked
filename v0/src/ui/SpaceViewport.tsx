@@ -461,21 +461,20 @@ export interface Object3DTransform {
 
 /**
  * Which face of the bounding rectangular prism the gizmo pivot sits on.
- * "center" = volumetric center.  The six faces correspond to the axis-aligned
- * planes of the oriented bounding box *after* the −90° X rotation.
- * Because the rotation maps raw (x,y,z) → (x, z, -y):
- *   +Z = bottom (base/feet), −Z = top (head), ±X = left/right, ±Y = front/back.
+ * "center" = volumetric center.  The six faces are axis-aligned in Y-up space
+ * (standard glTF / Three.js convention, no rotation applied):
+ *   +Y = top (head), −Y = bottom (feet/base), ±X = left/right, ±Z = front/back.
  */
 export type PivotFace = "center" | "-y" | "+y" | "-x" | "+x" | "-z" | "+z";
-export const PIVOT_FACES: PivotFace[] = ["center", "+z", "-z", "-x", "+x", "-y", "+y"];
+export const PIVOT_FACES: PivotFace[] = ["center", "+y", "-y", "-x", "+x", "+z", "-z"];
 export const PIVOT_FACE_LABELS: Record<PivotFace, string> = {
   "center": "Center",
-  "+z": "Bottom",
-  "-z": "Top",
+  "+y": "Top",
+  "-y": "Bottom",
   "-x": "Left",
   "+x": "Right",
-  "-y": "Front",
-  "+y": "Back",
+  "+z": "Front",
+  "-z": "Back",
 };
 
 const DEFAULT_TRANSFORM: Object3DTransform = {
@@ -521,6 +520,7 @@ function GLBLayerModel({
   const pivotColor = useUIStyle((s) => s.template.colors.pivotColor);
   const tcTargetRef = useRef<import("three").Group>(null);
   const contentRef = useRef<import("three").Group>(null);
+  const scaleGroupRef = useRef<import("three").Group>(null);
   const [tcReady, setTcReady] = useState(false);
 
   const cloned = useMemo(() => {
@@ -555,40 +555,6 @@ function GLBLayerModel({
     return c;
   }, [scene]);
 
-  // ── Auto-detect model orientation and compute bbox metrics without mutating the rendered clone.
-  const { orientationQuat, rotatedMetrics } = useMemo(() => {
-    // 1. Detect up axis from raw AABB (no rotation applied)
-    const rawBox = new Box3().setFromObject(cloned);
-    const rawSize = new Vector3();
-    rawBox.getSize(rawSize);
-
-    const q = new Quaternion();
-    if (rawSize.y >= rawSize.z * 1.5) {
-      // Y is clearly the tallest axis → Y-up model (glTF standard) → no rotation needed
-    } else {
-      // Z-up or ambiguous → apply -90°X correction to convert to Y-up
-      q.setFromEuler(new Euler(-Math.PI / 2, 0, 0));
-    }
-
-    // 2. Compute bbox using a SEPARATE deep clone (non-mutating)
-    const bboxProbe = cloned.clone(true);
-    const tempGroup = new Group();
-    tempGroup.quaternion.copy(q);
-    tempGroup.add(bboxProbe);
-    tempGroup.updateMatrixWorld(true);
-
-    const box = new Box3().setFromObject(tempGroup);
-    const size = new Vector3();
-    box.getSize(size);
-    const center = new Vector3();
-    box.getCenter(center);
-
-    return {
-      orientationQuat: q,
-      rotatedMetrics: { center, size, min: box.min.clone(), max: box.max.clone() },
-    };
-  }, [cloned]);
-
   // ── Target footprint on the prism ──
   const fullW = width * 0.96;
   const fullD = depth * 0.96;
@@ -604,59 +570,178 @@ function GLBLayerModel({
     targetD = fullD * (crop.cropH / crop.origH);
   }
 
-  // ── Fit scale: match XZ footprint (top-down view) to the segment area.
-  const fitScale = useMemo(() => {
-    const sX = targetW / Math.max(rotatedMetrics.size.x, 0.001);
-    const sZ = targetD / Math.max(rotatedMetrics.size.z, 0.001);
-    return Math.min(sX, sZ);
-  }, [rotatedMetrics, targetW, targetD]);
+  // ── Compute bbox metrics WITHOUT mutating the rendered clone.
+  // Build a probe with the EXACT same transform chain as the render tree:
+  //   scaleGroup(fitScale) → orientGroup(q) → model
+  // so that bbox center is directly in tcTarget-equivalent space.
+  // Auto-yaw: if rotating 90° around Y makes the XZ footprint aspect better
+  // match the target image aspect, apply it.
+  const { orientationQuat, scaledMetrics } = useMemo(() => {
+    // 1. Determine if yaw correction is needed (using unscaled probe first)
+    const rawProbe = cloned.clone(true);
+    const rawGroup = new Group();
+    rawGroup.add(rawProbe);
+    rawGroup.updateMatrixWorld(true);
+    const rawBox = new Box3().setFromObject(rawGroup);
+    const rawSize = new Vector3();
+    rawBox.getSize(rawSize);
 
-  // ── Single content offset: positions content so the desired pivot point
+    // Count meshes and check geometry readiness for debug
+    let meshCount = 0;
+    let allGeometryReady = true;
+    cloned.traverse((node) => {
+      const mesh = node as Mesh;
+      if (!mesh.isMesh) return;
+      meshCount++;
+      if (!mesh.geometry.attributes["position"] || mesh.geometry.attributes["position"].count === 0) {
+        allGeometryReady = false;
+      }
+    });
+
+    const imageAspect = targetW / Math.max(targetD, 0.001);
+    const modelAspect = rawSize.x / Math.max(rawSize.z, 0.001);
+    const modelAspect90 = rawSize.z / Math.max(rawSize.x, 0.001);
+    const needsYaw90 =
+      Math.abs(modelAspect - imageAspect) > Math.abs(modelAspect90 - imageAspect) &&
+      Math.abs(modelAspect - imageAspect) > 0.3;
+
+    const q = new Quaternion();
+    if (needsYaw90) {
+      q.setFromEuler(new Euler(0, Math.PI / 2, 0));
+    }
+
+    // 2. Compute fitScale from oriented (but unscaled) bbox
+    const orientProbe = cloned.clone(true);
+    const orientGroup = new Group();
+    orientGroup.quaternion.copy(q);
+    orientGroup.add(orientProbe);
+    orientGroup.updateMatrixWorld(true);
+    const orientBox = new Box3().setFromObject(orientGroup);
+    const orientSize = new Vector3();
+    orientBox.getSize(orientSize);
+
+    const sX = targetW / Math.max(orientSize.x, 0.001);
+    const sZ = targetD / Math.max(orientSize.z, 0.001);
+    const fs = Math.min(sX, sZ);
+
+    // 3. Build full probe matching render hierarchy: scale → orient → model
+    //    This gives us bbox center directly in tcTarget-equivalent space.
+    const fullProbe = cloned.clone(true);
+    const innerOrient = new Group();
+    innerOrient.quaternion.copy(q);
+    innerOrient.add(fullProbe);
+    const scaleWrap = new Group();
+    scaleWrap.scale.set(fs, fs, fs);
+    scaleWrap.add(innerOrient);
+    const outerGroup = new Group();
+    outerGroup.add(scaleWrap);
+    outerGroup.updateMatrixWorld(true);
+
+    const box = new Box3().setFromObject(outerGroup);
+    const size = new Vector3();
+    box.getSize(size);
+    const center = new Vector3();
+    box.getCenter(center);
+
+    // Guard: NaN / Infinity / degenerate
+    if (!isFinite(center.x) || !isFinite(center.y) || !isFinite(center.z) || size.length() < 0.0001) {
+      console.warn('[GLBLayerModel] probe: degenerate bbox, using fallback', { meshCount, allGeometryReady });
+      return {
+        orientationQuat: q,
+        scaledMetrics: {
+          fitScale: fs,
+          center: new Vector3(),
+          size: new Vector3(0.1, 0.1, 0.1),
+          min: new Vector3(-0.05, -0.05, -0.05),
+          max: new Vector3(0.05, 0.05, 0.05),
+        },
+      };
+    }
+
+    console.log('[GLBLayerModel] bbox computed', {
+      meshCount,
+      allGeometryReady,
+      'center (XYZ)': `(${center.x.toFixed(4)}, ${center.y.toFixed(4)}, ${center.z.toFixed(4)})`,
+      'size (XYZ)': `(${size.x.toFixed(4)}, ${size.y.toFixed(4)}, ${size.z.toFixed(4)})`,
+      'min (XYZ)': `(${box.min.x.toFixed(4)}, ${box.min.y.toFixed(4)}, ${box.min.z.toFixed(4)})`,
+      'max (XYZ)': `(${box.max.x.toFixed(4)}, ${box.max.y.toFixed(4)}, ${box.max.z.toFixed(4)})`,
+      fitScale: fs.toFixed(4),
+      needsYaw90,
+    });
+
+    return {
+      orientationQuat: q,
+      scaledMetrics: { fitScale: fs, center, size, min: box.min.clone(), max: box.max.clone() },
+    };
+  }, [cloned, targetW, targetD]);
+
+  const fitScale = scaledMetrics.fitScale;
+
+  // ── Content offset: position content so the desired pivot point
   //    (center or face) lands at tcTarget origin [0,0,0].
-  //    All values are in POST-scale space (applied after scale group).
+  //    scaledMetrics values are in tcTarget-equivalent space (post-orient, post-scale).
   const pivotFace: PivotFace = transformPivot ?? "center";
   const contentOffset = useMemo<[number, number, number]>(() => {
-    const { center, min, max } = rotatedMetrics;
-    const s = fitScale;
+    const { center, min, max } = scaledMetrics;
     // Base offset puts bbox center at origin
-    const cx = -center.x * s;
-    const cy = -center.y * s;
-    const cz = -center.z * s;
+    const cx = -center.x;
+    const cy = -center.y;
+    const cz = -center.z;
     if (pivotFace === "center") return [cx, cy, cz];
-    // For face modes: shift so the face center is at origin instead of bbox center
+    // For face modes: shift so the face center is at origin instead of bbox center.
+    // On the pivot axis, use the face coordinate; on other axes, use center.
     switch (pivotFace) {
-      case "-y": return [cx, -min.y * s, cz];
-      case "+y": return [cx, -max.y * s, cz];
-      case "-x": return [-min.x * s, cy, cz];
-      case "+x": return [-max.x * s, cy, cz];
-      case "-z": return [cx, cy, -min.z * s];
-      case "+z": return [cx, cy, -max.z * s];
+      case "-y": return [cx, -min.y, cz];
+      case "+y": return [cx, -max.y, cz];
+      case "-x": return [-min.x, cy, cz];
+      case "+x": return [-max.x, cy, cz];
+      case "-z": return [cx, cy, -min.z];
+      case "+z": return [cx, cy, -max.z];
     }
-  }, [rotatedMetrics, pivotFace, fitScale]);
+  }, [scaledMetrics, pivotFace]);
 
-  // ── Bounding box size (scaled) for wireframe ──
+  // ── Bounding box size for wireframe (already scaled) ──
   const bboxSize = useMemo<[number, number, number]>(() => {
-    const { size } = rotatedMetrics;
-    return [size.x * fitScale, size.y * fitScale, size.z * fitScale];
-  }, [rotatedMetrics, fitScale]);
+    const { size } = scaledMetrics;
+    return [size.x, size.y, size.z];
+  }, [scaledMetrics]);
 
   // ── Bounding box center offset from pivot point (for wireframe positioning) ──
-  // This is the vector from the pivot point to the bbox center in tcTarget space.
   const bboxCenterOffset = useMemo<[number, number, number]>(() => {
-    const { center, min, max } = rotatedMetrics;
-    const s = fitScale;
+    const { center, min, max } = scaledMetrics;
     if (pivotFace === "center") return [0, 0, 0];
-    // Bbox center in tcTarget space = center*s + contentOffset
-    // For face modes, the face coordinate is at 0, so the center is offset from that.
     switch (pivotFace) {
-      case "-y": return [0, (center.y - min.y) * s, 0];
-      case "+y": return [0, (center.y - max.y) * s, 0];
-      case "-x": return [(center.x - min.x) * s, 0, 0];
-      case "+x": return [(center.x - max.x) * s, 0, 0];
-      case "-z": return [0, 0, (center.z - min.z) * s];
-      case "+z": return [0, 0, (center.z - max.z) * s];
+      case "-y": return [0, center.y - min.y, 0];
+      case "+y": return [0, center.y - max.y, 0];
+      case "-x": return [center.x - min.x, 0, 0];
+      case "+x": return [center.x - max.x, 0, 0];
+      case "-z": return [0, 0, center.z - min.z];
+      case "+z": return [0, 0, center.z - max.z];
     }
-  }, [rotatedMetrics, pivotFace, fitScale]);
+  }, [scaledMetrics, pivotFace]);
+
+  // ── Debug: verify actual bbox matches probe on first rendered frame (read-only) ──
+  const debugVerifiedRef = useRef(false);
+  useEffect(() => { debugVerifiedRef.current = false; }, [cloned]);
+  useFrame(() => {
+    if (debugVerifiedRef.current) return;
+    if (!scaleGroupRef.current || !tcTargetRef.current || !contentRef.current) return;
+    debugVerifiedRef.current = true;
+    tcTargetRef.current.updateMatrixWorld(true);
+    const actualBox = new Box3().setFromObject(scaleGroupRef.current);
+    if (actualBox.isEmpty()) { console.warn('[GLBLayerModel] DEBUG: actual bbox empty'); return; }
+    const actualCenter = new Vector3();
+    actualBox.getCenter(actualCenter);
+    // Convert to tcTarget local space
+    const tcInv = tcTargetRef.current.matrixWorld.clone().invert();
+    const localCenter = actualCenter.applyMatrix4(tcInv);
+    console.log('[GLBLayerModel] DEBUG first-frame bbox', {
+      'actual center in tcTarget local': `(${localCenter.x.toFixed(4)}, ${localCenter.y.toFixed(4)}, ${localCenter.z.toFixed(4)})`,
+      'expected (should be ~0,0,0 for center pivot)': pivotFace === 'center' ? 'yes' : `offset for ${pivotFace}`,
+      'contentOffset applied': `(${contentOffset[0].toFixed(4)}, ${contentOffset[1].toFixed(4)}, ${contentOffset[2].toFixed(4)})`,
+      'tcTarget.position': `(${tcTargetRef.current.position.x.toFixed(4)}, ${tcTargetRef.current.position.y.toFixed(4)}, ${tcTargetRef.current.position.z.toFixed(4)})`,
+    });
+  });
 
   // Mark tcTarget ready after first render
   useEffect(() => {
@@ -693,20 +778,33 @@ function GLBLayerModel({
   useEffect(() => { reportTransform(); }, [reportTransform]);
 
   // ── When pivotFace changes, adjust tcTarget.position to compensate
-  //    for the contentOffset change, so the model stays in place.
+  //    for the contentOffset change, so the model stays in place visually.
+  //    INVARIANT: pivot toggle NEVER modifies model position/rotation/scale.
+  //    It only changes which point is at tcTarget origin.
+  const prevPivotRef = useRef<PivotFace>(pivotFace);
   const prevOffsetRef = useRef<[number, number, number]>(contentOffset);
   useEffect(() => {
     if (!tcTargetRef.current) return;
     const prev = prevOffsetRef.current;
     const next = contentOffset;
-    if (prev[0] === next[0] && prev[1] === next[1] && prev[2] === next[2]) return;
     prevOffsetRef.current = next;
-    tcTargetRef.current.position.x -= (next[0] - prev[0]);
-    tcTargetRef.current.position.y -= (next[1] - prev[1]);
-    tcTargetRef.current.position.z -= (next[2] - prev[2]);
+    // Only compensate if the pivot actually changed (not on metrics/model change)
+    if (prevPivotRef.current === pivotFace) return;
+    prevPivotRef.current = pivotFace;
+    if (prev[0] === next[0] && prev[1] === next[1] && prev[2] === next[2]) return;
+    const dx = -(next[0] - prev[0]);
+    const dy = -(next[1] - prev[1]);
+    const dz = -(next[2] - prev[2]);
+    console.log('[GLBLayerModel] pivot toggle → compensating tcTarget (model stays put)', {
+      pivotFace,
+      'tcTarget delta': `(${dx.toFixed(4)}, ${dy.toFixed(4)}, ${dz.toFixed(4)})`,
+    });
+    tcTargetRef.current.position.x += dx;
+    tcTargetRef.current.position.y += dy;
+    tcTargetRef.current.position.z += dz;
     invalidate();
     reportTransform();
-  }, [contentOffset, reportTransform]);
+  }, [contentOffset, pivotFace, reportTransform]);
 
   // Apply externally-set transform (from editable panel inputs)
   const lastAppliedRef = useRef<Object3DTransform | null>(null);
@@ -732,7 +830,7 @@ function GLBLayerModel({
       <group ref={tcTargetRef} position={[offX, 0.05, offZ]}>
         {/* Content offset: positions model so desired pivot point is at tcTarget origin */}
         <group ref={contentRef} position={contentOffset}>
-          <group scale={[fitScale, fitScale, fitScale]}>
+          <group ref={scaleGroupRef} scale={[fitScale, fitScale, fitScale]}>
             <group quaternion={orientationQuat}>
               <primitive object={cloned} />
             </group>

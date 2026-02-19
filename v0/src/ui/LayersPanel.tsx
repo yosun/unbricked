@@ -601,7 +601,7 @@ export default function LayersPanel(props: LayersPanelProps): React.JSX.Element 
                 </button>
                 <button
                   type="button"
-                  onClick={() => { if (transformPivot === "center") onSetTransformPivot("+z"); }}
+                  onClick={() => { if (transformPivot === "center") onSetTransformPivot("-y"); }}
                   style={{
                     flex: 1,
                     background: transformPivot !== "center" ? "var(--hud-active)" : "none",

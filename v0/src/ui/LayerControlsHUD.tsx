@@ -501,7 +501,7 @@ export default function LayerControlsHUD(props: LayerControlsHUDProps): React.JS
       {has3DModel && (
         <button
           type="button"
-          onClick={() => { onSetTransformPivot(transformPivot === "center" ? "+z" : "center"); }}
+          onClick={() => { onSetTransformPivot(transformPivot === "center" ? "-y" : "center"); }}
           title={transformPivot === "center" ? "Switch to Pivot mode" : "Switch to Center mode"}
           style={{
             background: transformPivot !== "center" ? "var(--hud-active)" : "none",

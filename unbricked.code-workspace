@@ -19,6 +19,10 @@
 			"/^\\./node_modules/\\.bin/vitest run 2>&1$/": {
 				"approve": true,
 				"matchCommandLine": true
+			},
+			"/^\\./node_modules/\\.bin/vitest run 2>&1 \\| tail -10$/": {
+				"approve": true,
+				"matchCommandLine": true
 			}
 		}
 	}
