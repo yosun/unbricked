@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Canvas, useThree, useFrame, invalidate } from "@react-three/fiber";
 import { OrbitControls, TransformControls, useGLTF } from "@react-three/drei";
-import { Box3, CanvasTexture, Color, DoubleSide, Euler, GridHelper as ThreeGridHelper, Group, MathUtils, MeshBasicMaterial, MeshStandardMaterial, PlaneGeometry, Plane, Raycaster, SRGBColorSpace, Vector3, TextureLoader, BufferGeometry, Float32BufferAttribute, LineBasicMaterial } from "three";
+import { Box3, CanvasTexture, Color, DoubleSide, Euler, GridHelper as ThreeGridHelper, Group, MathUtils, MeshBasicMaterial, MeshStandardMaterial, PlaneGeometry, Plane, Quaternion, Raycaster, SRGBColorSpace, Vector3, TextureLoader, BufferGeometry, Float32BufferAttribute, LineBasicMaterial } from "three";
 import type { Camera, Material, Mesh, Texture } from "three";
 import type { ThreeEvent } from "@react-three/fiber";
 
@@ -94,6 +94,8 @@ interface SpacePrismProps {
   snapScale?: number | undefined;
   /** Whether snapping is currently enabled (for visual helpers). */
   snapEnabled?: boolean | undefined;
+  /** Callback when user clicks a bbox face to change pivot. */
+  onSetTransformPivot?: ((face: PivotFace) => void) | undefined;
   /** Callback when model transform changes. */
   onTransformChange?: ((t: Object3DTransform) => void) | undefined;
   /** Externally-set transform to apply to the model. */
@@ -494,8 +496,10 @@ function GLBLayerModel({
   snapTranslation,
   snapRotation,
   snapScale,
+  snapEnabled,
   onTransformChange,
   appliedTransform,
+  onSetTransformPivot,
 }: {
   url: string;
   width: number;
@@ -507,8 +511,10 @@ function GLBLayerModel({
   snapTranslation?: number | undefined;
   snapRotation?: number | undefined;
   snapScale?: number | undefined;
+  snapEnabled?: boolean | undefined;
   onTransformChange?: ((t: Object3DTransform) => void) | undefined;
   appliedTransform?: Object3DTransform | undefined;
+  onSetTransformPivot?: ((face: PivotFace) => void) | undefined;
 }): React.JSX.Element | null {
   const { scene } = useGLTF(url);
   const selectionWireframe = useUIStyle((s) => s.template.colors.selectionWireframe);
@@ -549,12 +555,26 @@ function GLBLayerModel({
     return c;
   }, [scene]);
 
-  // ── Compute bbox metrics in the ROTATED space (as the model will actually be displayed).
-  // We apply the -90° X rotation to a temporary group, then compute the AABB directly.
-  const rotatedMetrics = useMemo(() => {
+  // ── Auto-detect model orientation and compute bbox metrics without mutating the rendered clone.
+  const { orientationQuat, rotatedMetrics } = useMemo(() => {
+    // 1. Detect up axis from raw AABB (no rotation applied)
+    const rawBox = new Box3().setFromObject(cloned);
+    const rawSize = new Vector3();
+    rawBox.getSize(rawSize);
+
+    const q = new Quaternion();
+    if (rawSize.y >= rawSize.z * 1.5) {
+      // Y is clearly the tallest axis → Y-up model (glTF standard) → no rotation needed
+    } else {
+      // Z-up or ambiguous → apply -90°X correction to convert to Y-up
+      q.setFromEuler(new Euler(-Math.PI / 2, 0, 0));
+    }
+
+    // 2. Compute bbox using a SEPARATE deep clone (non-mutating)
+    const bboxProbe = cloned.clone(true);
     const tempGroup = new Group();
-    tempGroup.rotation.set(-Math.PI / 2, 0, 0);
-    tempGroup.add(cloned);
+    tempGroup.quaternion.copy(q);
+    tempGroup.add(bboxProbe);
     tempGroup.updateMatrixWorld(true);
 
     const box = new Box3().setFromObject(tempGroup);
@@ -563,10 +583,10 @@ function GLBLayerModel({
     const center = new Vector3();
     box.getCenter(center);
 
-    // Remove cloned from temp group so it can be used normally in the scene
-    tempGroup.remove(cloned);
-
-    return { center, size, min: box.min.clone(), max: box.max.clone() };
+    return {
+      orientationQuat: q,
+      rotatedMetrics: { center, size, min: box.min.clone(), max: box.max.clone() },
+    };
   }, [cloned]);
 
   // ── Target footprint on the prism ──
@@ -713,7 +733,7 @@ function GLBLayerModel({
         {/* Content offset: positions model so desired pivot point is at tcTarget origin */}
         <group ref={contentRef} position={contentOffset}>
           <group scale={[fitScale, fitScale, fitScale]}>
-            <group rotation={[-Math.PI / 2, 0, 0]}>
+            <group quaternion={orientationQuat}>
               <primitive object={cloned} />
             </group>
           </group>
@@ -731,6 +751,25 @@ function GLBLayerModel({
             <boxGeometry args={[0.06, 0.06, 0.06]} />
             <meshBasicMaterial color={pivotColor} depthTest={false} transparent opacity={0.9} />
           </mesh>
+        )}
+        {/* Clickable bbox face proxies for pivot selection */}
+        {selected && onSetTransformPivot && (
+          <BBoxFaceProxies
+            size={bboxSize}
+            centerOffset={bboxCenterOffset}
+            currentFace={pivotFace}
+            onSelectFace={onSetTransformPivot}
+          />
+        )}
+        {/* Snap helpers — parented to gizmo target so they follow position */}
+        {selected && snapEnabled && (
+          <GizmoChildSnapHelpers
+            mode={effectiveMode}
+            snapTranslation={snapTranslation}
+            snapRotation={snapRotation}
+            snapScale={snapScale}
+            radius={Math.max(width, depth) * 0.6}
+          />
         )}
       </group>
       {selected && tcReady && tcTargetRef.current && (
@@ -857,8 +896,104 @@ function SnapHelpers({
   );
 }
 
+/** Clickable invisible planes at each bbox face for quick pivot selection. */
+function BBoxFaceProxies({
+  size,
+  centerOffset,
+  currentFace,
+  onSelectFace,
+}: {
+  size: [number, number, number];
+  centerOffset: [number, number, number];
+  currentFace: PivotFace;
+  onSelectFace: (face: PivotFace) => void;
+}): React.JSX.Element {
+  const hoverColor = useUIStyle((s) => s.template.colors.accent);
+  const [hovered, setHovered] = useState<PivotFace | null>(null);
+  const [sx, sy, sz] = size;
+  const [cx, cy, cz] = centerOffset;
+  const faces: { face: PivotFace; pos: [number, number, number]; rot: [number, number, number]; w: number; h: number }[] = useMemo(() => [
+    { face: "+x", pos: [cx + sx / 2, cy, cz], rot: [0, Math.PI / 2, 0], w: sz, h: sy },
+    { face: "-x", pos: [cx - sx / 2, cy, cz], rot: [0, -Math.PI / 2, 0], w: sz, h: sy },
+    { face: "+y", pos: [cx, cy + sy / 2, cz], rot: [-Math.PI / 2, 0, 0], w: sx, h: sz },
+    { face: "-y", pos: [cx, cy - sy / 2, cz], rot: [Math.PI / 2, 0, 0], w: sx, h: sz },
+    { face: "+z", pos: [cx, cy, cz + sz / 2], rot: [0, 0, 0], w: sx, h: sy },
+    { face: "-z", pos: [cx, cy, cz - sz / 2], rot: [0, Math.PI, 0], w: sx, h: sy },
+  ], [sx, sy, sz, cx, cy, cz]);
+
+  return (
+    <group>
+      {faces.map(({ face, pos, rot, w, h }) => (
+        <mesh
+          key={face}
+          position={pos}
+          rotation={rot}
+          onClick={(e) => { e.stopPropagation(); onSelectFace(face); }}
+          onPointerOver={() => { setHovered(face); invalidate(); }}
+          onPointerOut={() => { setHovered(null); invalidate(); }}
+        >
+          <planeGeometry args={[w * 0.9, h * 0.9]} />
+          <meshBasicMaterial
+            transparent
+            opacity={hovered === face ? 0.15 : currentFace === face ? 0.08 : 0}
+            color={hoverColor}
+            depthWrite={false}
+            side={DoubleSide}
+          />
+        </mesh>
+      ))}
+    </group>
+  );
+}
+
+/** Snap helpers rendered as child of gizmo target — counter-rotates for translate mode. */
+function GizmoChildSnapHelpers({
+  mode,
+  snapTranslation,
+  snapRotation,
+  snapScale,
+  radius,
+}: {
+  mode: "translate" | "rotate" | "scale";
+  snapTranslation?: number | undefined;
+  snapRotation?: number | undefined;
+  snapScale?: number | undefined;
+  radius: number;
+}): React.JSX.Element {
+  const counterRef = useRef<Group>(null);
+  const _q = useMemo(() => new Quaternion(), []);
+
+  useFrame(() => {
+    if (!counterRef.current) return;
+    if (mode === "translate") {
+      // Counter-rotate so translate grid stays world-axis-aligned
+      const parent = counterRef.current.parent;
+      if (parent) {
+        parent.getWorldQuaternion(_q);
+        counterRef.current.quaternion.copy(_q.invert());
+      }
+    } else {
+      // For rotate/scale, snap helpers follow object rotation
+      counterRef.current.quaternion.identity();
+    }
+  });
+
+  return (
+    <group ref={counterRef}>
+      <SnapHelpers
+        mode={mode}
+        position={[0, 0, 0]}
+        snapTranslation={snapTranslation}
+        snapRotation={snapRotation}
+        snapScale={snapScale}
+        radius={radius}
+      />
+    </group>
+  );
+}
+
 function SpacePrism(props: SpacePrismProps): React.JSX.Element {
-  const { layerCount, selectedLayerIndex, layerVisibility, layerOrder, onSelectLayer, dragOverride, suppressClicks, layerTextures, layerCropInfo, imageAspect, revealActive, onRevealDone, aiEditingLayer, layerGlbUrls, generating3DLayer, transformPivot, transformMode, snapTranslation, snapRotation, snapScale, snapEnabled, onTransformChange, appliedTransform, modelTransform } = props;
+  const { layerCount, selectedLayerIndex, layerVisibility, layerOrder, onSelectLayer, dragOverride, suppressClicks, layerTextures, layerCropInfo, imageAspect, revealActive, onRevealDone, aiEditingLayer, layerGlbUrls, generating3DLayer, transformPivot, transformMode, snapTranslation, snapRotation, snapScale, snapEnabled, onSetTransformPivot, onTransformChange, appliedTransform, modelTransform } = props;
   const { prismW, prismD } = prismDims(imageAspect);
   const hiddenSlideX = prismW + 0.5;
   const template = useUIStyle((s) => s.template);
@@ -935,28 +1070,6 @@ function SpacePrism(props: SpacePrismProps): React.JSX.Element {
         <meshBasicMaterial wireframe transparent opacity={0.15} color={template.colors.foreground} />
       </mesh>
 
-      {/* Snap helpers: mode-specific guides centered at transform tool */}
-      {snapEnabled && selectedLayerIndex !== null && layerGlbUrls?.[selectedLayerIndex] && (() => {
-        // Use the live modelTransform position (which tracks the gizmo's actual position
-        // in AnimatedLayerGroup-local space). Add the layer's Y offset to get root-space position.
-        const posIdx = layerOrder.indexOf(selectedLayerIndex);
-        const layerYOffset = posIdx >= 0 ? layerY(posIdx, layerCount) : 0;
-        const posX = modelTransform?.position[0] ?? 0;
-        const posY = layerYOffset + (modelTransform?.position[1] ?? 0.05);
-        const posZ = modelTransform?.position[2] ?? 0;
-        const mode = transformMode ?? "rotate";
-        return (
-          <SnapHelpers
-            mode={mode}
-            position={[posX, posY, posZ]}
-            snapTranslation={snapTranslation}
-            snapRotation={snapRotation}
-            snapScale={snapScale}
-            radius={Math.max(prismW, prismD) * 0.6}
-          />
-        );
-      })()}
-
       {positions.map(({ layerIdx, y, isDragged }, positionIndex) => {
         const vis = layerVisibility[layerIdx];
         const hidden = vis ? !vis.visible : false;
@@ -1029,8 +1142,10 @@ function SpacePrism(props: SpacePrismProps): React.JSX.Element {
                 snapTranslation={snapTranslation}
                 snapRotation={snapRotation}
                 snapScale={snapScale}
+                snapEnabled={snapEnabled}
                 onTransformChange={selected ? onTransformChange : undefined}
                 appliedTransform={selected ? appliedTransform : undefined}
+                onSetTransformPivot={selected ? onSetTransformPivot : undefined}
                 {...(layerCropInfo[layerIdx] ? { crop: layerCropInfo[layerIdx] } : {})}
               />
             )}
@@ -1580,6 +1695,7 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
           snapRotation={snapRotation}
           snapScale={snapScale}
           snapEnabled={snapEnabled}
+          onSetTransformPivot={setTransformPivot}
           onTransformChange={setModelTransform}
           appliedTransform={appliedTransform}
           modelTransform={modelTransform}
