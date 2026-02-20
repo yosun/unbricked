@@ -1,4 +1,7 @@
 import type { Annotation, AnnotationId, Edge, ProjectState, SpaceId } from "./types";
+import type { SpaceAIHistory } from "./history/aiHistorySchema";
+import { deserializeAIHistory } from "./history/historyGraph";
+import { SPACE_AI_HISTORY_SCHEMA } from "./history/aiHistorySchema";
 
 export function findLayerSelection(
   state: ProjectState,
@@ -278,4 +281,64 @@ export function findPortalEdges(
   return Object.values(state.edges).filter(
     (e) => e.edgeKind === "portal" && e.from === spaceId,
   );
+}
+
+/* ── AI History ──────────────────────────────────── */
+
+export interface AIHistoryResult {
+  annotationId: AnnotationId;
+  history: SpaceAIHistory;
+}
+
+/**
+ * Find the SpaceAIHistory annotation for a Space.
+ * Returns the deserialized history + annotation ID, or null if none.
+ */
+export function findAIHistory(
+  state: ProjectState,
+  spaceId: SpaceId,
+): AIHistoryResult | null {
+  const ann = Object.values(state.annotations).find(
+    (a) =>
+      a.target.kind === "Space" &&
+      a.target.id === spaceId &&
+      a.schema === SPACE_AI_HISTORY_SCHEMA,
+  );
+  if (!ann) return null;
+  const history = deserializeAIHistory(ann.data);
+  if (!history) return null;
+  return { annotationId: ann.id, history };
+}
+
+/* ── Stable Slice IDs ────────────────────────────── */
+
+export interface SliceIds {
+  annotationId: AnnotationId;
+  ids: string[];
+}
+
+/**
+ * Find the stable slice ID mapping for a Space.
+ * Maps layer indices to stable IDs for history keying.
+ */
+export function findSliceIds(
+  state: ProjectState,
+  spaceId: SpaceId,
+): SliceIds | null {
+  const ann = Object.values(state.annotations).find(
+    (a) =>
+      a.target.kind === "Space" &&
+      a.target.id === spaceId &&
+      a.schema === "ui.layers.sliceIds",
+  );
+  if (!ann) return null;
+  const raw = ann.data["ids"];
+  if (!raw) return null;
+  try {
+    const ids = JSON.parse(raw) as string[];
+    if (!Array.isArray(ids)) return null;
+    return { annotationId: ann.id, ids };
+  } catch {
+    return null;
+  }
 }

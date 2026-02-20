@@ -9,3 +9,5 @@ export * from "./sampleProject";
 export * from "./crypto";
 export * from "./operations";
 export * from "./preferences";
+export * from "./history/aiHistorySchema";
+export * from "./history/historyGraph";

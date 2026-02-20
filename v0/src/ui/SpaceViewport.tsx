@@ -10,11 +10,14 @@ import type { CropInfo } from "../services/falProxy";
 import LayerScrubber from "./LayerScrubber";
 import LayerControlsHUD from "./LayerControlsHUD";
 import LayersPanel from "./LayersPanel";
+import AIHistoryPanel from "./AIHistoryPanel";
 import RadialMenu from "./RadialMenu";
 import CameraRig from "./CameraRig";
 import type { AnimPhase } from "./CameraRig";
 import type { ViewMode } from "./ViewMode";
 import { useUIStyle } from "./uiStyleStore";
+import type { SliceHistoryGraph } from "../core/history/aiHistorySchema";
+import type { PayloadId } from "../core/types";
 
 /* ── Shared prism dimensions ──────────────────────── */
 const PRISM_H = 2.5;
@@ -1108,7 +1111,7 @@ function GizmoChildSnapHelpers({
 function SpacePrism(props: SpacePrismProps): React.JSX.Element {
   const { layerCount, selectedLayerIndex, layerVisibility, layerOrder, onSelectLayer, dragOverride, suppressClicks, layerTextures, layerCropInfo, imageAspect, revealActive, onRevealDone, aiEditingLayer, layerGlbUrls, generating3DLayer, transformPivot, transformMode, snapTranslation, snapRotation, snapScale, snapEnabled, onSetTransformPivot, onTransformChange, appliedTransform, modelTransform } = props;
   const { prismW, prismD } = prismDims(imageAspect);
-  const hiddenSlideX = prismW + 0.5;
+  const hiddenSlideX = -(prismW + 0.5);
   const template = useUIStyle((s) => s.template);
 
   // Track reveal animation progress
@@ -1458,6 +1461,15 @@ interface SpaceViewportProps {
   layerGlbUrls: Record<number, string>;
   threeDSourceHidden: Set<number>;
   onToggle3DSourceImage: (index: number) => void;
+  // AI History
+  getSliceHistory?: (layerIndex: number) => SliceHistoryGraph | null;
+  onSetDisplayCursor?: (layerIndex: number, stateId: string) => void;
+  onSetOperationCursor?: (layerIndex: number, stateId: string) => void;
+  payloads?: Record<string, { uri: string; meta: Record<string, string> }>;
+  /** Keyframe preview: all layer thumbnails composited top-down */
+  keyframePreviewUrl?: string | null;
+  /** Document-level source image for AI history anchor. */
+  documentSourceImageId?: PayloadId | undefined;
 }
 
 export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Element {
@@ -1510,11 +1522,20 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
     layerGlbUrls,
     threeDSourceHidden,
     onToggle3DSourceImage,
+    getSliceHistory,
+    onSetDisplayCursor,
+    onSetOperationCursor,
+    payloads,
+    keyframePreviewUrl,
+    documentSourceImageId,
   } = props;
   const animating = animPhase !== "idle";
 
   // Transform pivot face for 3D models: which bbox face the gizmo anchors to
   const [transformPivot, setTransformPivot] = useState<PivotFace>("center");
+
+  // Universal AI History panel: which layer index is open, or null
+  const [historyPanelLayer, setHistoryPanelLayer] = useState<number | null>(null);
   // Transform gizmo mode
   const [transformMode, setTransformMode] = useState<"translate" | "rotate" | "scale">("rotate");
   // Snap settings
@@ -1847,6 +1868,94 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
         {shouldShowChrome ? "✕" : "☰"}
       </button>
 
+      {/* Keyframe preview — persistent top-down composite */}
+      {keyframePreviewUrl && shouldShowChrome && (
+        <div
+          title="Keyframe preview (top-down composite)"
+          style={{
+            position: "absolute",
+            top: 12,
+            right: viewMode === "layers" ? 260 : 12,
+            width: 80,
+            height: 80,
+            borderRadius: 8,
+            overflow: "hidden",
+            border: "1px solid var(--hud-border)",
+            background: "var(--hud-bg)",
+            zIndex: 11,
+            transition: "right 0.2s",
+          }}
+        >
+          <img
+            src={keyframePreviewUrl}
+            alt="Keyframe"
+            style={{
+              width: "100%",
+              height: "100%",
+              objectFit: "contain",
+            }}
+          />
+          <span style={{
+            position: "absolute",
+            bottom: 2,
+            left: 0,
+            right: 0,
+            textAlign: "center",
+            fontSize: 7,
+            color: "var(--hud-muted)",
+            textTransform: "uppercase",
+            letterSpacing: 0.5,
+          }}>Keyframe</span>
+        </div>
+      )}
+
+      {/* AI History toggle button */}
+      {shouldShowChrome && selectedLayerIndex !== null && getSliceHistory && (() => {
+        const graph = getSliceHistory(selectedLayerIndex);
+        if (!graph) return null;
+        return (
+          <button
+            type="button"
+            onClick={() => { setHistoryPanelLayer(historyPanelLayer === selectedLayerIndex ? null : selectedLayerIndex); }}
+            title="Open AI History panel"
+            style={{
+              position: "absolute",
+              top: keyframePreviewUrl ? 100 : 12,
+              right: viewMode === "layers" ? 260 : 12,
+              padding: "5px 10px",
+              borderRadius: 6,
+              background: historyPanelLayer !== null ? "var(--hud-active)" : "var(--hud-bg)",
+              border: historyPanelLayer !== null ? "1px solid var(--scrubber-active)" : "1px solid var(--hud-border)",
+              color: historyPanelLayer !== null ? "var(--scrubber-active)" : "var(--hud-text)",
+              fontSize: 10,
+              fontWeight: 600,
+              cursor: "pointer",
+              zIndex: 11,
+              transition: "right 0.2s, top 0.2s",
+            }}
+          >
+            🕰 History
+          </button>
+        );
+      })()}
+
+      {/* Universal AI History Panel */}
+      {historyPanelLayer !== null && getSliceHistory && onSetDisplayCursor && onSetOperationCursor && (() => {
+        const graph = getSliceHistory(historyPanelLayer);
+        if (!graph) return null;
+        return (
+          <AIHistoryPanel
+            layerIndex={historyPanelLayer}
+            graph={graph}
+            payloads={payloads}
+            onSetDisplayCursor={onSetDisplayCursor}
+            onSetOperationCursor={onSetOperationCursor}
+            onClose={() => { setHistoryPanelLayer(null); }}
+            documentSourceImageId={documentSourceImageId}
+          />
+        );
+      })()}
+
       {/* Segment display mode toggle (masked original vs colored segments) */}
       {shouldShowChrome && layerCount > 1 && (
         <button
@@ -1973,6 +2082,10 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
           onToggleSnap={() => { setSnapEnabled((s) => !s); }}
           modelTransform={selectedLayerIndex !== null && selectedLayerIndex in layerGlbUrls ? modelTransform : undefined}
           onApplyTransform={handleApplyTransform}
+          getSliceHistory={getSliceHistory}
+          onSetDisplayCursor={onSetDisplayCursor}
+          onSetOperationCursor={onSetOperationCursor}
+          payloads={payloads}
         />
       )}
 

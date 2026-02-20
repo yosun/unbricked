@@ -3,6 +3,8 @@ import { AI_EDIT_MODELS, getAiEditModel } from "../services/falProxy";
 import type { Object3DTransform, PivotFace } from "./SpaceViewport";
 import { PIVOT_FACES, PIVOT_FACE_LABELS } from "./SpaceViewport";
 import { TransformPanel } from "./LayerControlsHUD";
+import type { SliceHistoryGraph, StateNode } from "../core/history/aiHistorySchema";
+import { getSeedPathIds, getPathHeadStateId, getAncestryPath } from "../core/history/historyGraph";
 
 interface LayersPanelProps {
   layerCount: number;
@@ -38,6 +40,11 @@ interface LayersPanelProps {
   threeDSourceHidden: Set<number>;
   onToggle3DSourceImage: (index: number) => void;
   transformPivot: PivotFace;
+  // AI History
+  getSliceHistory?: ((layerIndex: number) => SliceHistoryGraph | null) | undefined;
+  onSetDisplayCursor?: ((layerIndex: number, stateId: string) => void) | undefined;
+  onSetOperationCursor?: ((layerIndex: number, stateId: string) => void) | undefined;
+  payloads?: Record<string, { uri: string; meta: Record<string, string> }> | undefined;
   onSetTransformPivot: (face: PivotFace) => void;
   transformMode: "translate" | "rotate" | "scale";
   onSetTransformMode: (mode: "translate" | "rotate" | "scale") => void;
@@ -93,6 +100,10 @@ export default function LayersPanel(props: LayersPanelProps): React.JSX.Element 
     onToggle3DSourceImage,
     transformPivot,
     onSetTransformPivot,
+    getSliceHistory: getSliceHistoryProp,
+    onSetDisplayCursor: onSetDisplayCursorProp,
+    onSetOperationCursor: onSetOperationCursorProp,
+    payloads: payloadsProp,
     transformMode,
     onSetTransformMode,
     snapEnabled,
@@ -123,6 +134,11 @@ export default function LayersPanel(props: LayersPanelProps): React.JSX.Element 
   const [showAiPromptLayer, setShowAiPromptLayer] = useState<number | null>(null);
   const [promptText, setPromptText] = useState("");
   const [strength, setStrength] = useState(0.75);
+
+  /** Which layer's history panel is open (by layer index), or null */
+  const [historyPanelLayer, setHistoryPanelLayer] = useState<number | null>(null);
+  /** Which seed path is selected in the history panel */
+  const [selectedPathId, setSelectedPathId] = useState<string | null>(null);
 
   const handleDragPointerDown = useCallback(
     (viewIdx: number, e: React.PointerEvent<HTMLSpanElement>) => {
@@ -374,6 +390,38 @@ export default function LayersPanel(props: LayersPanelProps): React.JSX.Element 
                   >
                     Layer {layerIdx}
                   </span>
+                  {/* AI History ops badge */}
+                  {(() => {
+                    const graph = getSliceHistoryProp?.(layerIdx);
+                    if (!graph) return null;
+                    const opsCount = Object.keys(graph.ops).length;
+                    if (opsCount === 0) return null;
+                    return (
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setHistoryPanelLayer(historyPanelLayer === layerIdx ? null : layerIdx);
+                          setSelectedPathId(null);
+                        }}
+                        title={`${String(opsCount)} AI op${opsCount > 1 ? "s" : ""}`}
+                        style={{
+                          background: historyPanelLayer === layerIdx ? "var(--scrubber-active)" : "var(--hud-active)",
+                          border: "1px solid var(--hud-border-btn)",
+                          borderRadius: 8,
+                          padding: "0 5px",
+                          fontSize: 9,
+                          fontWeight: 700,
+                          color: historyPanelLayer === layerIdx ? "var(--btn-primary-text)" : "var(--scrubber-active)",
+                          cursor: "pointer",
+                          lineHeight: "16px",
+                          flexShrink: 0,
+                        }}
+                      >
+                        {opsCount}
+                      </button>
+                    );
+                  })()}
                   <span
                     onClick={(e) => {
                       e.stopPropagation();
@@ -702,6 +750,244 @@ export default function LayersPanel(props: LayersPanelProps): React.JSX.Element 
           )}
         </div>
       )}
+
+      {/* AI History panel for selected layer */}
+      {historyPanelLayer !== null && (() => {
+        const graph = getSliceHistoryProp?.(historyPanelLayer);
+        if (!graph) return null;
+        const seedPaths = getSeedPathIds(graph);
+        const rootNode = graph.states[graph.rootStateId];
+        const displayNode = graph.states[graph.displayStateId];
+        const operationNode = graph.states[graph.operationStateId];
+
+        // Get thumbnail URL helper
+        const thumbUrl = (node: StateNode | undefined): string | null => {
+          if (!node) return null;
+          const thumbPid = node.assetRefs.thumb ?? node.assetRefs.image;
+          if (!thumbPid || !payloadsProp) return null;
+          return payloadsProp[thumbPid]?.uri ?? null;
+        };
+
+        // Get ancestry for the selected path
+        const activePath = selectedPathId ?? (seedPaths.length > 0 ? seedPaths[0]! : null);
+        const activeHead = activePath ? getPathHeadStateId(graph, activePath) : null;
+        const ancestryIds = activeHead ? getAncestryPath(graph, activeHead) : [];
+
+        return (
+          <div style={{
+            flexShrink: 0,
+            borderTop: "1px solid var(--hud-border)",
+            maxHeight: 300,
+            overflowY: "auto",
+          }}>
+            {/* Header: Slice Root + Current */}
+            <div style={{
+              padding: "8px 10px",
+              borderBottom: "1px solid var(--hud-border)",
+              display: "flex",
+              gap: 8,
+              alignItems: "center",
+            }}>
+              {/* Slice Root thumbnail */}
+              <div style={{ textAlign: "center" }}>
+                <div
+                  onClick={() => {
+                    if (rootNode) onSetDisplayCursorProp?.(historyPanelLayer, rootNode.stateId);
+                  }}
+                  style={{
+                    width: 36, height: 36, borderRadius: 4, overflow: "hidden",
+                    border: graph.displayStateId === graph.rootStateId ? "2px solid var(--scrubber-active)" : "1px solid var(--hud-border-btn)",
+                    cursor: "pointer",
+                    position: "relative",
+                    background: "var(--hud-active)",
+                  }}
+                >
+                  {thumbUrl(rootNode) && (
+                    <img src={thumbUrl(rootNode)!} alt="Root" style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+                  )}
+                  {graph.displayStateId === graph.rootStateId && (
+                    <span style={{ position: "absolute", top: 0, right: 1, fontSize: 8 }}>👁</span>
+                  )}
+                  {graph.operationStateId === graph.rootStateId && (
+                    <span style={{ position: "absolute", bottom: 0, right: 1, fontSize: 8 }}>⚙</span>
+                  )}
+                </div>
+                <div style={{ fontSize: 7, color: "var(--hud-muted)", marginTop: 2 }}>Root</div>
+              </div>
+
+              <span style={{ fontSize: 10, color: "var(--hud-muted)" }}>→</span>
+
+              {/* Current (display) thumbnail */}
+              <div style={{ textAlign: "center" }}>
+                <div style={{
+                  width: 36, height: 36, borderRadius: 4, overflow: "hidden",
+                  border: "2px solid var(--scrubber-active)",
+                  background: "var(--hud-active)",
+                  position: "relative",
+                }}>
+                  {thumbUrl(displayNode) && (
+                    <img src={thumbUrl(displayNode)!} alt="Current" style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+                  )}
+                  <span style={{ position: "absolute", top: 0, right: 1, fontSize: 8 }}>👁</span>
+                  {graph.operationStateId === graph.displayStateId && (
+                    <span style={{ position: "absolute", bottom: 0, right: 1, fontSize: 8 }}>⚙</span>
+                  )}
+                </div>
+                <div style={{ fontSize: 7, color: "var(--hud-muted)", marginTop: 2 }}>Current</div>
+              </div>
+
+              <div style={{ flex: 1 }} />
+              <button
+                type="button"
+                onClick={() => { setHistoryPanelLayer(null); }}
+                style={{
+                  background: "none", border: "none", color: "var(--hud-muted)",
+                  cursor: "pointer", fontSize: 12,
+                }}
+              >✕</button>
+            </div>
+
+            {/* Seed path heads */}
+            {seedPaths.length > 0 && (
+              <div style={{
+                padding: "6px 10px",
+                borderBottom: "1px solid var(--hud-border)",
+              }}>
+                <div style={{ fontSize: 8, color: "var(--hud-muted)", textTransform: "uppercase", letterSpacing: 0.8, marginBottom: 4 }}>
+                  Seed Paths ({String(seedPaths.length)}) · {Object.keys(graph.ops).length} op{Object.keys(graph.ops).length !== 1 ? "s" : ""}
+                </div>
+                <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+                  {seedPaths.map((pathId) => {
+                    const headId = getPathHeadStateId(graph, pathId);
+                    const headNode = graph.states[headId];
+                    const isCurrentPath = activePath === pathId;
+                    const displayInPath = displayNode?.seedPathId === pathId;
+                    const opInPath = operationNode?.seedPathId === pathId;
+                    return (
+                      <div
+                        key={pathId}
+                        onClick={() => {
+                          setSelectedPathId(pathId);
+                          if (headNode) onSetDisplayCursorProp?.(historyPanelLayer, headId);
+                        }}
+                        style={{
+                          width: 40, height: 40, borderRadius: 4, overflow: "hidden",
+                          border: isCurrentPath
+                            ? "2px solid var(--scrubber-active)"
+                            : displayInPath
+                              ? "2px solid var(--scrubber-active)"
+                              : "1px solid var(--hud-border-btn)",
+                          cursor: "pointer",
+                          position: "relative",
+                          background: "var(--hud-active)",
+                          flexShrink: 0,
+                        }}
+                        title={`Path ${pathId.slice(0, 8)}${displayInPath ? " (current)" : ""}`}
+                      >
+                        {thumbUrl(headNode) && (
+                          <img src={thumbUrl(headNode)!} alt="Head" style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+                        )}
+                        {displayInPath && (
+                          <span style={{ position: "absolute", top: 0, right: 1, fontSize: 7 }}>👁</span>
+                        )}
+                        {opInPath && (
+                          <span style={{ position: "absolute", bottom: 0, right: 1, fontSize: 7 }}>⚙</span>
+                        )}
+                        {headNode?.meta.opType && (
+                          <span style={{
+                            position: "absolute", bottom: 0, left: 0, right: 0,
+                            fontSize: 6, textAlign: "center",
+                            background: "rgba(0,0,0,0.6)", color: "#fff",
+                            padding: "0 1px", lineHeight: "10px",
+                          }}>
+                            {headNode.meta.opType}
+                          </span>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            {/* Ancestry chain for selected path */}
+            {ancestryIds.length > 0 && (
+              <div style={{ padding: "6px 10px" }}>
+                <div style={{ fontSize: 8, color: "var(--hud-muted)", textTransform: "uppercase", letterSpacing: 0.8, marginBottom: 4 }}>
+                  Path History ({ancestryIds.length - 1} op{ancestryIds.length - 1 !== 1 ? "s" : ""})
+                </div>
+                <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+                  {ancestryIds.map((stateId) => {
+                    const node = graph.states[stateId];
+                    if (!node) return null;
+                    const isDisplay = stateId === graph.displayStateId;
+                    const isOp = stateId === graph.operationStateId;
+                    return (
+                      <div
+                        key={stateId}
+                        style={{
+                          display: "flex", alignItems: "center", gap: 6,
+                          padding: "3px 4px", borderRadius: 4,
+                          background: isDisplay ? "var(--hud-active)" : "transparent",
+                          cursor: "pointer",
+                        }}
+                        onClick={() => {
+                          onSetDisplayCursorProp?.(historyPanelLayer, stateId);
+                        }}
+                      >
+                        <div style={{
+                          width: 28, height: 28, borderRadius: 3, overflow: "hidden", flexShrink: 0,
+                          border: isDisplay ? "1.5px solid var(--scrubber-active)" : "1px solid var(--hud-border-btn)",
+                          background: "var(--hud-active)",
+                          position: "relative",
+                        }}>
+                          {thumbUrl(node) && (
+                            <img src={thumbUrl(node)!} alt="" style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+                          )}
+                          {isDisplay && <span style={{ position: "absolute", top: -1, right: 0, fontSize: 7 }}>👁</span>}
+                          {isOp && <span style={{ position: "absolute", bottom: -1, right: 0, fontSize: 7 }}>⚙</span>}
+                        </div>
+                        <div style={{ flex: 1, minWidth: 0 }}>
+                          <div style={{
+                            fontSize: 10,
+                            color: isDisplay ? "var(--scrubber-active)" : "var(--hud-text)",
+                            fontWeight: isDisplay ? 600 : 400,
+                            overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+                          }}>
+                            {node.meta.label}
+                          </div>
+                          {node.meta.opType && (
+                            <div style={{ fontSize: 8, color: "var(--hud-muted)" }}>
+                              {node.meta.opType}
+                            </div>
+                          )}
+                        </div>
+                        {!isOp && stateId !== graph.rootStateId && (
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              onSetOperationCursorProp?.(historyPanelLayer, stateId);
+                            }}
+                            title="Use as input for next AI op"
+                            style={{
+                              background: "none", border: "1px solid var(--hud-border-btn)",
+                              borderRadius: 3, padding: "1px 4px", fontSize: 7,
+                              color: "var(--hud-muted)", cursor: "pointer", flexShrink: 0,
+                            }}
+                          >
+                            ⚙ Use
+                          </button>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+          </div>
+        );
+      })()}
 
       {/* Inline opacity slider when editing */}
       {editingOpacityLayer !== null && (

@@ -29,9 +29,21 @@ import {
   loadPreferences,
   savePreferences,
 } from "./core";
-import type { AnnotationId, Edge, GraphPatch, GraphPatchOp, JsonObject, PayloadId, ProjectState, SpaceId } from "./core";
+import type { AnnotationId, Edge, GraphPatch, GraphPatchOp, JsonObject, PayloadId, ProjectState, SpaceId, OperatorRunId } from "./core";
 import type { ProjectPreferences } from "./core/preferences";
-import { findPortalEdges } from "./core";
+import { findPortalEdges, findAIHistory, findSliceIds } from "./core";
+import {
+  createSpaceAIHistory,
+  ensureHistoryGraphForSlice,
+  addOpResultToGraph,
+  getSeedPathIds,
+  setDisplayCursor,
+  setOperationCursor,
+  serializeAIHistory,
+  SPACE_AI_HISTORY_SCHEMA,
+} from "./core/history/historyGraph";
+import type { SpaceAIHistory } from "./core/history/aiHistorySchema";
+import type { OpType } from "./core/history/aiHistorySchema";
 import { runImg2Img, runTextToImg, runNanoBananaEdit, fetchImageBlob, applyAlphaMask, invertAlpha, invertMaskWithOriginal, getAiEditModel, combineMasksToOriginal, refitAiResult, runImageTo3D, runBackgroundRemoval } from "./services/falProxy";
 import type { CropInfo } from "./services/falProxy";
 import { runOperation } from "./services/operationRunner";
@@ -682,6 +694,93 @@ export default function App(): React.JSX.Element {
     return null;
   }, [layerCount, layerRender, state.payloads]);
 
+  /** Keyframe preview: composite all visible/display-state layers top-down into a single image. */
+  const [keyframePreviewUrl, setKeyframePreviewUrl] = useState<string | null>(null);
+  useEffect(() => {
+    // Only build if we have textures
+    const textureEntries = Object.entries(layerTextures);
+    if (textureEntries.length === 0) {
+      setKeyframePreviewUrl(null);
+      return;
+    }
+
+    let cancelled = false;
+
+    void (async () => {
+      try {
+        // Load all visible layer images
+        const images: { idx: number; img: HTMLImageElement }[] = [];
+        await Promise.all(
+          textureEntries.map(async ([idxStr, uri]) => {
+            const idx = Number(idxStr);
+            const vis = layerVisibility[idx];
+            if (vis && !vis.visible) return; // skip hidden layers
+            const img = new Image();
+            img.src = uri;
+            await new Promise<void>((resolve, reject) => {
+              img.onload = () => { resolve(); };
+              img.onerror = () => { reject(new Error("img load failed")); };
+            });
+            if (!cancelled) images.push({ idx, img });
+          }),
+        );
+        if (cancelled || images.length === 0) return;
+
+        // Find max dimensions
+        let maxW = 0, maxH = 0;
+        for (const { img } of images) {
+          if (img.naturalWidth > maxW) maxW = img.naturalWidth;
+          if (img.naturalHeight > maxH) maxH = img.naturalHeight;
+        }
+        if (maxW === 0 || maxH === 0) return;
+
+        // Cap size for performance
+        const scale = Math.min(1, 200 / Math.max(maxW, maxH));
+        const cW = Math.round(maxW * scale);
+        const cH = Math.round(maxH * scale);
+
+        const canvas = document.createElement("canvas");
+        canvas.width = cW;
+        canvas.height = cH;
+        const ctx = canvas.getContext("2d");
+        if (!ctx) return;
+
+        // Sort by order (bottom to top)
+        images.sort((a, b) => {
+          const posA = effectiveOrder.indexOf(a.idx);
+          const posB = effectiveOrder.indexOf(b.idx);
+          return posA - posB;
+        });
+
+        // Draw each layer using its crop info if available
+        for (const { idx, img } of images) {
+          const vis = layerVisibility[idx];
+          const texOpacity = vis ? vis.textureOpacity : 1;
+          ctx.globalAlpha = texOpacity;
+
+          const crop = layerCropInfo[idx];
+          if (crop && crop.origW > 0 && crop.origH > 0) {
+            const sx = (crop.cropX / crop.origW) * cW;
+            const sy = (crop.cropY / crop.origH) * cH;
+            const sw = (crop.cropW / crop.origW) * cW;
+            const sh = (crop.cropH / crop.origH) * cH;
+            ctx.drawImage(img, sx, sy, sw, sh);
+          } else {
+            ctx.drawImage(img, 0, 0, cW, cH);
+          }
+        }
+
+        if (!cancelled) {
+          setKeyframePreviewUrl(canvas.toDataURL("image/png"));
+        }
+      } catch {
+        // Silently ignore — keyframe preview is optional
+      }
+    })();
+
+    return () => { cancelled = true; };
+  }, [layerTextures, layerVisibility, effectiveOrder, layerCropInfo]);
+
   /**
    * Helper: emit a render-mapping update patch.
    * Takes the current render annotation (or creates one) and applies an updater.
@@ -717,6 +816,216 @@ export default function App(): React.JSX.Element {
       });
     },
     [activeSpaceId, commitPatch],
+  );
+
+  /* ── AI History helpers ───────────────────────── */
+
+  /** Get or initialize stable slice IDs for the active space. */
+  const getOrCreateSliceIds = useCallback(
+    (prev: ProjectState, spaceId: SpaceId): { sliceIds: string[]; ops: GraphPatchOp[] } => {
+      const existing = findSliceIds(prev, spaceId);
+      if (existing) {
+        const space = prev.spaces[spaceId];
+        const count = space?.layerCount ?? 0;
+        // Extend if needed (new layers added)
+        if (existing.ids.length >= count) {
+          return { sliceIds: existing.ids, ops: [] };
+        }
+        const extended = [...existing.ids];
+        while (extended.length < count) {
+          extended.push(makeId("slice" as "slice"));
+        }
+        const ann: JsonObject = {
+          id: existing.annotationId,
+          kind: "Annotation",
+          target: { kind: "Space", id: spaceId },
+          schema: "ui.layers.sliceIds",
+          data: { ids: JSON.stringify(extended) },
+          createdAt: new Date().toISOString(),
+        };
+        return { sliceIds: extended, ops: [putOp("Annotation", existing.annotationId, ann)] };
+      }
+      // Create new
+      const space = prev.spaces[spaceId];
+      const count = space?.layerCount ?? 1;
+      const ids: string[] = [];
+      for (let i = 0; i < count; i++) {
+        ids.push(makeId("slice" as "slice"));
+      }
+      const annId = makeId("annotation");
+      const ann: JsonObject = {
+        id: annId,
+        kind: "Annotation",
+        target: { kind: "Space", id: spaceId },
+        schema: "ui.layers.sliceIds",
+        data: { ids: JSON.stringify(ids) },
+        createdAt: new Date().toISOString(),
+      };
+      return { sliceIds: ids, ops: [putOp("Annotation", annId, ann)] };
+    },
+    [],
+  );
+
+  /** Get or initialize the AI history for the active space. */
+  const getOrCreateAIHistory = useCallback(
+    (
+      prev: ProjectState,
+      spaceId: SpaceId,
+      sliceIds: string[],
+    ): { history: SpaceAIHistory; annotationId: AnnotationId; ops: GraphPatchOp[] } => {
+      const existing = findAIHistory(prev, spaceId);
+      if (existing) {
+        return { history: existing.history, annotationId: existing.annotationId, ops: [] };
+      }
+      // Initialize: create root state for each slice that has a render payload
+      let history = createSpaceAIHistory();
+      const render = findLayerRender(prev, spaceId);
+      for (let i = 0; i < sliceIds.length; i++) {
+        const sliceId = sliceIds[i]!;
+        const pid = layerPayloadId(render, i);
+        if (pid) {
+          history = ensureHistoryGraphForSlice(history, sliceId, {
+            image: pid as PayloadId,
+          });
+        }
+      }
+      const annId = makeId("annotation");
+      const ann: JsonObject = {
+        id: annId,
+        kind: "Annotation",
+        target: { kind: "Space", id: spaceId },
+        schema: SPACE_AI_HISTORY_SCHEMA,
+        data: serializeAIHistory(history) as unknown as Record<string, string>,
+        createdAt: new Date().toISOString(),
+      };
+      return { history, annotationId: annId, ops: [putOp("Annotation", annId, ann)] };
+    },
+    [],
+  );
+
+  /** Commit an AI history update as a patch operation. */
+  const buildHistoryPatchOp = useCallback(
+    (
+      history: SpaceAIHistory,
+      annotationId: AnnotationId,
+      spaceId: SpaceId,
+    ): GraphPatchOp => {
+      const ann: JsonObject = {
+        id: annotationId,
+        kind: "Annotation",
+        target: { kind: "Space", id: spaceId },
+        schema: SPACE_AI_HISTORY_SCHEMA,
+        data: serializeAIHistory(history) as unknown as Record<string, string>,
+        createdAt: new Date().toISOString(),
+      };
+      return putOp("Annotation", annotationId, ann);
+    },
+    [],
+  );
+
+  /** Current AI history for the active space (memoized). */
+  const aiHistory = useMemo(
+    () => findAIHistory(state, activeSpaceId),
+    [state, activeSpaceId],
+  );
+
+  /** Current slice IDs for the active space (memoized). */
+  const sliceIdsResult = useMemo(
+    () => findSliceIds(state, activeSpaceId),
+    [state, activeSpaceId],
+  );
+
+  /** Get the sliceId for a given layer index. */
+  const getSliceIdForLayer = useCallback(
+    (layerIndex: number): string | null => {
+      if (!sliceIdsResult) return null;
+      return sliceIdsResult.ids[layerIndex] ?? null;
+    },
+    [sliceIdsResult],
+  );
+
+  /** Get the SliceHistoryGraph for a given layer index. */
+  const getSliceHistory = useCallback(
+    (layerIndex: number) => {
+      const sliceId = getSliceIdForLayer(layerIndex);
+      if (!sliceId || !aiHistory) return null;
+      return aiHistory.history.slices[sliceId] ?? null;
+    },
+    [getSliceIdForLayer, aiHistory],
+  );
+
+  /** Set the display cursor for a slice (by layer index) and update render annotation. */
+  const handleSetDisplayCursor = useCallback(
+    (layerIndex: number, stateId: string) => {
+      commitPatch((prev) => {
+        const { sliceIds, ops: sliceOps } = getOrCreateSliceIds(prev, activeSpaceId);
+        const sliceId = sliceIds[layerIndex];
+        if (!sliceId) return null;
+
+        const { history, annotationId, ops: histOps } = getOrCreateAIHistory(prev, activeSpaceId, sliceIds);
+        const graph = history.slices[sliceId];
+        if (!graph) return null;
+
+        const stateNode = graph.states[stateId];
+        if (!stateNode) return null;
+
+        const updatedGraph = setDisplayCursor(graph, stateId);
+        const updatedHistory: SpaceAIHistory = {
+          ...history,
+          slices: { ...history.slices, [sliceId]: updatedGraph },
+        };
+
+        const allOps: GraphPatchOp[] = [...sliceOps, ...histOps];
+        allOps.push(buildHistoryPatchOp(updatedHistory, annotationId, activeSpaceId));
+
+        // Update render annotation to reflect new display state
+        if (stateNode.assetRefs.image) {
+          const existing = findLayerRender(prev, activeSpaceId);
+          const annId: AnnotationId = existing ? existing.annotationId : makeId("annotation");
+          const currentData = existing ? { ...existing.annotation.data } : {};
+          currentData[`payload.${String(layerIndex)}`] = stateNode.assetRefs.image;
+          const renderAnn: JsonObject = {
+            id: annId,
+            kind: "Annotation",
+            target: { kind: "Space", id: activeSpaceId },
+            schema: "ui.layers.render",
+            data: currentData,
+            createdAt: new Date().toISOString(),
+          };
+          allOps.push(putOp("Annotation", annId, renderAnn));
+        }
+
+        return newPatch({ baseRevision: prev.revision, ops: allOps });
+      });
+    },
+    [activeSpaceId, commitPatch, getOrCreateSliceIds, getOrCreateAIHistory, buildHistoryPatchOp],
+  );
+
+  /** Set the operation cursor for a slice (by layer index). */
+  const handleSetOperationCursor = useCallback(
+    (layerIndex: number, stateId: string) => {
+      commitPatch((prev) => {
+        const { sliceIds, ops: sliceOps } = getOrCreateSliceIds(prev, activeSpaceId);
+        const sliceId = sliceIds[layerIndex];
+        if (!sliceId) return null;
+
+        const { history, annotationId, ops: histOps } = getOrCreateAIHistory(prev, activeSpaceId, sliceIds);
+        const graph = history.slices[sliceId];
+        if (!graph) return null;
+
+        const updatedGraph = setOperationCursor(graph, stateId);
+        const updatedHistory: SpaceAIHistory = {
+          ...history,
+          slices: { ...history.slices, [sliceId]: updatedGraph },
+        };
+
+        const allOps: GraphPatchOp[] = [...sliceOps, ...histOps];
+        allOps.push(buildHistoryPatchOp(updatedHistory, annotationId, activeSpaceId));
+
+        return newPatch({ baseRevision: prev.revision, ops: allOps });
+      });
+    },
+    [activeSpaceId, commitPatch, getOrCreateSliceIds, getOrCreateAIHistory, buildHistoryPatchOp],
   );
 
   /**
@@ -790,11 +1099,48 @@ export default function App(): React.JSX.Element {
           },
         };
 
-        // Update the render annotation to point to the new payload
-        emitRenderUpdate(
-          (data) => ({ ...data, [`payload.${String(index)}`]: newPayloadId }),
-          [putOp("Payload", newPayloadId, newPayloadValue)],
-        );
+        // Update the render annotation + record in AI history
+        commitPatch((prev) => {
+          const patchOps: GraphPatchOp[] = [putOp("Payload", newPayloadId, newPayloadValue)];
+
+          const { sliceIds, ops: sliceOps } = getOrCreateSliceIds(prev, activeSpaceId);
+          const sliceId = sliceIds[index];
+          patchOps.push(...sliceOps);
+
+          if (sliceId) {
+            const { history, annotationId, ops: histOps } = getOrCreateAIHistory(prev, activeSpaceId, sliceIds);
+            patchOps.push(...histOps);
+
+            const existingPid = layerPayloadId(findLayerRender(prev, activeSpaceId), index);
+            const rootAssets: { image?: PayloadId } = {};
+            if (existingPid) rootAssets.image = existingPid as PayloadId;
+            let updatedHistory = ensureHistoryGraphForSlice(history, sliceId, rootAssets);
+            const graph = updatedHistory.slices[sliceId]!;
+
+            const result = addOpResultToGraph(graph, {
+              inputStateId: graph.operationStateId,
+              opType: "maskInvert",
+              outputAssets: [{ image: newPayloadId as PayloadId }],
+              sliceIndex: index,
+            });
+            updatedHistory = { ...updatedHistory, slices: { ...updatedHistory.slices, [sliceId]: result.graph } };
+            patchOps.push(buildHistoryPatchOp(updatedHistory, annotationId, activeSpaceId));
+          }
+
+          // Render annotation update
+          const existing = findLayerRender(prev, activeSpaceId);
+          const annId: AnnotationId = existing ? existing.annotationId : makeId("annotation");
+          const currentData = existing ? { ...existing.annotation.data } : {};
+          currentData[`payload.${String(index)}`] = newPayloadId;
+          patchOps.push(putOp("Annotation", annId, {
+            id: annId, kind: "Annotation",
+            target: { kind: "Space", id: activeSpaceId },
+            schema: "ui.layers.render", data: currentData,
+            createdAt: new Date().toISOString(),
+          }));
+
+          return newPatch({ baseRevision: prev.revision, ops: patchOps });
+        });
 
         // Toggle the maskInverted annotation flag
         emitPropsUpdate((data) => {
@@ -809,7 +1155,7 @@ export default function App(): React.JSX.Element {
         console.error("[InvertMask] failed:", err);
       }
     },
-[layerRender, state.payloads, emitRenderUpdate, emitPropsUpdate, layerCropInfo],
+[layerRender, state.payloads, commitPatch, activeSpaceId, emitPropsUpdate, layerCropInfo, getOrCreateSliceIds, getOrCreateAIHistory, buildHistoryPatchOp],
   );
 
   /** Combine user-selected masks into a new layer. */
@@ -908,6 +1254,32 @@ export default function App(): React.JSX.Element {
             createdAt: new Date().toISOString(),
           }));
 
+          // Record in AI history: create a new slice with maskCombine root
+          const { sliceIds, ops: sliceOps } = getOrCreateSliceIds(prev, activeSpaceId);
+          // Extend sliceIds for the new layer
+          const extendedSliceIds = [...sliceIds];
+          const newSliceId = makeId("hslice" as "hslice");
+          extendedSliceIds[newLayerIdx] = newSliceId;
+          ops.push(...sliceOps);
+
+          // Update sliceIds annotation with extended array
+          const existingSliceIdsResult = findSliceIds(prev, activeSpaceId);
+          const sliceIdsAnnId = existingSliceIdsResult ? existingSliceIdsResult.annotationId : makeId("annotation");
+          ops.push(putOp("Annotation", sliceIdsAnnId, {
+            id: sliceIdsAnnId,
+            kind: "Annotation",
+            target: { kind: "Space", id: activeSpaceId },
+            schema: "ui.layers.sliceIds",
+            data: { ids: extendedSliceIds.join(",") },
+            createdAt: new Date().toISOString(),
+          }));
+
+          const { history, annotationId: histAnnId, ops: histOps } = getOrCreateAIHistory(prev, activeSpaceId, extendedSliceIds);
+          ops.push(...histOps);
+          // Ensure graph for the new slice with the combined payload as root
+          const updatedHistory = ensureHistoryGraphForSlice(history, newSliceId, { image: newPayloadId as PayloadId });
+          ops.push(buildHistoryPatchOp(updatedHistory, histAnnId, activeSpaceId));
+
           return newPatch({ baseRevision: prev.revision, ops });
         });
 
@@ -918,7 +1290,7 @@ export default function App(): React.JSX.Element {
         setCombining(false);
       }
     },
-    [layerRender, state.payloads, activeSpaceId, commitPatch],
+    [layerRender, state.payloads, activeSpaceId, commitPatch, getOrCreateSliceIds, getOrCreateAIHistory, buildHistoryPatchOp],
   );
 
   /** Toggle source-image visibility for a layer that has a 3D model. */
@@ -1156,6 +1528,32 @@ export default function App(): React.JSX.Element {
             createdAt: new Date().toISOString(),
           }));
 
+          // Record in AI history
+          const { sliceIds, ops: sliceOps } = getOrCreateSliceIds(prev, activeSpaceId);
+          const sliceId = sliceIds[index];
+          ops.push(...sliceOps);
+
+          if (sliceId) {
+            const { history, annotationId: histAnnId, ops: histOps } = getOrCreateAIHistory(prev, activeSpaceId, sliceIds);
+            ops.push(...histOps);
+
+            const existingPid = layerPayloadId(findLayerRender(prev, activeSpaceId), index);
+            const rootAssets: { image?: PayloadId } = {};
+            if (existingPid) rootAssets.image = existingPid as PayloadId;
+            let updatedHistory = ensureHistoryGraphForSlice(history, sliceId, rootAssets);
+            const graph = updatedHistory.slices[sliceId]!;
+
+            const histResult = addOpResultToGraph(graph, {
+              inputStateId: graph.operationStateId,
+              opType: "imageTo3D",
+              outputAssets: [{ image: (layerPayloadId(findLayerRender(prev, activeSpaceId), index) ?? glbPayloadId) as PayloadId, glb: glbPayloadId as PayloadId }],
+              summary: { model: "sam3" },
+              sliceIndex: index,
+            });
+            updatedHistory = { ...updatedHistory, slices: { ...updatedHistory.slices, [sliceId]: histResult.graph } };
+            ops.push(buildHistoryPatchOp(updatedHistory, histAnnId, activeSpaceId));
+          }
+
           return newPatch({ baseRevision: prev.revision, ops });
         });
 
@@ -1175,7 +1573,7 @@ export default function App(): React.JSX.Element {
         abortRef.current = null;
       }
     },
-    [generating3DLayer, layerRender, state.payloads, commitPatch, activeSpaceId, layerProps, layerCount, layerTextures],
+    [generating3DLayer, layerRender, state.payloads, commitPatch, activeSpaceId, layerProps, layerCount, layerTextures, getOrCreateSliceIds, getOrCreateAIHistory, buildHistoryPatchOp],
   );
 
   /** Import an image file into the selected layer. */
@@ -1224,11 +1622,48 @@ export default function App(): React.JSX.Element {
     };
 
     const layerIdx = effectiveSelectedIndex;
-    emitRenderUpdate(
-      (data) => ({ ...data, [`payload.${String(layerIdx)}`]: payloadId }),
-      [putOp("Payload", payloadId, payloadValue)],
-    );
-  }, [effectiveSelectedIndex, emitRenderUpdate]);
+    commitPatch((prev) => {
+      const patchOps: GraphPatchOp[] = [putOp("Payload", payloadId, payloadValue)];
+
+      const { sliceIds, ops: sliceOps } = getOrCreateSliceIds(prev, activeSpaceId);
+      const sliceId = sliceIds[layerIdx];
+      patchOps.push(...sliceOps);
+
+      if (sliceId) {
+        const { history, annotationId, ops: histOps } = getOrCreateAIHistory(prev, activeSpaceId, sliceIds);
+        patchOps.push(...histOps);
+
+        const existingPid = layerPayloadId(findLayerRender(prev, activeSpaceId), layerIdx);
+        const rootAssets: { image?: PayloadId } = {};
+        if (existingPid) rootAssets.image = existingPid as PayloadId;
+        let updatedHistory = ensureHistoryGraphForSlice(history, sliceId, rootAssets);
+        const graph = updatedHistory.slices[sliceId]!;
+
+        const result = addOpResultToGraph(graph, {
+          inputStateId: graph.operationStateId,
+          opType: "import",
+          outputAssets: [{ image: payloadId as PayloadId }],
+          sliceIndex: layerIdx,
+        });
+        updatedHistory = { ...updatedHistory, slices: { ...updatedHistory.slices, [sliceId]: result.graph } };
+        patchOps.push(buildHistoryPatchOp(updatedHistory, annotationId, activeSpaceId));
+      }
+
+      // Render annotation update
+      const existing = findLayerRender(prev, activeSpaceId);
+      const annId: AnnotationId = existing ? existing.annotationId : makeId("annotation");
+      const currentData = existing ? { ...existing.annotation.data } : {};
+      currentData[`payload.${String(layerIdx)}`] = payloadId;
+      patchOps.push(putOp("Annotation", annId, {
+        id: annId, kind: "Annotation",
+        target: { kind: "Space", id: activeSpaceId },
+        schema: "ui.layers.render", data: currentData,
+        createdAt: new Date().toISOString(),
+      }));
+
+      return newPatch({ baseRevision: prev.revision, ops: patchOps });
+    });
+  }, [effectiveSelectedIndex, commitPatch, activeSpaceId, getOrCreateSliceIds, getOrCreateAIHistory, buildHistoryPatchOp]);
 
   /** Run AI edit on the selected layer's current image using the preferred model. */
   const handleAiEdit = useCallback(
@@ -1523,10 +1958,60 @@ export default function App(): React.JSX.Element {
         }
 
         const layerIdx = effectiveSelectedIndex;
-        emitRenderUpdate(
-          (data) => ({ ...data, [`payload.${String(layerIdx)}`]: finalPayloadId }),
-          patchOps,
-        );
+
+        // Record in AI history
+        commitPatch((prev) => {
+          const { sliceIds, ops: sliceOps } = getOrCreateSliceIds(prev, activeSpaceId);
+          const sliceId = sliceIds[layerIdx];
+          const allOps: GraphPatchOp[] = [...patchOps, ...sliceOps];
+
+          if (sliceId) {
+            const { history, annotationId, ops: histOps } = getOrCreateAIHistory(prev, activeSpaceId, sliceIds);
+            allOps.push(...histOps);
+
+            // Ensure graph exists for this slice
+            const existingPid = layerPayloadId(findLayerRender(prev, activeSpaceId), layerIdx);
+            const rootAssets: { image?: PayloadId; mask?: PayloadId } = {};
+            if (existingPid) rootAssets.image = existingPid as PayloadId;
+            let updatedHistory = ensureHistoryGraphForSlice(history, sliceId, rootAssets);
+
+            const graph = updatedHistory.slices[sliceId]!;
+
+            // Determine the opType
+            const aiOpType: OpType = sentMaskedInput ? "img2img" : "img2img";
+            const result = addOpResultToGraph(graph, {
+              inputStateId: graph.operationStateId,
+              opType: aiOpType,
+              operatorRunId: oprunId as OperatorRunId,
+              outputAssets: [{ image: finalPayloadId as PayloadId }],
+              summary: { model: modelDef.id, prompt },
+              sliceIndex: layerIdx,
+            });
+
+            updatedHistory = {
+              ...updatedHistory,
+              slices: { ...updatedHistory.slices, [sliceId]: result.graph },
+            };
+            allOps.push(buildHistoryPatchOp(updatedHistory, annotationId, activeSpaceId));
+          }
+
+          // Update render annotation
+          const existing = findLayerRender(prev, activeSpaceId);
+          const annId: AnnotationId = existing ? existing.annotationId : makeId("annotation");
+          const currentData = existing ? { ...existing.annotation.data } : {};
+          currentData[`payload.${String(layerIdx)}`] = finalPayloadId;
+          const renderAnn: JsonObject = {
+            id: annId,
+            kind: "Annotation",
+            target: { kind: "Space", id: activeSpaceId },
+            schema: "ui.layers.render",
+            data: currentData,
+            createdAt: new Date().toISOString(),
+          };
+          allOps.push(putOp("Annotation", annId, renderAnn));
+
+          return newPatch({ baseRevision: prev.revision, ops: allOps });
+        });
       } catch (err: unknown) {
         if (err instanceof DOMException && err.name === "AbortError") return;
         const msg = err instanceof Error ? err.message : "Unknown error";
@@ -1536,7 +2021,7 @@ export default function App(): React.JSX.Element {
         abortRef.current = null;
       }
     },
-    [effectiveSelectedIndex, layerRender, state.payloads, emitRenderUpdate, preferences.defaultAiEditModelId, layerProps, layerCount, layerTextures],
+    [effectiveSelectedIndex, layerRender, state.payloads, commitPatch, activeSpaceId, preferences.defaultAiEditModelId, layerProps, layerCount, layerTextures, getOrCreateSliceIds, getOrCreateAIHistory, buildHistoryPatchOp],
   );
 
   /* ── Ingest flow: Tabula Rasa → Image → BrickUI ── */
@@ -1671,6 +2156,18 @@ export default function App(): React.JSX.Element {
               allOps.push(putOp("Annotation", annId, annotationValue));
             }
 
+            // Initialize AI history with root states for each slice
+            const { sliceIds, ops: sliceOps } = getOrCreateSliceIds(prev, activeSpaceId);
+            allOps.push(...sliceOps);
+            const { history, annotationId: histAnnId, ops: histOps } = getOrCreateAIHistory(prev, activeSpaceId, sliceIds);
+            allOps.push(...histOps);
+            // Set documentSourceImageId to the layer-0 payload (source image)
+            const updatedHistory: SpaceAIHistory = {
+              ...history,
+              documentSourceImageId: payloadId as PayloadId,
+            };
+            allOps.push(buildHistoryPatchOp(updatedHistory, histAnnId, activeSpaceId));
+
             return newPatch({ baseRevision: prev.revision, ops: allOps });
           });
           // Dismiss the slicing overlay — reveals the expanded layers
@@ -1710,7 +2207,7 @@ export default function App(): React.JSX.Element {
         }
       }
     },
-    [activeSpaceId, commitPatch, handleSelectLayer],
+    [activeSpaceId, commitPatch, handleSelectLayer, getOrCreateSliceIds, getOrCreateAIHistory, buildHistoryPatchOp],
   );
 
   /** Update a preference and persist. */
@@ -2011,6 +2508,12 @@ export default function App(): React.JSX.Element {
           layerGlbUrls={layerGlbUrls}
           threeDSourceHidden={threeDSourceHidden}
           onToggle3DSourceImage={handleToggle3DSourceImage}
+          getSliceHistory={getSliceHistory}
+          onSetDisplayCursor={handleSetDisplayCursor}
+          onSetOperationCursor={handleSetOperationCursor}
+          payloads={state.payloads as Record<string, { uri: string; meta: Record<string, string> }>}
+          keyframePreviewUrl={keyframePreviewUrl}
+          documentSourceImageId={aiHistory?.history.documentSourceImageId}
         />
         <SpaceAddressHUD
           fallbackSpaceId={rootSpaceId}
@@ -2097,6 +2600,13 @@ export default function App(): React.JSX.Element {
                           };
                           allOps.push(putOp("Annotation", annId, annotationValue));
                         }
+                        // Initialize AI history with root states (retry path)
+                        const { sliceIds: retrySliceIds, ops: retrySliceOps } = getOrCreateSliceIds(prev, activeSpaceId);
+                        allOps.push(...retrySliceOps);
+                        const { history: retryHist, annotationId: retryHistAnnId, ops: retryHistOps } = getOrCreateAIHistory(prev, activeSpaceId, retrySliceIds);
+                        allOps.push(...retryHistOps);
+                        const updatedRetryHist: SpaceAIHistory = { ...retryHist, documentSourceImageId: ctx.payloadId as PayloadId };
+                        allOps.push(buildHistoryPatchOp(updatedRetryHist, retryHistAnnId, activeSpaceId));
                         return newPatch({ baseRevision: prev.revision, ops: allOps });
                       });
                       setSlicingImageUrl(null);
