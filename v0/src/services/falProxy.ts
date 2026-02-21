@@ -11,11 +11,14 @@ import { z } from "zod";
  *   Response: { images: [{ url, content_type?, width?, height? }], ... }
  */
 
-const PROXY_BASE = import.meta.env.VITE_FAL_PROXY_URL;
+const isLocalhost = window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1";
+const PROXY_BASE = isLocalhost
+  ? (import.meta.env.VITE_FAL_PROXY_LOCALHOST_URL || import.meta.env.VITE_FAL_PROXY_URL)
+  : import.meta.env.VITE_FAL_PROXY_URL;
 if (!PROXY_BASE) {
   throw new Error(
     "VITE_FAL_PROXY_URL environment variable is required. " +
-    "Please create a .env file with VITE_FAL_PROXY_URL set to your proxy endpoint."
+    "Please create a .env file with VITE_FAL_PROXY_URL and VITE_FAL_PROXY_LOCALHOST_URL set to your proxy endpoints."
   );
 }
 
@@ -180,7 +183,7 @@ async function falQueueSubmit(
   body: Record<string, unknown>,
   signal?: AbortSignal,
 ): Promise<FalQueueSubmitResponse> {
-  const url = `${PROXY_BASE}/${modelPath}?fal_webhook=`;
+  const url = `${PROXY_BASE}/${modelPath}`;
   const resp = await proxyFetch(
     url,
     {

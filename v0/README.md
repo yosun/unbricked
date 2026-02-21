@@ -162,7 +162,14 @@ pnpm i
 pnpm dev          # Vite dev server
 ```
 
-Requires a `.env` file with `VITE_FAL_PROXY_URL` pointing to your fal.ai drop-in proxy endpoint.
+Requires a `.env` file with fal.ai proxy endpoints (see `.env.example`):
+
+| Variable | Purpose |
+|----------|--------|
+| `VITE_FAL_PROXY_URL` | Production proxy (CORS-locked to `*.unbricked.xyz`) |
+| `VITE_FAL_PROXY_LOCALHOST_URL` | Dev proxy (allows `localhost` origins) |
+
+The app auto-selects the correct proxy based on hostname — localhost uses the dev proxy, deployed builds use the production proxy.
 
 ## Quality gates
 
@@ -189,7 +196,7 @@ The deploy script builds the app, syncs to S3, and invalidates the CloudFront ca
 
 **Prerequisites:**
 - AWS CLI installed (`brew install awscli`)
-- `.env` file with valid AWS credentials (see [docs/deployment.md](docs/deployment.md))
+- `.env` file with valid AWS credentials (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION`) and deployment config (`S3_BUCKET`, `CF_DISTRIBUTION_ID`) — see [docs/deployment.md](docs/deployment.md)
 
 See [docs/deployment.md](docs/deployment.md) for detailed deployment docs, manual steps, and rollback procedures.
 
