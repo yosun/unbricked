@@ -26,6 +26,7 @@ export const FAL_ENDPOINTS = {
   imageTo3D: "fal-ai/sam-3/3d-objects",
   img2img: "fal-ai/flux/dev/image-to-image",
   textToImg: "fal-ai/flux/dev",
+  flux2: "fal-ai/flux-2",
 } as const;
 
 /**
@@ -1047,6 +1048,68 @@ export async function runTextToImg(
   const json: unknown = await response.json();
   return FalTextToImgResponseSchema.parse(json);
 }
+/* ── Flux 2 Text-to-Image (fal-ai/flux-2) ────────── */
+
+export interface Flux2TextToImgRequest {
+  prompt: string;
+  imageSize?: { width: number; height: number } | string;
+  guidanceScale?: number;        // 0–20, default 2.5
+  numInferenceSteps?: number;    // 4–50, default 28
+  numImages?: number;            // 1–4, default 1
+  seed?: number;
+  acceleration?: "none" | "regular" | "high"; // default "regular"
+  enablePromptExpansion?: boolean;             // default false
+  enableSafetyChecker?: boolean;               // default true
+  outputFormat?: "jpeg" | "png" | "webp";      // default "png"
+}
+
+const FalFlux2ResponseSchema = z.object({
+  images: z.array(FalImageSchema).min(1),
+  seed: z.number().optional(),
+  prompt: z.string().optional(),
+  has_nsfw_concepts: z.array(z.boolean()).optional(),
+});
+
+export type FalFlux2Response = z.infer<typeof FalFlux2ResponseSchema>;
+
+export async function runFlux2TextToImg(
+  req: Flux2TextToImgRequest,
+  signal?: AbortSignal,
+): Promise<FalFlux2Response> {
+  const body: Record<string, unknown> = {
+    prompt: req.prompt,
+  };
+  if (req.imageSize !== undefined) body["image_size"] = req.imageSize;
+  if (req.guidanceScale !== undefined) body["guidance_scale"] = req.guidanceScale;
+  if (req.numInferenceSteps !== undefined) body["num_inference_steps"] = req.numInferenceSteps;
+  if (req.numImages !== undefined) body["num_images"] = req.numImages;
+  if (req.seed !== undefined) body["seed"] = req.seed;
+  if (req.acceleration !== undefined) body["acceleration"] = req.acceleration;
+  if (req.enablePromptExpansion !== undefined) body["enable_prompt_expansion"] = req.enablePromptExpansion;
+  if (req.enableSafetyChecker !== undefined) body["enable_safety_checker"] = req.enableSafetyChecker;
+  if (req.outputFormat !== undefined) body["output_format"] = req.outputFormat;
+
+  const url = `${PROXY_BASE}/fal-ai/flux-2`;
+
+  const response = await proxyFetch(
+    url,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    },
+    { timeoutMs: 120_000, signal },
+  );
+
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(`fal flux-2 proxy error ${String(response.status)}: ${text}`);
+  }
+
+  const json: unknown = await response.json();
+  return FalFlux2ResponseSchema.parse(json);
+}
+
 /* ── Layer Composite Rendering ───────────────────── */
 
 /**

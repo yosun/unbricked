@@ -10,7 +10,8 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest",
     "lint": "eslint .",
-    "format": "prettier -w ."
+    "format": "prettier -w .",
+    "deploy": "./scripts/deploy.sh"
   },
   "dependencies": {
     "@react-three/drei": "^9.114.0",

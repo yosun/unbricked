@@ -173,6 +173,26 @@ pnpm lint         # ESLint
 pnpm format       # Prettier
 ```
 
+## Deployment
+
+The app deploys to **AWS S3 + CloudFront** at [https://demo.unbricked.xyz](https://demo.unbricked.xyz).
+
+### One-command deploy
+
+```bash
+pnpm deploy
+# or
+./scripts/deploy.sh
+```
+
+The deploy script builds the app, syncs to S3, and invalidates the CloudFront cache.
+
+**Prerequisites:**
+- AWS CLI installed (`brew install awscli`)
+- `.env` file with valid AWS credentials (see [docs/deployment.md](docs/deployment.md))
+
+See [docs/deployment.md](docs/deployment.md) for detailed deployment docs, manual steps, and rollback procedures.
+
 ## Agent workflow
 
 This repo uses a disciplined Research → Plan → Implement cycle. See `CLAUDE.md` for the full protocol. Key rules:
