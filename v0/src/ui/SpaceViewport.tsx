@@ -11,10 +11,7 @@ import LayerScrubber from "./LayerScrubber";
 import LayerControlsHUD from "./LayerControlsHUD";
 import LayersPanel from "./LayersPanel";
 import AIHistoryPanel from "./AIHistoryPanel";
-import HistoryMapPanel from "../history/HistoryMapPanel";
-import HistoryHudPanel from "../history/HistoryHudPanel";
 import type { AnchorPoint } from "../history/HistoryHudPanel";
-import { sliceHistoryToSubwayGraph } from "../history/adaptSliceHistory";
 import HistoryGraph3D from "../history/HistoryGraph3D";
 import RadialMenu from "./RadialMenu";
 import CameraRig from "./CameraRig";
@@ -1895,20 +1892,21 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
           imageAspect={imageAspect}
         />
         <CameraRef cameraRef={cameraRef} />
-        {/* ── 3D AI History (Universal) ── */}
-        {viewMode === "universal" && historyPanelLayer !== null && getSliceHistory && onSetDisplayCursor && payloads && (() => {
-          const sliceGraph = getSliceHistory(historyPanelLayer);
+        {/* ── 3D AI History (Universal) — shown automatically when a slice is selected ── */}
+        {viewMode === "universal" && selectedLayerIndex !== null && getSliceHistory && onSetDisplayCursor && payloads && (() => {
+          const sliceGraph = getSliceHistory(selectedLayerIndex);
           if (!sliceGraph) return null;
           const { prismW: pw } = prismDims(imageAspect);
-          const visualIdx = layerOrder.indexOf(historyPanelLayer);
-          const yPos = layerY(visualIdx < 0 ? historyPanelLayer : visualIdx, layerCount);
+          const visualIdx = layerOrder.indexOf(selectedLayerIndex);
+          const yPos = layerY(visualIdx < 0 ? selectedLayerIndex : visualIdx, layerCount);
           return (
             <HistoryGraph3D
               graph={sliceGraph}
               payloads={payloads}
               sliceY={yPos}
               prismW={pw}
-              onSelectNode={(id) => { onSetDisplayCursor(historyPanelLayer, id); }}
+              onSelectNode={(id) => { onSetDisplayCursor(selectedLayerIndex, id); }}
+              onSetOperationCursor={(id) => { onSetOperationCursor?.(selectedLayerIndex, id); }}
               {...(documentSourceImageId ? { documentSourceImageId } : {})}
             />
           );
@@ -1945,21 +1943,21 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
       </button>
 
       {/* Keyframe preview — persistent top-down composite */}
-      {keyframePreviewUrl && shouldShowChrome && (
+      {keyframePreviewUrl && (
         <div
           title="Keyframe preview (top-down composite)"
           style={{
             position: "absolute",
-            top: 12,
-            right: viewMode === "layers" ? 260 : 12,
-            width: 80,
-            height: 80,
+            // Layers mode: top-left so the bottom history drawer never covers it.
+            // Other modes: bottom-left, above the LayerControlsHUD (bottom: 12).
+            ...(viewMode === "layers" ? { top: 50, left: 12 } : { bottom: 60, left: 12 }),
+            width: 72,
+            height: 72,
             borderRadius: 8,
             overflow: "hidden",
             border: "1px solid var(--hud-border)",
             background: "var(--hud-bg)",
             zIndex: 11,
-            transition: "right 0.2s",
           }}
         >
           <img
@@ -1985,10 +1983,41 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
         </div>
       )}
 
-      {/* AI History toggle button */}
-      {shouldShowChrome && selectedLayerIndex !== null && getSliceHistory && (() => {
+      {/* AI History toggle button — only for Layers/Minimalist; Universal auto-shows in 3D */}
+      {viewMode !== "universal" && selectedLayerIndex !== null && getSliceHistory && (() => {
         const graph = getSliceHistory(selectedLayerIndex);
         if (!graph) return null;
+        // In layers view: bottom-anchored drawer-handle tab; hide when drawer is open.
+        // In minimalist: top-right corner toggle.
+        if (viewMode === "layers") {
+          if (historyPanelLayer !== null) return null; // drawer open — its own ✕ handles close
+          return (
+            <button
+              type="button"
+              onClick={() => { setHistoryPanelLayer(selectedLayerIndex); }}
+              title="Open AI History drawer"
+              style={{
+                position: "absolute",
+                bottom: 0,
+                left: 12,
+                padding: "6px 14px",
+                borderRadius: "8px 8px 0 0",
+                background: "var(--hud-bg)",
+                border: "1px solid var(--hud-border)",
+                borderBottom: "none",
+                color: "var(--hud-text)",
+                fontSize: 10,
+                fontWeight: 600,
+                cursor: "pointer",
+                zIndex: 13,
+                backdropFilter: "blur(12px)",
+                letterSpacing: 0.4,
+              }}
+            >
+              ↑ AI History
+            </button>
+          );
+        }
         return (
           <button
             type="button"
@@ -1996,8 +2025,8 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
             title="Open AI History panel"
             style={{
               position: "absolute",
-              top: keyframePreviewUrl ? 100 : 12,
-              right: viewMode === "layers" ? 260 : 12,
+              top: 12,
+              right: 12,
               padding: "5px 10px",
               borderRadius: 6,
               background: historyPanelLayer !== null ? "var(--hud-active)" : "var(--hud-bg)",
@@ -2007,7 +2036,6 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
               fontWeight: 600,
               cursor: "pointer",
               zIndex: 11,
-              transition: "right 0.2s, top 0.2s",
             }}
           >
             🕰 History
@@ -2017,77 +2045,26 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
 
       {/* Universal AI History is now rendered inside <Canvas> as HistoryGraph3D */}
 
-      {/* Layers-view AI History — bottom drawer (only in Layers mode) */}
+      {/* Layers-view AI History — seed-path panel (only in Layers mode) */}
       {viewMode === "layers" && historyPanelLayer !== null && getSliceHistory && onSetDisplayCursor && onSetOperationCursor && (() => {
         const sliceGraph = getSliceHistory(historyPanelLayer);
         if (!sliceGraph) return null;
-        const subwayGraph = sliceHistoryToSubwayGraph(sliceGraph, documentSourceImageId);
         return (
-          <div
-            style={{
-              position: "absolute",
-              left: 12,
-              right: 260,
-              bottom: 12,
-              maxHeight: 280,
-              borderRadius: 10,
-              background: "var(--hud-bg)",
-              border: "1px solid var(--hud-border)",
-              zIndex: 12,
-              display: "flex",
-              flexDirection: "column",
-              overflow: "hidden",
-              backdropFilter: "blur(12px)",
-            }}
-          >
-            <div
-              style={{
-                display: "flex",
-                alignItems: "center",
-                gap: 8,
-                padding: "8px 12px",
-                borderBottom: "1px solid var(--hud-border)",
-                flexShrink: 0,
-              }}
-            >
-              <span style={{ fontSize: 10, fontWeight: 600, color: "var(--hud-text)", textTransform: "uppercase", letterSpacing: 0.8 }}>
-                AI History — Layer {historyPanelLayer}
-              </span>
-              <span style={{ flex: 1 }} />
-              <span style={{ fontSize: 9, color: "var(--hud-muted)" }}>
-                {Object.keys(sliceGraph.ops).length} op{Object.keys(sliceGraph.ops).length !== 1 ? "s" : ""}
-              </span>
-              <button
-                type="button"
-                onClick={() => { setHistoryPanelLayer(null); }}
-                style={{
-                  background: "none",
-                  border: "none",
-                  color: "var(--hud-muted)",
-                  cursor: "pointer",
-                  fontSize: 14,
-                  padding: "0 4px",
-                }}
-              >
-                ✕
-              </button>
-            </div>
-            <div style={{ flex: 1, overflow: "auto", minHeight: 0 }}>
-              <HistoryMapPanel
-                graph={subwayGraph}
-                operationNodeId={sliceGraph.operationStateId}
-                onSelectNode={(id) => {
-                  if (id.startsWith("__source__")) return;
-                  onSetDisplayCursor(historyPanelLayer, id);
-                }}
-              />
-            </div>
-          </div>
+          <AIHistoryPanel
+            layerIndex={historyPanelLayer}
+            graph={sliceGraph}
+            payloads={payloads}
+            onSetDisplayCursor={onSetDisplayCursor}
+            onSetOperationCursor={onSetOperationCursor}
+            onClose={() => { setHistoryPanelLayer(null); }}
+            documentSourceImageId={documentSourceImageId}
+            style={{ right: 260, bottom: 0, borderRadius: "10px 10px 0 0" }}
+          />
         );
       })()}
 
       {/* Segment display mode toggle (masked original vs colored segments) */}
-      {shouldShowChrome && layerCount > 1 && (
+      {layerCount > 1 && (
         <button
           type="button"
           onClick={onToggleSegmentDisplay}
@@ -2116,7 +2093,7 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
       )}
 
       {/* Universal: Depth Rail (scrubber with drag-reorder ticks) */}
-      {shouldShowChrome && showScrubber && (
+      {showScrubber && (
         <LayerScrubber
           layerCount={layerCount}
           selectedIndex={selectedLayerIndex}
@@ -2131,7 +2108,7 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
       )}
 
       {/* Universal: Context HUD on selection (bottom center) */}
-      {shouldShowChrome && showControlsHUD && selectedLayerIndex !== null && (
+      {showControlsHUD && selectedLayerIndex !== null && (
         <LayerControlsHUD
           layerIndex={selectedLayerIndex}
           isHidden={selectedIsHidden}
@@ -2170,7 +2147,7 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
       )}
 
       {/* Layers view: full Photoshop-inspired panel */}
-      {shouldShowChrome && showLayersPanel && (
+      {showLayersPanel && (
         <LayersPanel
           layerCount={layerCount}
           order={layerOrder}

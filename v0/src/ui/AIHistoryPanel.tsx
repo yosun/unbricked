@@ -13,6 +13,8 @@ export interface AIHistoryPanelProps {
   onClose: () => void;
   /** Document-level source image id (project-level, separate from slice root). */
   documentSourceImageId?: PayloadId | undefined;
+  /** Override any CSS properties on the panel's root container (e.g. right/bottom offsets). */
+  style?: React.CSSProperties;
 }
 
 /**
@@ -27,6 +29,7 @@ export default function AIHistoryPanel({
   onSetOperationCursor,
   onClose,
   documentSourceImageId,
+  style: containerStyle,
 }: AIHistoryPanelProps): React.JSX.Element {
   const [expandedPath, setExpandedPath] = useState<string | null>(null);
 
@@ -155,7 +158,7 @@ export default function AIHistoryPanel({
         left: 12,
         right: 12,
         bottom: 12,
-        maxHeight: 240,
+        height: 240,
         borderRadius: 10,
         background: "var(--hud-bg)",
         border: "1px solid var(--hud-border)",
@@ -164,6 +167,7 @@ export default function AIHistoryPanel({
         flexDirection: "column",
         overflow: "hidden",
         backdropFilter: "blur(12px)",
+        ...containerStyle,
       }}
       /* Show ⚙ gear on hover over any ThumbBox */
       onMouseOver={(e) => {
@@ -210,7 +214,7 @@ export default function AIHistoryPanel({
       </div>
 
       {/* Main content: left anchors + right seed lanes */}
-      <div style={{ flex: 1, overflowY: "auto", overflowX: "auto", display: "flex", gap: 0, minHeight: 0 }}>
+      <div style={{ flex: 1, display: "flex", gap: 0, minHeight: 0, overflow: "hidden" }}>
         {/* Left anchor: Source Image + Slice Root */}
         <div
           style={{

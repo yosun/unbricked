@@ -637,13 +637,37 @@ export default function App(): React.JSX.Element {
     return result;
   }, [layerCount, layerRender, state.payloads, layerProps]);
 
-  /** Build a map of layerIndex → CropInfo for layers that were tightly cropped. */
+  /** Build a map of layerIndex → CropInfo for layers that were tightly cropped.
+   *  When a layer has an AI history with a non-root display cursor, we use the
+   *  **root state's** crop info so the plane geometry stays stable while the
+   *  user navigates between history states (avoids visible restretch). */
+  const historyRootCropPids = useMemo(() => {
+    const result: Record<number, string> = {};
+    const hist = findAIHistory(state, activeSpaceId);
+    const slices = findSliceIds(state, activeSpaceId);
+    if (!hist || !slices) return result;
+    for (let i = 0; i < layerCount; i++) {
+      const sliceId = slices.ids[i];
+      const graph = sliceId ? hist.history.slices[sliceId] : undefined;
+      if (!graph) continue;
+      const rootState = graph.states[graph.rootStateId];
+      const rootImagePid = rootState?.assetRefs.image;
+      if (rootImagePid) result[i] = rootImagePid;
+    }
+    return result;
+  }, [state, activeSpaceId, layerCount]);
+
   const layerCropInfo = useMemo(() => {
     const result: Record<number, CropInfo> = {};
     for (let i = 0; i < layerCount; i++) {
-      const pid = layerPayloadId(layerRender, i);
-      if (!pid) continue;
-      const payload = state.payloads[pid as PayloadId];
+      // Prefer the root state's payload for stable plane geometry across history nav
+      let cropPid: string | undefined = historyRootCropPids[i];
+      if (!cropPid) {
+        const pid = layerPayloadId(layerRender, i);
+        if (pid) cropPid = pid;
+      }
+      if (!cropPid) continue;
+      const payload = state.payloads[cropPid as PayloadId];
       if (!payload) continue;
       const m = payload.meta;
       const cx = Number(m.cropX);
@@ -657,7 +681,7 @@ export default function App(): React.JSX.Element {
       }
     }
     return result;
-  }, [layerCount, layerRender, state.payloads]);
+  }, [layerCount, layerRender, state.payloads, historyRootCropPids]);
 
   /** Build a map of layerIndex → colored-segment URI for the "colored" display mode. */
   const colorLayerTextures = useMemo(() => {

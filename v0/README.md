@@ -65,6 +65,13 @@ The app is a functional spatial editor with the following capabilities:
 - **Source image toggle** — hide/show the 2D texture when a 3D model is active
 - GLB models persisted as Payloads and restored on reload
 
+### AI History
+- **Per-slice history graph** — every AI operation is recorded as a directed acyclic graph of state nodes and operation edges
+- **3D subway map** (Universal mode) — history rendered as actual R3F meshes attached to the selected slice: a figure-8 hub (original + current image) with branching operation thumbnails
+- **SVG subway map** (Layers mode) — bottom-drawer panel with the same graph rendered as interactive SVG
+- **Display cursor** — click any history node to preview that state; all nodes remain visible (no destructive navigation)
+- **Branch-aware** — divergent AI edits fan out as separate lanes; active ancestry is highlighted
+
 ### Editor infrastructure
 - **Undo / Redo** (snapshot-based, up to 100 levels) with `Cmd+Z` / `Cmd+Shift+Z`
 - **LocalStorage persistence** — project state survives page reload
@@ -101,6 +108,20 @@ src/
     preferences.ts            # User preferences (default AI model, operation)
     crypto.ts                 # WebCrypto sha256 helper
     sampleProject.ts          # Default empty project factory
+  core/history/                # AI history graph engine
+    aiHistorySchema.ts        # SliceHistoryGraph, StateNode, OpEdge schemas
+    historyGraph.ts           # Core helpers (addOpResult, getSeedPath, setDisplayCursor)
+    chainVisibility.test.ts   # Chain visibility tests
+    historyGraph.test.ts      # History graph unit tests
+    integrationRoundtrip.test.ts # End-to-end roundtrip tests
+  history/                      # AI history visualization
+    historyTypes.ts           # Subway-map data model (HistoryNode, HistoryGraph)
+    historyGraph.ts           # DAG traversal (getActiveLineage, buildActiveSet)
+    historyLayout.ts          # DAG → subway geometry positions
+    adaptSliceHistory.ts      # SliceHistoryGraph → subway HistoryGraph adapter
+    HistoryGraph3D.tsx        # R3F 3D subway map (in-scene, attached to slice)
+    HistoryMapPanel.tsx       # SVG subway map (Layers-view bottom drawer)
+    HistoryHudPanel.tsx       # Screen-space HUD panel (legacy, Layers fallback)
   services/
     falProxy.ts               # fal.ai proxy client (img2img, text2img, SAM2, BiRefNet, SAM-3)
     operationRunner.ts        # Orchestrates operations (segmentation → patches)
