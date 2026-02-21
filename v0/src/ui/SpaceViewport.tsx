@@ -11,6 +11,11 @@ import LayerScrubber from "./LayerScrubber";
 import LayerControlsHUD from "./LayerControlsHUD";
 import LayersPanel from "./LayersPanel";
 import AIHistoryPanel from "./AIHistoryPanel";
+import HistoryMapPanel from "../history/HistoryMapPanel";
+import HistoryHudPanel from "../history/HistoryHudPanel";
+import type { AnchorPoint } from "../history/HistoryHudPanel";
+import { sliceHistoryToSubwayGraph } from "../history/adaptSliceHistory";
+import HistoryGraph3D from "../history/HistoryGraph3D";
 import RadialMenu from "./RadialMenu";
 import CameraRig from "./CameraRig";
 import type { AnimPhase } from "./CameraRig";
@@ -377,6 +382,50 @@ function screenToBrickY(camera: Camera, canvasH: number): number {
 function CameraRef({ cameraRef }: { cameraRef: React.MutableRefObject<Camera | null> }): null {
   const { camera } = useThree();
   cameraRef.current = camera;
+  return null;
+}
+
+/**
+ * Projects a selected slice's 3D position → screen coords each frame.
+ * Writes to the provided callback only when the position changes by >1px
+ * to avoid unnecessary re-renders in demand-render mode.
+ */
+function SliceAnchorTracker({
+  layerIndex,
+  layerCount,
+  layerOrder,
+  onUpdate,
+}: {
+  layerIndex: number | null;
+  layerCount: number;
+  layerOrder: number[];
+  onUpdate: (anchor: AnchorPoint) => void;
+}): null {
+  const { camera, size } = useThree();
+  const lastRef = useRef<{ x: number; y: number; visible: boolean }>({ x: 0, y: 0, visible: false });
+  const _v = useMemo(() => new Vector3(), []);
+
+  useFrame(() => {
+    if (layerIndex === null) return;
+    const visualPos = layerOrder.indexOf(layerIndex);
+    if (visualPos < 0) return;
+    const y = layerY(visualPos, layerCount);
+    // Slice center in world: x=0, y=layer height, z=0
+    _v.set(0, y, 0);
+    _v.project(camera);
+    // NDC → screen px
+    const sx = ((_v.x + 1) / 2) * size.width;
+    const sy = ((1 - _v.y) / 2) * size.height;
+    const visible = _v.z >= 0 && _v.z <= 1
+      && sx >= -100 && sx <= size.width + 100
+      && sy >= -100 && sy <= size.height + 100;
+    const prev = lastRef.current;
+    if (Math.abs(prev.x - sx) > 1 || Math.abs(prev.y - sy) > 1 || prev.visible !== visible) {
+      lastRef.current = { x: sx, y: sy, visible };
+      onUpdate({ x: sx, y: sy, visible });
+    }
+  });
+
   return null;
 }
 
@@ -1536,6 +1585,9 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
 
   // Universal AI History panel: which layer index is open, or null
   const [historyPanelLayer, setHistoryPanelLayer] = useState<number | null>(null);
+  // Screen-space anchor for the 3D-attached history HUD
+  const [sliceAnchor, setSliceAnchor] = useState<AnchorPoint>({ x: 0, y: 0, visible: false });
+  const stableSetSliceAnchor = useCallback((a: AnchorPoint) => { setSliceAnchor(a); }, []);
   // Transform gizmo mode
   const [transformMode, setTransformMode] = useState<"translate" | "rotate" | "scale">("rotate");
   // Snap settings
@@ -1843,6 +1895,30 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
           imageAspect={imageAspect}
         />
         <CameraRef cameraRef={cameraRef} />
+        {/* ── 3D AI History (Universal) ── */}
+        {viewMode === "universal" && historyPanelLayer !== null && getSliceHistory && onSetDisplayCursor && payloads && (() => {
+          const sliceGraph = getSliceHistory(historyPanelLayer);
+          if (!sliceGraph) return null;
+          const { prismW: pw } = prismDims(imageAspect);
+          const visualIdx = layerOrder.indexOf(historyPanelLayer);
+          const yPos = layerY(visualIdx < 0 ? historyPanelLayer : visualIdx, layerCount);
+          return (
+            <HistoryGraph3D
+              graph={sliceGraph}
+              payloads={payloads}
+              sliceY={yPos}
+              prismW={pw}
+              onSelectNode={(id) => { onSetDisplayCursor(historyPanelLayer, id); }}
+              {...(documentSourceImageId ? { documentSourceImageId } : {})}
+            />
+          );
+        })()}
+        <SliceAnchorTracker
+          layerIndex={historyPanelLayer}
+          layerCount={layerCount}
+          layerOrder={layerOrder}
+          onUpdate={stableSetSliceAnchor}
+        />
         <CameraRig animPhase={animPhase} onAnimDone={onAnimDone} />
         <OrbitControls
           makeDefault
@@ -1939,20 +2015,74 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
         );
       })()}
 
-      {/* Universal AI History Panel */}
-      {historyPanelLayer !== null && getSliceHistory && onSetDisplayCursor && onSetOperationCursor && (() => {
-        const graph = getSliceHistory(historyPanelLayer);
-        if (!graph) return null;
+      {/* Universal AI History is now rendered inside <Canvas> as HistoryGraph3D */}
+
+      {/* Layers-view AI History — bottom drawer (only in Layers mode) */}
+      {viewMode === "layers" && historyPanelLayer !== null && getSliceHistory && onSetDisplayCursor && onSetOperationCursor && (() => {
+        const sliceGraph = getSliceHistory(historyPanelLayer);
+        if (!sliceGraph) return null;
+        const subwayGraph = sliceHistoryToSubwayGraph(sliceGraph, documentSourceImageId);
         return (
-          <AIHistoryPanel
-            layerIndex={historyPanelLayer}
-            graph={graph}
-            payloads={payloads}
-            onSetDisplayCursor={onSetDisplayCursor}
-            onSetOperationCursor={onSetOperationCursor}
-            onClose={() => { setHistoryPanelLayer(null); }}
-            documentSourceImageId={documentSourceImageId}
-          />
+          <div
+            style={{
+              position: "absolute",
+              left: 12,
+              right: 260,
+              bottom: 12,
+              maxHeight: 280,
+              borderRadius: 10,
+              background: "var(--hud-bg)",
+              border: "1px solid var(--hud-border)",
+              zIndex: 12,
+              display: "flex",
+              flexDirection: "column",
+              overflow: "hidden",
+              backdropFilter: "blur(12px)",
+            }}
+          >
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 8,
+                padding: "8px 12px",
+                borderBottom: "1px solid var(--hud-border)",
+                flexShrink: 0,
+              }}
+            >
+              <span style={{ fontSize: 10, fontWeight: 600, color: "var(--hud-text)", textTransform: "uppercase", letterSpacing: 0.8 }}>
+                AI History — Layer {historyPanelLayer}
+              </span>
+              <span style={{ flex: 1 }} />
+              <span style={{ fontSize: 9, color: "var(--hud-muted)" }}>
+                {Object.keys(sliceGraph.ops).length} op{Object.keys(sliceGraph.ops).length !== 1 ? "s" : ""}
+              </span>
+              <button
+                type="button"
+                onClick={() => { setHistoryPanelLayer(null); }}
+                style={{
+                  background: "none",
+                  border: "none",
+                  color: "var(--hud-muted)",
+                  cursor: "pointer",
+                  fontSize: 14,
+                  padding: "0 4px",
+                }}
+              >
+                ✕
+              </button>
+            </div>
+            <div style={{ flex: 1, overflow: "auto", minHeight: 0 }}>
+              <HistoryMapPanel
+                graph={subwayGraph}
+                operationNodeId={sliceGraph.operationStateId}
+                onSelectNode={(id) => {
+                  if (id.startsWith("__source__")) return;
+                  onSetDisplayCursor(historyPanelLayer, id);
+                }}
+              />
+            </div>
+          </div>
         );
       })()}
 
