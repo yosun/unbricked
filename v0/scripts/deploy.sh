@@ -25,6 +25,10 @@ for var in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_DEFAULT_REGION S3_BUCKET 
   fi
 done
 
+# ── Force .env credentials only (ignore ~/.aws/*) ───────────
+export AWS_CONFIG_FILE=/dev/null
+export AWS_SHARED_CREDENTIALS_FILE=/dev/null
+
 # ── Check prerequisites ─────────────────────────────────────
 command -v aws >/dev/null 2>&1 || { echo "❌  aws CLI not found. Install: brew install awscli"; exit 1; }
 

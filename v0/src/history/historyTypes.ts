@@ -28,6 +28,7 @@ export interface HistoryNode {
   };
 
   artifactId?: string;   // points to snapshot/thumbnail
+  has3D?: boolean;       // true if this node has an associated GLB model
 }
 
 export interface HistoryGraph {

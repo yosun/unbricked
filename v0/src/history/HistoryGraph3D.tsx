@@ -20,17 +20,21 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useThree, useFrame, invalidate } from "@react-three/fiber";
 import {
+  CanvasTexture,
   DoubleSide,
   SRGBColorSpace,
+  SpriteMaterial,
   TextureLoader,
   MeshBasicMaterial,
   BufferGeometry,
   Float32BufferAttribute,
   Vector3,
+  Color,
 } from "three";
 import type { Texture, Group } from "three";
 import type { SliceHistoryGraph, StateNode } from "../core/history/aiHistorySchema";
 import type { PayloadId } from "../core/types";
+import { useUIStyle } from "../ui/uiStyleStore";
 
 // ── Shared texture loader ────────────────────────────
 const _texLoader = new TextureLoader();
@@ -43,7 +47,25 @@ function useNodeTexture(uri: string | undefined): Texture | null {
     let cancelled = false;
     _texLoader.load(
       uri,
-      (t) => { t.colorSpace = SRGBColorSpace; if (!cancelled) { setTex(t); invalidate(); } },
+      (t) => {
+        t.colorSpace = SRGBColorSpace;
+        // Center-crop the texture into a square so circle geometry
+        // doesn't stretch non-square images.
+        const img = t.image as HTMLImageElement | undefined;
+        if (img && img.naturalWidth && img.naturalHeight) {
+          const aspect = img.naturalWidth / img.naturalHeight;
+          if (aspect > 1) {
+            // Landscape: crop sides
+            t.repeat.set(1 / aspect, 1);
+            t.offset.set((1 - 1 / aspect) / 2, 0);
+          } else if (aspect < 1) {
+            // Portrait: crop top/bottom
+            t.repeat.set(1, aspect);
+            t.offset.set(0, (1 - aspect) / 2);
+          }
+        }
+        if (!cancelled) { setTex(t); invalidate(); }
+      },
       undefined,
       () => { if (!cancelled) setTex(null); },
     );
@@ -62,6 +84,71 @@ const BRANCH_STEP_X = 0.5;      // step between successive ops on a branch
 const BRANCH_STEP_Z = 0.5;      // Z offset between branch lanes
 const LINE_Y_OFFSET = 0.01;     // keep lines slightly above planes for visibility
 const CURSOR_RING_EXTRA = 0.04; // extra radius for selection ring
+const GRAPH_RENDER_ORDER = 1000; // draw history graph above all slice layers
+const AI_BUTTON_SIZE = 0.22;    // AI sparkle button sprite size
+
+// ── Shared "3D" badge texture (created once, reused) ─
+let _badgeTex: CanvasTexture | null = null;
+let _badgeMat: SpriteMaterial | null = null;
+function get3DBadgeMaterial(): SpriteMaterial {
+  if (_badgeMat) return _badgeMat;
+  const sz = 64;
+  const c = document.createElement("canvas");
+  c.width = sz; c.height = sz;
+  const ctx = c.getContext("2d")!;
+  // Rounded rect background
+  const r = 10;
+  ctx.fillStyle = "#2299ff";
+  ctx.beginPath();
+  ctx.moveTo(r, 0); ctx.lineTo(sz - r, 0); ctx.quadraticCurveTo(sz, 0, sz, r);
+  ctx.lineTo(sz, sz - r); ctx.quadraticCurveTo(sz, sz, sz - r, sz);
+  ctx.lineTo(r, sz); ctx.quadraticCurveTo(0, sz, 0, sz - r);
+  ctx.lineTo(0, r); ctx.quadraticCurveTo(0, 0, r, 0);
+  ctx.fill();
+  // Text
+  ctx.fillStyle = "#ffffff";
+  ctx.font = "bold 36px sans-serif";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText("3D", sz / 2, sz / 2);
+  _badgeTex = new CanvasTexture(c);
+  _badgeMat = new SpriteMaterial({ map: _badgeTex, transparent: true, depthWrite: false, depthTest: false });
+  return _badgeMat;
+}
+
+// ── Shared AI button textures ("✨" and "⏳") ─
+const _aiButtonTexCache = new Map<string, CanvasTexture>();
+function getAiButtonTexture(emoji: string): CanvasTexture {
+  const cached = _aiButtonTexCache.get(emoji);
+  if (cached) return cached;
+  const sz = 128;
+  const c = document.createElement("canvas");
+  c.width = sz; c.height = sz;
+  const ctx = c.getContext("2d")!;
+  // Transparent bg with subtle circle
+  ctx.clearRect(0, 0, sz, sz);
+  ctx.beginPath();
+  ctx.arc(sz / 2, sz / 2, sz / 2 - 4, 0, Math.PI * 2);
+  ctx.fillStyle = "rgba(0,0,0,0.45)";
+  ctx.fill();
+  ctx.strokeStyle = "rgba(255,255,255,0.35)";
+  ctx.lineWidth = 2;
+  ctx.stroke();
+  // Emoji
+  ctx.font = `${sz * 0.45}px sans-serif`;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillStyle = "#ffffff";
+  ctx.fillText(emoji, sz / 2, sz / 2 + 2);
+  const tex = new CanvasTexture(c);
+  _aiButtonTexCache.set(emoji, tex);
+  return tex;
+}
+
+/** Helper: parse a CSS hex color to a Three.js Color integer. */
+function cssHexToInt(hex: string): number {
+  return new Color(hex).getHex();
+}
 
 // ── Responsive scaling ───────────────────────────────
 // At the "reference" camera distance the layout uses its base sizes.
@@ -164,6 +251,12 @@ interface HistoryGraph3DProps {
   onSetOperationCursor: (stateId: string) => void;
   /** Optional: document source image id. */
   documentSourceImageId?: PayloadId;
+  /** Toggle the AI edit panel for this slice. */
+  onToggleAiPanel?: () => void;
+  /** Whether an AI edit is running on this slice. */
+  aiEditing?: boolean;
+  /** Whether the AI prompt panel is currently open for this slice. */
+  aiPanelOpen?: boolean;
 }
 
 // ── Helpers ──────────────────────────────────────────
@@ -217,6 +310,7 @@ function ThumbNode({
   isSelected,
   isCursor,
   isOpCursor,
+  is3D,
   onClick,
   onDoubleClick,
 }: {
@@ -229,6 +323,8 @@ function ThumbNode({
   isCursor?: boolean;
   /** Whether this node is the current operation cursor (⚙). */
   isOpCursor?: boolean;
+  /** Whether this node represents a 3D (imageTo3D) operation result. */
+  is3D?: boolean;
   onClick?: () => void;
   onDoubleClick?: () => void;
 }): React.JSX.Element {
@@ -245,61 +341,67 @@ function ThumbNode({
 
   return (
     <group position={position}>
-      {/* Thumbnail plane */}
+      {/* Thumbnail plane (circular) */}
       {tex && (
         <mesh
           rotation={[-Math.PI / 2, 0, 0]}
+          renderOrder={GRAPH_RENDER_ORDER}
           {...clickHandlers}
         >
-          <planeGeometry args={[size, size]} />
+          <circleGeometry args={[halfSize, 32]} />
           <meshBasicMaterial
             map={tex}
             transparent
             opacity={0.95}
             depthWrite={false}
+            depthTest={false}
             side={DoubleSide}
           />
         </mesh>
       )}
 
-      {/* Fallback: colored square if no texture */}
+      {/* Fallback: colored circle if no texture */}
       {!tex && (
         <mesh
           rotation={[-Math.PI / 2, 0, 0]}
+          renderOrder={GRAPH_RENDER_ORDER}
           {...clickHandlers}
         >
-          <planeGeometry args={[size, size]} />
+          <circleGeometry args={[halfSize, 32]} />
           <meshBasicMaterial
             color={0x666666}
             transparent
             opacity={0.5}
             depthWrite={false}
+            depthTest={false}
             side={DoubleSide}
           />
         </mesh>
       )}
 
       {/* Border ring */}
-      <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, 0.001, 0]}>
+      <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, 0.001, 0]} renderOrder={GRAPH_RENDER_ORDER + 1}>
         <ringGeometry args={[halfSize - 0.01, halfSize + 0.02, 32]} />
         <meshBasicMaterial
           color={isCursor ? 0x66ccff : isSelected ? 0xffffff : 0x888888}
           transparent
           opacity={isCursor ? 1.0 : isSelected ? 0.8 : 0.4}
           depthWrite={false}
+          depthTest={false}
           side={DoubleSide}
         />
       </mesh>
 
       {/* 👁 cursor indicator */}
       {isCursor && (
-        <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, 0.002, 0]}>
+        <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, 0.002, 0]} renderOrder={GRAPH_RENDER_ORDER + 2}>
           <ringGeometry args={[halfSize + 0.03, halfSize + CURSOR_RING_EXTRA + 0.03, 32]} />
           <meshBasicMaterial
             color={0x00ccff}
             transparent
             opacity={0.7}
             depthWrite={false}
+            depthTest={false}
             side={DoubleSide}
           />
         </mesh>
@@ -307,34 +409,46 @@ function ThumbNode({
 
       {/* ⚙ operation cursor indicator (orange ring) */}
       {isOpCursor && (
-        <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, 0.003, 0]}>
+        <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, 0.003, 0]} renderOrder={GRAPH_RENDER_ORDER + 3}>
           <ringGeometry args={[halfSize + CURSOR_RING_EXTRA + 0.04, halfSize + CURSOR_RING_EXTRA + 0.07, 32]} />
           <meshBasicMaterial
             color={0xff9933}
             transparent
             opacity={0.8}
             depthWrite={false}
+            depthTest={false}
             side={DoubleSide}
           />
         </mesh>
+      )}
+
+      {/* 3D badge (sprite, always faces camera) */}
+      {is3D && (
+        <sprite
+          material={get3DBadgeMaterial()}
+          position={[halfSize + 0.04, 0.005, -halfSize - 0.04]}
+          scale={[size * 0.45, size * 0.45, 1]}
+          renderOrder={GRAPH_RENDER_ORDER + 4}
+        />
       )}
     </group>
   );
 }
 
-/** A 3D line between two points (using BufferGeometry line segments). */
+/** A themed connector line with optional glow dots at endpoints. */
 function ConnectorLine({
   from,
   to,
   color,
   opacity,
-  lineWidth,
+  glowDots,
 }: {
   from: [number, number, number];
   to: [number, number, number];
   color?: number;
   opacity?: number;
-  lineWidth?: number;
+  /** Show small glowing dots at from/to endpoints. */
+  glowDots?: boolean;
 }): React.JSX.Element {
   const geo = useMemo(() => {
     const g = new BufferGeometry();
@@ -342,15 +456,44 @@ function ConnectorLine({
     return g;
   }, [from[0], from[1], from[2], to[0], to[1], to[2]]);
 
+  const c = color ?? 0xaaaaaa;
+  const o = opacity ?? 0.6;
+  const dotSize = 0.025;
+
   return (
-    <lineSegments geometry={geo}>
-      <lineBasicMaterial
-        color={color ?? 0xaaaaaa}
-        transparent
-        opacity={opacity ?? 0.6}
-        depthWrite={false}
-      />
-    </lineSegments>
+    <group>
+      <lineSegments geometry={geo} renderOrder={GRAPH_RENDER_ORDER}>
+        <lineBasicMaterial
+          color={c}
+          transparent
+          opacity={o}
+          depthWrite={false}
+          depthTest={false}
+        />
+      </lineSegments>
+      {/* Faint glow ribbon behind the line for depth */}
+      <lineSegments geometry={geo} renderOrder={GRAPH_RENDER_ORDER - 1}>
+        <lineBasicMaterial
+          color={c}
+          transparent
+          opacity={o * 0.2}
+          depthWrite={false}
+          depthTest={false}
+        />
+      </lineSegments>
+      {glowDots && (
+        <>
+          <mesh position={from} rotation={[-Math.PI / 2, 0, 0]} renderOrder={GRAPH_RENDER_ORDER + 1}>
+            <circleGeometry args={[dotSize, 12]} />
+            <meshBasicMaterial color={c} transparent opacity={Math.min(1, o + 0.3)} depthWrite={false} depthTest={false} side={DoubleSide} />
+          </mesh>
+          <mesh position={to} rotation={[-Math.PI / 2, 0, 0]} renderOrder={GRAPH_RENDER_ORDER + 1}>
+            <circleGeometry args={[dotSize, 12]} />
+            <meshBasicMaterial color={c} transparent opacity={Math.min(1, o + 0.3)} depthWrite={false} depthTest={false} side={DoubleSide} />
+          </mesh>
+        </>
+      )}
+    </group>
   );
 }
 
@@ -364,10 +507,37 @@ export default function HistoryGraph3D({
   onSelectNode,
   onSetOperationCursor,
   documentSourceImageId,
+  onToggleAiPanel,
+  aiEditing,
+  aiPanelOpen,
 }: HistoryGraph3DProps): React.JSX.Element | null {
   const groupRef = useRef<Group>(null);
   useAdaptiveScale(groupRef);
   const [startZoom] = useZoomToNode();
+
+  // Theme colors
+  const template = useUIStyle((s) => s.template);
+  const accentInt = useMemo(() => cssHexToInt(template.colors.accent), [template]);
+  const glowAiInt = useMemo(() => cssHexToInt(template.colors.glowAi), [template]);
+  const mutedInt = useMemo(() => cssHexToInt(template.colors.dimmed), [template]);
+  const fgInt = useMemo(() => cssHexToInt(template.colors.foreground), [template]);
+  // Active line color: accent in dark, glowAi in light (better contrast)
+  const isDark = template.id === "dark";
+  const lineActiveColor = isDark ? accentInt : glowAiInt;
+  const lineInactiveColor = mutedInt;
+
+  // AI button sprite material (memoized per editing state)
+  const aiButtonMat = useMemo(() => {
+    const emoji = aiEditing ? "⏳" : "✨";
+    const tex = getAiButtonTexture(emoji);
+    return new SpriteMaterial({
+      map: tex,
+      transparent: true,
+      depthWrite: false,
+      depthTest: false,
+      opacity: aiEditing ? 0.6 : 1.0,
+    });
+  }, [aiEditing]);
 
   /** Convert a local node position to world-space and trigger zoom. */
   const zoomToLocal = useCallback((localX: number, localZ: number) => {
@@ -461,32 +631,64 @@ export default function HistoryGraph3D({
 
   return (
     <group ref={groupRef} position={[0, sliceY, 0]}>
-      {/* ── Connector line: slice → hub ── */}
+      {/* ── Connector line: slice edge → AI button → hub ── */}
+      {/* Segment 1: slice edge → AI button midpoint */}
       <ConnectorLine
         from={[sliceEdgeX, LINE_Y_OFFSET, 0]}
-        to={[hubX - HUB_NODE_SIZE / 2 - 0.1, LINE_Y_OFFSET, 0]}
-        color={0x66ccff}
-        opacity={0.5}
+        to={[(sliceEdgeX + hubX - HUB_NODE_SIZE / 2 - 0.1) / 2 - AI_BUTTON_SIZE / 2 - 0.02, LINE_Y_OFFSET, 0]}
+        color={lineActiveColor}
+        opacity={isDark ? 0.5 : 0.45}
+        glowDots
       />
+      {/* Segment 2: AI button → hub */}
+      <ConnectorLine
+        from={[(sliceEdgeX + hubX - HUB_NODE_SIZE / 2 - 0.1) / 2 + AI_BUTTON_SIZE / 2 + 0.02, LINE_Y_OFFSET, 0]}
+        to={[hubX - HUB_NODE_SIZE / 2 - 0.1, LINE_Y_OFFSET, 0]}
+        color={lineActiveColor}
+        opacity={isDark ? 0.5 : 0.45}
+      />
+
+      {/* ── AI Edit button (sprite on the connector) ── */}
+      {onToggleAiPanel && (
+        <sprite
+          material={aiButtonMat}
+          position={[(sliceEdgeX + hubX - HUB_NODE_SIZE / 2 - 0.1) / 2, LINE_Y_OFFSET + 0.005, 0]}
+          scale={[AI_BUTTON_SIZE, AI_BUTTON_SIZE, 1]}
+          renderOrder={GRAPH_RENDER_ORDER + 5}
+          onClick={(e) => { e.stopPropagation(); onToggleAiPanel(); }}
+        />
+      )}
+      {/* Highlight ring around AI button when panel is open */}
+      {aiPanelOpen && (
+        <mesh
+          rotation={[-Math.PI / 2, 0, 0]}
+          position={[(sliceEdgeX + hubX - HUB_NODE_SIZE / 2 - 0.1) / 2, LINE_Y_OFFSET + 0.006, 0]}
+          renderOrder={GRAPH_RENDER_ORDER + 4}
+        >
+          <ringGeometry args={[AI_BUTTON_SIZE / 2 + 0.01, AI_BUTTON_SIZE / 2 + 0.035, 24]} />
+          <meshBasicMaterial color={lineActiveColor} transparent opacity={0.8} depthWrite={false} depthTest={false} side={DoubleSide} />
+        </mesh>
+      )}
 
       {/* ── Hub: figure-8 with two nodes ── */}
       {/* Vertical line between top and bottom hub nodes */}
       <ConnectorLine
         from={[hubX, LINE_Y_OFFSET, -HUB_GAP_Y / 2]}
         to={[hubX, LINE_Y_OFFSET, HUB_GAP_Y / 2]}
-        color={0x88aacc}
-        opacity={0.5}
+        color={isDark ? 0x5588aa : 0x889aaa}
+        opacity={isDark ? 0.5 : 0.4}
       />
 
-      {/* Top hub node: Original Slice Image */}
+      {/* Top hub node: Original Slice Image (use the slice's root state, not the full import) */}
       <ThumbNode
-        uri={sourceUri ?? rootThumbUri}
+        uri={rootThumbUri}
         size={HUB_NODE_SIZE}
         position={[hubX, LINE_Y_OFFSET, -HUB_GAP_Y / 2]}
         label="Original"
         isSelected={displayStateId === graph.rootStateId}
         isCursor={displayStateId === graph.rootStateId}
         isOpCursor={graph.operationStateId === graph.rootStateId}
+        is3D={!!rootState.assetRefs.glb}
         onClick={() => handleNodeClick(graph.rootStateId)}
         onDoubleClick={() => zoomToLocal(hubX, -HUB_GAP_Y / 2)}
       />
@@ -500,6 +702,7 @@ export default function HistoryGraph3D({
         isSelected
         isCursor
         isOpCursor={graph.operationStateId === displayStateId}
+        is3D={!!displayState?.assetRefs.glb}
         onDoubleClick={() => zoomToLocal(hubX, HUB_GAP_Y / 2)}
       />
 
@@ -516,8 +719,9 @@ export default function HistoryGraph3D({
             <ConnectorLine
               from={[bForkX, LINE_Y_OFFSET, forkZ]}
               to={[startX, LINE_Y_OFFSET, zOffset]}
-              color={activeAncestry.has(chain[0]!.stateId) ? 0x66ccff : 0x888888}
-              opacity={activeAncestry.has(chain[0]!.stateId) ? 0.8 : 0.4}
+              color={activeAncestry.has(chain[0]!.stateId) ? lineActiveColor : lineInactiveColor}
+              opacity={activeAncestry.has(chain[0]!.stateId) ? (isDark ? 0.8 : 0.65) : (isDark ? 0.4 : 0.3)}
+              glowDots
             />
 
             {/* Op nodes along the branch */}
@@ -536,8 +740,8 @@ export default function HistoryGraph3D({
                     <ConnectorLine
                       from={[nodeX + NODE_SIZE / 2, LINE_Y_OFFSET, nodeZ]}
                       to={[nodeX + BRANCH_STEP_X - NODE_SIZE / 2, LINE_Y_OFFSET, nodeZ]}
-                      color={isOnActive ? 0x66ccff : 0x888888}
-                      opacity={isOnActive ? 0.7 : 0.35}
+                      color={isOnActive ? lineActiveColor : lineInactiveColor}
+                      opacity={isOnActive ? (isDark ? 0.7 : 0.55) : (isDark ? 0.35 : 0.25)}
                     />
                   )}
                   <ThumbNode
@@ -548,6 +752,7 @@ export default function HistoryGraph3D({
                     isSelected={isOnActive}
                     isCursor={isCursorNode}
                     isOpCursor={state.stateId === graph.operationStateId}
+                    is3D={!!state.assetRefs.glb}
                     onClick={() => handleNodeClick(state.stateId)}
                     onDoubleClick={() => zoomToLocal(nodeX, nodeZ)}
                   />
@@ -558,13 +763,13 @@ export default function HistoryGraph3D({
         );
       })}
 
-      {/* If no operations yet, show a subtle placeholder text */}
+      {/* If no operations yet, show a subtle trailing line from hub */}
       {allBranches.length === 0 && (
         <ConnectorLine
           from={[hubX + HUB_NODE_SIZE / 2 + 0.1, LINE_Y_OFFSET, 0]}
           to={[hubX + HUB_NODE_SIZE / 2 + 0.6, LINE_Y_OFFSET, 0]}
-          color={0x555555}
-          opacity={0.3}
+          color={lineInactiveColor}
+          opacity={isDark ? 0.3 : 0.2}
         />
       )}
     </group>

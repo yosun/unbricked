@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
+import type { SliceHistoryGraph } from "../core/history/aiHistorySchema";
 
 interface LayerScrubberProps {
   layerCount: number;
@@ -10,6 +11,9 @@ interface LayerScrubberProps {
   onCommitOrder: (order: number[]) => void;
   layerThumbnails: Record<number, string>;
   layerGlbUrls: Record<number, string>;
+  layerNames: Record<number, string>;
+  onRenameLayer: (index: number, name: string) => void;
+  getSliceHistory?: ((layerIndex: number) => SliceHistoryGraph | null) | undefined;
 }
 
 /** Distinct hue per logical layer (matches SpaceViewport). */
@@ -33,6 +37,9 @@ export default function LayerScrubber(props: LayerScrubberProps): React.JSX.Elem
     onCommitOrder,
     layerThumbnails,
     layerGlbUrls,
+    layerNames,
+    onRenameLayer,
+    getSliceHistory,
   } = props;
   const railRef = useRef<HTMLDivElement>(null);
 
@@ -50,6 +57,11 @@ export default function LayerScrubber(props: LayerScrubberProps): React.JSX.Elem
   const activePointerId = useRef<number | null>(null);
   // Suppress the rail click that fires after a drag-release
   const justFinishedDrag = useRef(false);
+
+  // Inline rename state
+  const [renamingIdx, setRenamingIdx] = useState<number | null>(null);
+  const [renameText, setRenameText] = useState("");
+  const renameInputRef = useRef<HTMLInputElement>(null);
 
   // Sync ref with prop only when idle (no drag in progress).
   // Using useEffect avoids overwriting with a stale prop during the
@@ -270,8 +282,46 @@ export default function LayerScrubber(props: LayerScrubberProps): React.JSX.Elem
                 boxShadow: isDragging ? "0 0 8px var(--shadow-medium)" : "none",
               }}
             />
+            {/* AI ops count badge */}
+            {(() => {
+              const graph = getSliceHistory?.(logicalIdx);
+              if (!graph) return null;
+              const opsCount = Object.keys(graph.ops).length;
+              if (opsCount === 0) return null;
+              return (
+                <div
+                  style={{
+                    position: "absolute",
+                    left: "100%",
+                    marginLeft: 4,
+                    fontSize: 8,
+                    fontWeight: 700,
+                    lineHeight: "14px",
+                    minWidth: 14,
+                    height: 14,
+                    padding: "0 3px",
+                    borderRadius: 7,
+                    background: "var(--scrubber-active)",
+                    color: "var(--btn-primary-text)",
+                    textAlign: "center",
+                    pointerEvents: "none",
+                    opacity: isDragging || isSelected || posIdx === hoveredPosIdx ? 1 : 0.6,
+                    transition: "opacity 0.15s",
+                  }}
+                  title={`${String(opsCount)} AI op${opsCount > 1 ? "s" : ""}`}
+                >
+                  {opsCount}
+                </div>
+              );
+            })()}
             {/* Layer label + thumbnail on the tick */}
             <div
+              onDoubleClick={(e) => {
+                e.stopPropagation();
+                setRenamingIdx(logicalIdx);
+                setRenameText(layerNames[logicalIdx] ?? `Layer ${String(logicalIdx)}`);
+                setTimeout(() => { renameInputRef.current?.select(); }, 0);
+              }}
               style={{
                 position: "absolute",
                 right: "100%",
@@ -279,7 +329,7 @@ export default function LayerScrubber(props: LayerScrubberProps): React.JSX.Elem
                 display: "flex",
                 alignItems: "center",
                 gap: 4,
-                pointerEvents: "none",
+                pointerEvents: isDragging || isSelected || posIdx === hoveredPosIdx ? "auto" : "none",
                 opacity: isDragging || isSelected || posIdx === hoveredPosIdx ? 1 : 0,
                 transition: "opacity 0.15s",
               }}
@@ -293,8 +343,9 @@ export default function LayerScrubber(props: LayerScrubberProps): React.JSX.Elem
                     style={{
                       width: 24,
                       height: 24,
-                      borderRadius: 3,
-                      objectFit: "cover",
+                      borderRadius: "50%",
+                      objectFit: "contain",
+                      background: "var(--hud-active)",
                       border: isSelected
                         ? "1px solid var(--scrubber-active)"
                         : `1px solid ${color}`,
@@ -321,17 +372,52 @@ export default function LayerScrubber(props: LayerScrubberProps): React.JSX.Elem
                 </div>
               )}
               {/* Label */}
-              <span
-                style={{
-                  fontSize: 10,
-                  color: isSelected ? "var(--scrubber-active)" : "var(--hud-muted)",
-                  fontWeight: isSelected ? 600 : 400,
-                  whiteSpace: "nowrap",
-                }}
-              >
-                L{logicalIdx}
-                {!layerThumbnails[logicalIdx] && logicalIdx in layerGlbUrls ? " 3D" : ""}
-              </span>
+              {renamingIdx === logicalIdx ? (
+                <input
+                  ref={renameInputRef}
+                  type="text"
+                  value={renameText}
+                  onChange={(e) => { setRenameText(e.target.value); }}
+                  onBlur={() => {
+                    onRenameLayer(logicalIdx, renameText);
+                    setRenamingIdx(null);
+                  }}
+                  onKeyDown={(e) => {
+                    e.stopPropagation();
+                    if (e.key === "Enter") {
+                      onRenameLayer(logicalIdx, renameText);
+                      setRenamingIdx(null);
+                    } else if (e.key === "Escape") {
+                      setRenamingIdx(null);
+                    }
+                  }}
+                  style={{
+                    fontSize: 10,
+                    width: 64,
+                    background: "var(--hud-active)",
+                    border: "1px solid var(--scrubber-active)",
+                    borderRadius: 3,
+                    padding: "1px 4px",
+                    color: "var(--hud-text)",
+                    outline: "none",
+                    textAlign: "right",
+                  }}
+                />
+              ) : (
+                <span
+                  style={{
+                    fontSize: 10,
+                    color: isSelected ? "var(--scrubber-active)" : "var(--hud-muted)",
+                    fontWeight: isSelected ? 600 : 400,
+                    whiteSpace: "nowrap",
+                    cursor: "default",
+                  }}
+                  title="Double-click to rename"
+                >
+                  {layerNames[logicalIdx] ?? `L${String(logicalIdx)}`}
+                  {!layerThumbnails[logicalIdx] && logicalIdx in layerGlbUrls ? " 3D" : ""}
+                </span>
+              )}
             </div>
           </div>
         );

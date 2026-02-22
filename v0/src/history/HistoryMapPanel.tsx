@@ -82,6 +82,13 @@ export default function HistoryMapPanel({ graph, onSelectNode, operationNodeId }
               {isOperation && (
                 <text x={r + 6} y={r + 12} fontSize={10} fill="currentColor" opacity={0.8}>⚙</text>
               )}
+              {/* 3D badge */}
+              {n.has3D && (
+                <g transform={`translate(${-r - 2}, ${-r - 6})`}>
+                  <rect width={18} height={11} rx={3} fill="#2299ff" />
+                  <text x={9} y={8.5} fontSize={7} fontWeight={700} fill="#fff" textAnchor="middle">3D</text>
+                </g>
+              )}
 
               {/* labels */}
               <text x={16} y={-6} fontSize={13} fill="currentColor" opacity={0.92}>

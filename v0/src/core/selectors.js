@@ -88,6 +88,17 @@ export function soloIndex(props, layerCount) {
     return idx;
 }
 /**
+ * Get the user-assigned name for a layer, or null if unnamed.
+ */
+export function layerName(props, index) {
+    if (!props)
+        return null;
+    const raw = props.annotation.data[`name.${String(index)}`];
+    if (!raw || raw.length === 0)
+        return null;
+    return raw;
+}
+/**
  * Parse and validate a persisted layer order annotation.
  * Returns `null` if no valid order annotation exists;
  * callers should fall back to the default `[0..layerCount-1]`.

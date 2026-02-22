@@ -1,9 +1,9 @@
 import { jsx as _jsx, jsxs as _jsxs } from "react/jsx-runtime";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { applyPatch, findLayerSelection, findLayerProps, findLayerOrder, findLayerRender, findLayerGlb, layerPayloadId, defaultLayerOrder, serializeOrder, isHidden, isMaskActive, isMaskInverted, opacityMultiplier, soloIndex, makeId, newPatch, putOp, delOp, sha256Hex, sampleProject, createSampleProject, loadProjectState, saveProjectState, clearProjectState, getOperation, loadPreferences, savePreferences, } from "./core";
+import { applyPatch, findLayerSelection, findLayerProps, findLayerOrder, findLayerRender, findLayerGlb, layerPayloadId, defaultLayerOrder, serializeOrder, isHidden, isMaskActive, isMaskInverted, opacityMultiplier, soloIndex, layerName, makeId, newPatch, putOp, delOp, sha256Hex, sampleProject, createSampleProject, loadProjectState, rehydrateBlobs, saveProjectState, clearProjectState, getOperation, loadPreferences, savePreferences, } from "./core";
 import { findPortalEdges, findAIHistory, findSliceIds } from "./core";
 import { createSpaceAIHistory, ensureHistoryGraphForSlice, addOpResultToGraph, setDisplayCursor, setOperationCursor, serializeAIHistory, SPACE_AI_HISTORY_SCHEMA, } from "./core/history/historyGraph";
-import { runImg2Img, runTextToImg, runNanoBananaEdit, fetchImageBlob, invertAlpha, invertMaskWithOriginal, getAiEditModel, combineMasksToOriginal, refitAiResult, runImageTo3D, runBackgroundRemoval } from "./services/falProxy";
+import { runTextToImg, runNanoBananaEdit, runFlux2Edit, runInpainting, extractSliceMaskForInpaint, fetchImageBlob, invertAlpha, invertMaskWithOriginal, getAiEditModel, combineMasksToOriginal, refitAiResult, runImageTo3D, runBackgroundRemoval } from "./services/falProxy";
 import { runOperation } from "./services/operationRunner";
 import SpaceViewport from "./ui/SpaceViewport";
 import SpaceAddressHUD from "./slice8/SpaceAddressHUD";
@@ -20,6 +20,18 @@ import { useUIStyle } from "./ui/uiStyleStore";
 const MAX_UNDO = 100;
 export default function App() {
     const [state, setState] = useState(() => loadProjectState() ?? sampleProject.state);
+    // Rehydrate large blobs from IndexedDB after initial sync load
+    useEffect(() => {
+        let cancelled = false;
+        void rehydrateBlobs(state).then((rehydrated) => {
+            if (!cancelled && rehydrated !== state) {
+                setState(rehydrated);
+            }
+        });
+        return () => { cancelled = true; };
+        // Only run once on mount
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
     const pastRef = useRef([]);
     const futureRef = useRef([]);
     const [undoCount, setUndoCount] = useState(0);
@@ -195,8 +207,42 @@ export default function App() {
     }, [state, activeSpaceId]);
     // Build per-layer visibility/opacity for SpaceViewport
     const layerCount = activeSpace?.layerCount ?? 1;
+    // Clean up stale React state when layerCount decreases (e.g. via undo)
+    useEffect(() => {
+        setLayerGlbUrls((prev) => {
+            const stale = Object.keys(prev).filter((k) => Number(k) >= layerCount);
+            if (stale.length === 0)
+                return prev;
+            const next = { ...prev };
+            for (const k of stale) {
+                URL.revokeObjectURL(next[Number(k)]);
+                delete next[Number(k)];
+            }
+            return next;
+        });
+        setThreeDSourceHidden((prev) => {
+            let changed = false;
+            const next = new Set();
+            for (const idx of prev) {
+                if (idx >= layerCount) {
+                    changed = true;
+                    continue;
+                }
+                next.add(idx);
+            }
+            return changed ? next : prev;
+        });
+    }, [layerCount]);
     const effectiveOrder = previewOrder ?? persistedLayerOrder?.order ?? defaultLayerOrder(layerCount);
     const solo = soloIndex(layerProps, layerCount);
+    /** Build a map of layer index → user-assigned name (or default). */
+    const layerNames = useMemo(() => {
+        const result = {};
+        for (let i = 0; i < layerCount; i++) {
+            result[i] = layerName(layerProps, i) ?? `Layer ${String(i)}`;
+        }
+        return result;
+    }, [layerCount, layerProps]);
     const layerVisibility = useMemo(() => {
         const result = [];
         for (let i = 0; i < layerCount; i++) {
@@ -266,6 +312,18 @@ export default function App() {
                 return Object.fromEntries(Object.entries(data).filter(([k]) => k !== "solo"));
             }
             return { ...data, solo: String(index) };
+        });
+    }, [emitPropsUpdate]);
+    /** Rename a layer (set or clear the user-assigned name). */
+    const handleRenameLayer = useCallback((index, name) => {
+        emitPropsUpdate((data) => {
+            const key = `name.${String(index)}`;
+            const trimmed = name.trim();
+            // If the name equals the default, remove it
+            if (!trimmed || trimmed === `Layer ${String(index)}`) {
+                return Object.fromEntries(Object.entries(data).filter(([k]) => k !== key));
+            }
+            return { ...data, [key]: trimmed };
         });
     }, [emitPropsUpdate]);
     const handleToggleMask = useCallback((index) => {
@@ -400,10 +458,427 @@ export default function App() {
             return newPatch({ baseRevision: prev.revision, ops });
         });
     }, [activeSpaceId, commitPatch]);
+    /** Delete a layer (slice) from the active space.
+     *  Decrements layerCount, re-indexes all annotation data so that
+     *  higher-indexed layers shift down to fill the gap, and cleans
+     *  up local React state (GLB urls, 3D source hidden set).
+     *  When a segment slice (index > 0) is deleted, automatically runs
+     *  inpainting on the base image to fill the removed area. */
+    const handleDeleteSlice = useCallback((deleteIdx) => {
+        // ── Vars to capture inside commitPatch for async inpainting ──
+        let capturedOrigUri;
+        let capturedOrigPid;
+        let capturedDeletedUri;
+        let capturedDeletedCrop;
+        commitPatch((prev) => {
+            const space = prev.spaces[activeSpaceId];
+            if (!space)
+                return null;
+            if (space.layerCount <= 1)
+                return null; // can't delete last layer
+            if (deleteIdx < 0 || deleteIdx >= space.layerCount)
+                return null;
+            // Capture data for async inpainting before the patch removes it
+            const renderForCapture = findLayerRender(prev, activeSpaceId);
+            if (renderForCapture) {
+                const origPid0 = renderForCapture.annotation.data["payload.0"];
+                if (origPid0) {
+                    const origP = prev.payloads[origPid0];
+                    capturedOrigUri = origP?.uri;
+                    capturedOrigPid = origPid0;
+                }
+                const delPid = renderForCapture.annotation.data[`payload.${String(deleteIdx)}`];
+                if (delPid) {
+                    const delP = prev.payloads[delPid];
+                    capturedDeletedUri = delP?.uri;
+                    if (delP?.meta.cropX !== undefined) {
+                        capturedDeletedCrop = {
+                            cropX: Number(delP.meta.cropX),
+                            cropY: Number(delP.meta.cropY),
+                            cropW: Number(delP.meta.cropW),
+                            cropH: Number(delP.meta.cropH),
+                            origW: Number(delP.meta.origW),
+                            origH: Number(delP.meta.origH),
+                        };
+                    }
+                }
+            }
+            const oldCount = space.layerCount;
+            const newCount = oldCount - 1;
+            const ops = [];
+            // Helper: shift layer index past the deleted one
+            const shift = (i) => (i > deleteIdx ? i - 1 : i);
+            // 1. Update space with decremented layerCount
+            ops.push(putOp("Space", activeSpaceId, { ...space, layerCount: newCount }));
+            // 2. Re-index render annotation (payload.{i} → PayloadId)
+            const existingRender = findLayerRender(prev, activeSpaceId);
+            // Capture the deleted layer's payload ID for cleanup
+            const deletedPayloadId = existingRender?.annotation.data[`payload.${String(deleteIdx)}`];
+            if (existingRender) {
+                const newData = {};
+                for (let i = 0; i < oldCount; i++) {
+                    if (i === deleteIdx)
+                        continue;
+                    const pid = existingRender.annotation.data[`payload.${String(i)}`];
+                    if (pid)
+                        newData[`payload.${String(shift(i))}`] = pid;
+                }
+                // Remove the deleted layer's Payload entity if it's no longer used
+                if (deletedPayloadId) {
+                    const stillUsed = Object.values(newData).includes(deletedPayloadId);
+                    if (!stillUsed) {
+                        ops.push(delOp("Payload", deletedPayloadId));
+                    }
+                }
+                ops.push(putOp("Annotation", existingRender.annotationId, {
+                    id: existingRender.annotationId,
+                    kind: "Annotation",
+                    target: { kind: "Space", id: activeSpaceId },
+                    schema: "ui.layers.render",
+                    data: newData,
+                    createdAt: new Date().toISOString(),
+                }));
+            }
+            // 3. Re-index layer order
+            const existingOrder = findLayerOrder(prev, activeSpaceId);
+            if (existingOrder) {
+                const newOrder = existingOrder.order
+                    .filter((i) => i !== deleteIdx)
+                    .map(shift);
+                ops.push(putOp("Annotation", existingOrder.annotationId, {
+                    id: existingOrder.annotationId,
+                    kind: "Annotation",
+                    target: { kind: "Space", id: activeSpaceId },
+                    schema: "ui.layers.order",
+                    data: { order: serializeOrder(newOrder) },
+                    createdAt: new Date().toISOString(),
+                }));
+            }
+            // 4. Re-index layer props (hidden.{i}, maskActive.{i}, etc.)
+            const existingProps = findLayerProps(prev, activeSpaceId);
+            if (existingProps) {
+                const newData = {};
+                const prefixes = ["hidden", "maskActive", "maskInverted", "opacity", "name"];
+                for (const [key, val] of Object.entries(existingProps.annotation.data)) {
+                    // Check if this is a per-layer key (prefix.N)
+                    const dot = key.lastIndexOf(".");
+                    if (dot === -1) {
+                        // Non-indexed key like "solo"
+                        if (key === "solo") {
+                            const soloIdx = Number(val);
+                            if (Number.isFinite(soloIdx)) {
+                                if (soloIdx === deleteIdx)
+                                    continue; // clear solo if deleted
+                                newData[key] = String(shift(soloIdx));
+                            }
+                        }
+                        else {
+                            newData[key] = val;
+                        }
+                        continue;
+                    }
+                    const prefix = key.slice(0, dot);
+                    const idxStr = key.slice(dot + 1);
+                    const idx = Number(idxStr);
+                    if (!prefixes.includes(prefix) || !Number.isFinite(idx)) {
+                        newData[key] = val;
+                        continue;
+                    }
+                    if (idx === deleteIdx)
+                        continue; // drop deleted layer props
+                    newData[`${prefix}.${String(shift(idx))}`] = val;
+                }
+                ops.push(putOp("Annotation", existingProps.annotationId, {
+                    id: existingProps.annotationId,
+                    kind: "Annotation",
+                    target: { kind: "Space", id: activeSpaceId },
+                    schema: "ui.layers.props",
+                    data: newData,
+                    createdAt: new Date().toISOString(),
+                }));
+            }
+            // 5. Re-index GLB annotation (glb.{i} → PayloadId)
+            const existingGlb = findLayerGlb(prev, activeSpaceId);
+            if (existingGlb) {
+                const newData = {};
+                for (let i = 0; i < oldCount; i++) {
+                    if (i === deleteIdx)
+                        continue;
+                    const pid = existingGlb.annotation.data[`glb.${String(i)}`];
+                    if (pid)
+                        newData[`glb.${String(shift(i))}`] = pid;
+                }
+                if (Object.keys(newData).length === 0) {
+                    ops.push(delOp("Annotation", existingGlb.annotationId));
+                }
+                else {
+                    ops.push(putOp("Annotation", existingGlb.annotationId, {
+                        id: existingGlb.annotationId,
+                        kind: "Annotation",
+                        target: { kind: "Space", id: activeSpaceId },
+                        schema: "ui.layers.glb",
+                        data: newData,
+                        createdAt: new Date().toISOString(),
+                    }));
+                }
+            }
+            // 6. Re-index slice IDs (array of stable IDs)
+            const existingSliceIds = findSliceIds(prev, activeSpaceId);
+            const deletedSliceId = existingSliceIds?.ids[deleteIdx];
+            if (existingSliceIds) {
+                const newIds = existingSliceIds.ids.filter((_, i) => i !== deleteIdx);
+                ops.push(putOp("Annotation", existingSliceIds.annotationId, {
+                    id: existingSliceIds.annotationId,
+                    kind: "Annotation",
+                    target: { kind: "Space", id: activeSpaceId },
+                    schema: "ui.layers.sliceIds",
+                    data: { ids: JSON.stringify(newIds) },
+                    createdAt: new Date().toISOString(),
+                }));
+            }
+            // 6b. Remove the deleted slice's graph from AI history
+            if (deletedSliceId) {
+                const existingHist = findAIHistory(prev, activeSpaceId);
+                if (existingHist && existingHist.history.slices[deletedSliceId]) {
+                    const updatedSlices = { ...existingHist.history.slices };
+                    delete updatedSlices[deletedSliceId];
+                    const updatedHistory = {
+                        ...existingHist.history,
+                        slices: updatedSlices,
+                    };
+                    ops.push(putOp("Annotation", existingHist.annotationId, {
+                        id: existingHist.annotationId,
+                        kind: "Annotation",
+                        target: { kind: "Space", id: activeSpaceId },
+                        schema: SPACE_AI_HISTORY_SCHEMA,
+                        data: serializeAIHistory(updatedHistory),
+                        createdAt: new Date().toISOString(),
+                    }));
+                }
+            }
+            // 7. Update selection
+            const existingSel = findLayerSelection(prev, activeSpaceId);
+            const newSelectedIdx = deleteIdx >= newCount ? newCount - 1 : deleteIdx > 0 ? deleteIdx - 1 : 0;
+            const selAnnId = existingSel
+                ? existingSel.annotationId
+                : makeId("annotation");
+            ops.push(putOp("Annotation", selAnnId, {
+                id: selAnnId,
+                kind: "Annotation",
+                target: { kind: "Space", id: activeSpaceId },
+                schema: "ui.selection.layerIndex",
+                data: { layerIndex: String(newSelectedIdx) },
+                createdAt: new Date().toISOString(),
+            }));
+            return newPatch({ baseRevision: prev.revision, ops });
+        });
+        // Clean up local React state by re-indexing
+        setLayerGlbUrls((prev) => {
+            const next = {};
+            for (const [key, url] of Object.entries(prev)) {
+                const idx = Number(key);
+                if (idx === deleteIdx) {
+                    URL.revokeObjectURL(url); // free blob URL
+                    continue;
+                }
+                next[idx > deleteIdx ? idx - 1 : idx] = url;
+            }
+            return next;
+        });
+        setThreeDSourceHidden((prev) => {
+            const next = new Set();
+            for (const idx of prev) {
+                if (idx === deleteIdx)
+                    continue;
+                next.add(idx > deleteIdx ? idx - 1 : idx);
+            }
+            return next;
+        });
+        // ── Inpaint the deleted slice's area on the base image ──
+        if (deleteIdx > 0 && capturedOrigUri && capturedDeletedUri) {
+            const spaceId = activeSpaceId;
+            const inpaintOrigPid = capturedOrigPid;
+            const inpaintOrigUri = capturedOrigUri;
+            const inpaintDeletedUri = capturedDeletedUri;
+            const inpaintDeletedCrop = capturedDeletedCrop;
+            void (async () => {
+                try {
+                    console.info("[Inpaint-on-delete] Creating mask from deleted slice…");
+                    const maskDataUrl = await extractSliceMaskForInpaint(inpaintDeletedUri, inpaintDeletedCrop);
+                    console.info("[Inpaint-on-delete] Running inpainting…");
+                    // Get original image dimensions to preserve aspect ratio.
+                    // Clamp to the valid API range (512–2048).
+                    const origPayload = state.payloads[inpaintOrigPid];
+                    const origW = origPayload ? Number(origPayload.meta.width) : 0;
+                    const origH = origPayload ? Number(origPayload.meta.height) : 0;
+                    let inpaintImageSize;
+                    if (origW > 0 && origH > 0) {
+                        let w = origW;
+                        let h = origH;
+                        const longest = Math.max(w, h);
+                        if (longest > 2048) {
+                            const s = 2048 / longest;
+                            w = Math.round(w * s);
+                            h = Math.round(h * s);
+                        }
+                        const shortest = Math.min(w, h);
+                        if (shortest < 512) {
+                            const s = 512 / shortest;
+                            w = Math.round(w * s);
+                            h = Math.round(h * s);
+                        }
+                        w = Math.max(512, Math.min(2048, w));
+                        h = Math.max(512, Math.min(2048, h));
+                        inpaintImageSize = { width: w, height: h };
+                    }
+                    const inpaintResult = await runInpainting({
+                        imageDataUrl: inpaintOrigUri,
+                        maskDataUrl,
+                        prompt: "fill in the background naturally, seamless, high quality",
+                        strength: 0.95,
+                        outputFormat: "png",
+                        ...(inpaintImageSize ? { imageSize: inpaintImageSize } : {}),
+                    });
+                    const firstImg = inpaintResult.images[0];
+                    if (!firstImg)
+                        throw new Error("Inpainting returned no images");
+                    // Fetch and convert to data URL
+                    const { blob: ipBlob, buffer: ipBuffer } = await fetchImageBlob(firstImg.url);
+                    const ipHash = await sha256Hex(ipBuffer);
+                    let ipDataUrl;
+                    if (firstImg.url.startsWith("data:")) {
+                        ipDataUrl = firstImg.url;
+                    }
+                    else {
+                        ipDataUrl = await new Promise((resolve, reject) => {
+                            const reader = new FileReader();
+                            reader.onload = () => { resolve(reader.result); };
+                            reader.onerror = () => { reject(new Error("Failed to convert inpaint blob to data URL")); };
+                            reader.readAsDataURL(ipBlob);
+                        });
+                    }
+                    const ipBitmap = await createImageBitmap(ipBlob);
+                    const ipW = ipBitmap.width;
+                    const ipH = ipBitmap.height;
+                    ipBitmap.close();
+                    // Add the inpainted image as a new layer above layer 0
+                    const ipPayloadId = makeId("payload");
+                    commitPatch((prev) => {
+                        const space = prev.spaces[spaceId];
+                        if (!space)
+                            return null;
+                        const newLayerIdx = space.layerCount;
+                        const newCount = space.layerCount + 1;
+                        const ops = [];
+                        // Payload
+                        ops.push(putOp("Payload", ipPayloadId, {
+                            id: ipPayloadId,
+                            kind: "Payload",
+                            mediaType: "image/png",
+                            uri: ipDataUrl,
+                            sha256: ipHash,
+                            bytes: ipBuffer.byteLength,
+                            meta: { width: String(ipW), height: String(ipH) },
+                        }));
+                        // Increment layerCount
+                        ops.push(putOp("Space", spaceId, { ...space, layerCount: newCount }));
+                        // Add to render annotation
+                        const existingRender = findLayerRender(prev, spaceId);
+                        if (existingRender) {
+                            const newData = { ...existingRender.annotation.data };
+                            newData[`payload.${String(newLayerIdx)}`] = ipPayloadId;
+                            ops.push(putOp("Annotation", existingRender.annotationId, {
+                                id: existingRender.annotationId,
+                                kind: "Annotation",
+                                target: { kind: "Space", id: spaceId },
+                                schema: "ui.layers.render",
+                                data: newData,
+                                createdAt: new Date().toISOString(),
+                            }));
+                        }
+                        // Add to layer order (insert right above layer 0 — below everything else)
+                        const existingOrder = findLayerOrder(prev, spaceId);
+                        if (existingOrder) {
+                            const order = [...existingOrder.order];
+                            // Find where layer 0 is in the visual order and insert after it
+                            const zeroPos = order.indexOf(0);
+                            if (zeroPos !== -1) {
+                                order.splice(zeroPos + 1, 0, newLayerIdx);
+                            }
+                            else {
+                                // Layer 0 not in order — insert at the beginning (bottom)
+                                order.unshift(newLayerIdx);
+                            }
+                            ops.push(putOp("Annotation", existingOrder.annotationId, {
+                                id: existingOrder.annotationId,
+                                kind: "Annotation",
+                                target: { kind: "Space", id: spaceId },
+                                schema: "ui.layers.order",
+                                data: { order: serializeOrder(order) },
+                                createdAt: new Date().toISOString(),
+                            }));
+                        }
+                        else {
+                            // No persisted order — build default and insert new layer at position 1
+                            const order = defaultLayerOrder(space.layerCount); // existing layers
+                            order.splice(1, 0, newLayerIdx); // insert right above layer 0
+                            const orderAnnId = makeId("annotation");
+                            ops.push(putOp("Annotation", orderAnnId, {
+                                id: orderAnnId,
+                                kind: "Annotation",
+                                target: { kind: "Space", id: spaceId },
+                                schema: "ui.layers.order",
+                                data: { order: serializeOrder(order) },
+                                createdAt: new Date().toISOString(),
+                            }));
+                        }
+                        // Set layer name
+                        const existingProps = findLayerProps(prev, spaceId);
+                        if (existingProps) {
+                            const newData = { ...existingProps.annotation.data };
+                            newData[`name.${String(newLayerIdx)}`] = "Inpainted";
+                            ops.push(putOp("Annotation", existingProps.annotationId, {
+                                id: existingProps.annotationId,
+                                kind: "Annotation",
+                                target: { kind: "Space", id: spaceId },
+                                schema: "ui.layers.props",
+                                data: newData,
+                                createdAt: new Date().toISOString(),
+                            }));
+                        }
+                        // OperatorRun for provenance
+                        const oprunId = makeId("oprun");
+                        ops.push(putOp("OperatorRun", oprunId, {
+                            id: oprunId,
+                            kind: "OperatorRun",
+                            operator: "fal.inpainting",
+                            status: "succeeded",
+                            createdAt: new Date().toISOString(),
+                            finishedAt: new Date().toISOString(),
+                            inputs: [{ kind: "Payload", id: inpaintOrigPid }],
+                            outputs: [{ kind: "Payload", id: ipPayloadId }],
+                            params: {
+                                prompt: "fill in the background naturally, seamless, high quality",
+                                proxyRoute: "fal-ai/flux-lora/inpainting",
+                                trigger: "slice-delete",
+                            },
+                        }));
+                        return newPatch({ baseRevision: prev.revision, ops });
+                    });
+                    console.info("[Inpaint-on-delete] Added inpainted layer successfully");
+                }
+                catch (err) {
+                    console.error("[Inpaint-on-delete] Failed:", err);
+                }
+            })();
+        }
+    }, [activeSpaceId, commitPatch]);
     /* ── AI / Import state ───────────────────────────── */
-    const [aiRunning, setAiRunning] = useState(false);
-    const [aiError, setAiError] = useState(null);
+    const [aiEditingLayers, setAiEditingLayers] = useState(() => new Set());
+    const aiRunning = aiEditingLayers.size > 0;
+    const [aiErrors, setAiErrors] = useState({});
     const [aiPromptOpen, setAiPromptOpen] = useState(false);
+    const abortRefs = useRef({});
     const abortRef = useRef(null);
     const layerRender = useMemo(() => findLayerRender(state, activeSpaceId), [state, activeSpaceId]);
     /** Restore persisted GLB 3D models on load / space change. */
@@ -449,16 +924,34 @@ export default function App() {
     /** Build a map of layerIndex → payload URI for texture rendering.
      *  When maskActive is false for a slice layer, fall back to the
      *  original image (layer 0) so the user sees the unmasked original.
-     *  When a layer's source image is hidden (3D mode), skip its texture. */
+     *  When a layer's source image is hidden (3D mode), skip its texture.
+     *  After segmentation, layer 0's texture is suppressed in the viewport
+     *  so that deleting a segment truly removes the visual content instead
+     *  of being "filled in" by the base image underneath. */
     const layerTextures = useMemo(() => {
         const result = {};
         // Resolve the original image URI from layer 0 for mask-off fallback
         const origPid = layerPayloadId(layerRender, 0);
         const origUri = origPid ? state.payloads[origPid]?.uri : undefined;
+        // Detect segmented state: if any layer > 0 has a segmentIndex payload,
+        // then layer 0 is the base image from segmentation and should be suppressed.
+        let hasSegments = false;
+        for (let i = 1; i < layerCount; i++) {
+            const pid = layerPayloadId(layerRender, i);
+            const p = pid ? state.payloads[pid] : undefined;
+            if (p?.meta.segmentIndex !== undefined) {
+                hasSegments = true;
+                break;
+            }
+        }
         for (let i = 0; i < layerCount; i++) {
-            // Skip texture for layers whose source image is hidden (3D model visible instead),
-            // but always include the selected layer's texture so the segment is visible when editing.
-            if (threeDSourceHidden.has(i) && i !== effectiveSelectedIndex)
+            // Skip texture for layers whose 3D model is active.
+            // During 3D generation, keep showing the source image as a placeholder.
+            if (threeDSourceHidden.has(i) && generating3DLayer !== i)
+                continue;
+            // Suppress layer 0 texture when segment layers exist above it,
+            // UNLESS layer 0 is the only layer (no segments to compose).
+            if (i === 0 && hasSegments && layerCount > 1)
                 continue;
             const pid = layerPayloadId(layerRender, i);
             const payload = pid ? state.payloads[pid] : undefined;
@@ -476,7 +969,7 @@ export default function App() {
             }
         }
         return result;
-    }, [layerCount, layerRender, state.payloads, layerProps, threeDSourceHidden, effectiveSelectedIndex]);
+    }, [layerCount, layerRender, state.payloads, layerProps, threeDSourceHidden, generating3DLayer]);
     /** Build a map of layerIndex → payload URI for panel thumbnails.
      *  Unlike layerTextures, this always includes textures even when
      *  the source image is hidden (3D mode) so thumbnails stay visible. */
@@ -499,41 +992,16 @@ export default function App() {
         }
         return result;
     }, [layerCount, layerRender, state.payloads, layerProps]);
-    /** Build a map of layerIndex → CropInfo for layers that were tightly cropped.
-     *  When a layer has an AI history with a non-root display cursor, we use the
-     *  **root state's** crop info so the plane geometry stays stable while the
-     *  user navigates between history states (avoids visible restretch). */
-    const historyRootCropPids = useMemo(() => {
-        const result = {};
-        const hist = findAIHistory(state, activeSpaceId);
-        const slices = findSliceIds(state, activeSpaceId);
-        if (!hist || !slices)
-            return result;
-        for (let i = 0; i < layerCount; i++) {
-            const sliceId = slices.ids[i];
-            const graph = sliceId ? hist.history.slices[sliceId] : undefined;
-            if (!graph)
-                continue;
-            const rootState = graph.states[graph.rootStateId];
-            const rootImagePid = rootState?.assetRefs.image;
-            if (rootImagePid)
-                result[i] = rootImagePid;
-        }
-        return result;
-    }, [state, activeSpaceId, layerCount]);
     const layerCropInfo = useMemo(() => {
         const result = {};
         for (let i = 0; i < layerCount; i++) {
-            // Prefer the root state's payload for stable plane geometry across history nav
-            let cropPid = historyRootCropPids[i];
-            if (!cropPid) {
-                const pid = layerPayloadId(layerRender, i);
-                if (pid)
-                    cropPid = pid;
-            }
-            if (!cropPid)
+            // Always use the CURRENT render payload's crop info so the plane
+            // geometry matches the displayed texture (prevents aspect distortion
+            // after AI edits that produce differently-shaped crops).
+            const pid = layerPayloadId(layerRender, i);
+            if (!pid)
                 continue;
-            const payload = state.payloads[cropPid];
+            const payload = state.payloads[pid];
             if (!payload)
                 continue;
             const m = payload.meta;
@@ -548,7 +1016,7 @@ export default function App() {
             }
         }
         return result;
-    }, [layerCount, layerRender, state.payloads, historyRootCropPids]);
+    }, [layerCount, layerRender, state.payloads]);
     /** Build a map of layerIndex → colored-segment URI for the "colored" display mode. */
     const colorLayerTextures = useMemo(() => {
         const result = {};
@@ -572,6 +1040,19 @@ export default function App() {
     }, [layerCount, layerRender, state.payloads]);
     /** Derive aspect ratio (width/height) from the first payload that has dimensions. */
     const imageAspect = useMemo(() => {
+        // 1. Prefer the document source image (original import before segmentation)
+        //    so the prism shape stays stable after AI edits change layer dimensions.
+        const docSrcId = findAIHistory(state, activeSpaceId)?.history.documentSourceImageId;
+        if (docSrcId) {
+            const docPayload = state.payloads[docSrcId];
+            if (docPayload) {
+                const dw = Number(docPayload.meta.width);
+                const dh = Number(docPayload.meta.height);
+                if (dw > 0 && dh > 0)
+                    return dw / dh;
+            }
+        }
+        // 2. Fall back to origW/origH from any layer's crop metadata (stable original dims).
         for (let i = 0; i < layerCount; i++) {
             const pid = layerPayloadId(layerRender, i);
             if (!pid)
@@ -579,13 +1060,17 @@ export default function App() {
             const payload = state.payloads[pid];
             if (!payload)
                 continue;
+            const ow = Number(payload.meta.origW);
+            const oh = Number(payload.meta.origH);
+            if (ow > 0 && oh > 0)
+                return ow / oh;
             const w = Number(payload.meta.width);
             const h = Number(payload.meta.height);
             if (w > 0 && h > 0)
                 return w / h;
         }
         return null;
-    }, [layerCount, layerRender, state.payloads]);
+    }, [layerCount, layerRender, state, activeSpaceId]);
     /** Keyframe preview: composite all visible/display-state layers top-down into a single image. */
     const [keyframePreviewUrl, setKeyframePreviewUrl] = useState(null);
     useEffect(() => {
@@ -669,6 +1154,104 @@ export default function App() {
         })();
         return () => { cancelled = true; };
     }, [layerTextures, layerVisibility, effectiveOrder, layerCropInfo]);
+    /* ── Keyframe AI composite (Flux2 Flash Edit) ──── */
+    const [compositeResultUrl, setCompositeResultUrl] = useState(null);
+    const [compositeBusy, setCompositeBusy] = useState(false);
+    /** Build a higher-res keyframe composite (up to 1024px) for AI editing. */
+    const buildHiResKeyframe = useCallback(async () => {
+        const textureEntries = Object.entries(layerTextures);
+        if (textureEntries.length === 0)
+            return null;
+        const images = [];
+        await Promise.all(textureEntries.map(async ([idxStr, uri]) => {
+            const idx = Number(idxStr);
+            const vis = layerVisibility[idx];
+            if (vis && !vis.visible)
+                return;
+            const img = new Image();
+            img.src = uri;
+            await new Promise((resolve, reject) => {
+                img.onload = () => { resolve(); };
+                img.onerror = () => { reject(new Error("img load failed")); };
+            });
+            images.push({ idx, img });
+        }));
+        if (images.length === 0)
+            return null;
+        let maxW = 0, maxH = 0;
+        for (const { img } of images) {
+            if (img.naturalWidth > maxW)
+                maxW = img.naturalWidth;
+            if (img.naturalHeight > maxH)
+                maxH = img.naturalHeight;
+        }
+        if (maxW === 0 || maxH === 0)
+            return null;
+        const scale = Math.min(1, 1024 / Math.max(maxW, maxH));
+        const cW = Math.round(maxW * scale);
+        const cH = Math.round(maxH * scale);
+        const canvas = document.createElement("canvas");
+        canvas.width = cW;
+        canvas.height = cH;
+        const ctx = canvas.getContext("2d");
+        if (!ctx)
+            return null;
+        images.sort((a, b) => {
+            const posA = effectiveOrder.indexOf(a.idx);
+            const posB = effectiveOrder.indexOf(b.idx);
+            return posA - posB;
+        });
+        for (const { idx, img } of images) {
+            const vis = layerVisibility[idx];
+            const texOpacity = vis ? vis.textureOpacity : 1;
+            ctx.globalAlpha = texOpacity;
+            const crop = layerCropInfo[idx];
+            if (crop && crop.origW > 0 && crop.origH > 0) {
+                const sx = (crop.cropX / crop.origW) * cW;
+                const sy = (crop.cropY / crop.origH) * cH;
+                const sw = (crop.cropW / crop.origW) * cW;
+                const sh = (crop.cropH / crop.origH) * cH;
+                ctx.drawImage(img, sx, sy, sw, sh);
+            }
+            else {
+                ctx.drawImage(img, 0, 0, cW, cH);
+            }
+        }
+        return canvas.toDataURL("image/png");
+    }, [layerTextures, layerVisibility, effectiveOrder, layerCropInfo]);
+    const handleCompositeKeyframe = useCallback(async () => {
+        setCompositeBusy(true);
+        try {
+            const hiRes = await buildHiResKeyframe();
+            if (!hiRes) {
+                setCompositeBusy(false);
+                return;
+            }
+            const result = await runFlux2Edit({
+                imageDataUrls: [hiRes],
+                prompt: "composite this image so it looks perfect",
+            });
+            const outputUrl = result.images[0]?.url;
+            if (outputUrl) {
+                // Fetch the result and convert to data URL to avoid CORS issues
+                const resp = await fetch(outputUrl);
+                const blob = await resp.blob();
+                const dataUrl = await new Promise((resolve, reject) => {
+                    const reader = new FileReader();
+                    reader.onload = () => { resolve(reader.result); };
+                    reader.onerror = () => { reject(new Error("Failed to read composite result")); };
+                    reader.readAsDataURL(blob);
+                });
+                setCompositeResultUrl(dataUrl);
+            }
+        }
+        catch (err) {
+            console.error("[Composite Keyframe] error:", err);
+        }
+        finally {
+            setCompositeBusy(false);
+        }
+    }, [buildHiResKeyframe]);
     /**
      * Helper: emit a render-mapping update patch.
      * Takes the current render annotation (or creates one) and applies an updater.
@@ -799,22 +1382,63 @@ export default function App() {
     }, [getSliceIdForLayer, aiHistory]);
     /** Set the display cursor for a slice (by layer index) and update render annotation. */
     const handleSetDisplayCursor = useCallback((layerIndex, stateId) => {
+        // \u2500\u2500 Resolve GLB presence for the target state (outside commitPatch) \u2500\u2500
+        // Look up the state node in the current project state so we can toggle 3D model display.
+        const sliceIds = getOrCreateSliceIds(state, activeSpaceId).sliceIds;
+        const sliceId = sliceIds[layerIndex];
+        if (sliceId) {
+            const hist = getOrCreateAIHistory(state, activeSpaceId, sliceIds).history;
+            const graph = hist.slices[sliceId];
+            const targetState = graph?.states[stateId];
+            if (targetState?.assetRefs.glb) {
+                // Target state has a 3D model \u2014 show it
+                const glbPid = targetState.assetRefs.glb;
+                const glbPayload = state.payloads[glbPid];
+                if (glbPayload) {
+                    fetch(glbPayload.uri)
+                        .then((r) => r.blob())
+                        .then((blob) => {
+                        const blobUrl = URL.createObjectURL(blob);
+                        setLayerGlbUrls((prev) => ({ ...prev, [layerIndex]: blobUrl }));
+                        setThreeDSourceHidden((prev) => new Set(prev).add(layerIndex));
+                    })
+                        .catch(() => { });
+                }
+            }
+            else {
+                // Target state has no 3D model \u2014 remove any active GLB for this layer
+                setLayerGlbUrls((prev) => {
+                    if (!(layerIndex in prev))
+                        return prev;
+                    const next = { ...prev };
+                    delete next[layerIndex];
+                    return next;
+                });
+                setThreeDSourceHidden((prev) => {
+                    if (!prev.has(layerIndex))
+                        return prev;
+                    const next = new Set(prev);
+                    next.delete(layerIndex);
+                    return next;
+                });
+            }
+        }
         commitPatch((prev) => {
-            const { sliceIds, ops: sliceOps } = getOrCreateSliceIds(prev, activeSpaceId);
-            const sliceId = sliceIds[layerIndex];
-            if (!sliceId)
+            const { sliceIds: sIds, ops: sliceOps } = getOrCreateSliceIds(prev, activeSpaceId);
+            const sId = sIds[layerIndex];
+            if (!sId)
                 return null;
-            const { history, annotationId, ops: histOps } = getOrCreateAIHistory(prev, activeSpaceId, sliceIds);
-            const graph = history.slices[sliceId];
-            if (!graph)
+            const { history, annotationId, ops: histOps } = getOrCreateAIHistory(prev, activeSpaceId, sIds);
+            const g = history.slices[sId];
+            if (!g)
                 return null;
-            const stateNode = graph.states[stateId];
+            const stateNode = g.states[stateId];
             if (!stateNode)
                 return null;
-            const updatedGraph = setDisplayCursor(graph, stateId);
+            const updatedGraph = setDisplayCursor(g, stateId);
             const updatedHistory = {
                 ...history,
-                slices: { ...history.slices, [sliceId]: updatedGraph },
+                slices: { ...history.slices, [sId]: updatedGraph },
             };
             const allOps = [...sliceOps, ...histOps];
             allOps.push(buildHistoryPatchOp(updatedHistory, annotationId, activeSpaceId));
@@ -836,7 +1460,7 @@ export default function App() {
             }
             return newPatch({ baseRevision: prev.revision, ops: allOps });
         });
-    }, [activeSpaceId, commitPatch, getOrCreateSliceIds, getOrCreateAIHistory, buildHistoryPatchOp]);
+    }, [activeSpaceId, state, commitPatch, getOrCreateSliceIds, getOrCreateAIHistory, buildHistoryPatchOp]);
     /** Set the operation cursor for a slice (by layer index). */
     const handleSetOperationCursor = useCallback((layerIndex, stateId) => {
         commitPatch((prev) => {
@@ -860,8 +1484,8 @@ export default function App() {
     }, [activeSpaceId, commitPatch, getOrCreateSliceIds, getOrCreateAIHistory, buildHistoryPatchOp]);
     /**
      * Invert mask: flip the alpha channel of the layer's current image,
-     * creating a new payload with inverted transparency.
-     * Also toggles the `maskInverted` annotation flag.
+     * creating a new payload with inverted transparency on a **new** slice.
+     * The original slice retains its current image.
      */
     const handleInvertMask = useCallback(async (index) => {
         const pid = layerPayloadId(layerRender, index);
@@ -926,35 +1550,81 @@ export default function App() {
                     invertedFrom: pid,
                 },
             };
-            // Update the render annotation + record in AI history
+            // Create a new slice with the inverted payload, keeping the original slice intact
             commitPatch((prev) => {
+                const space = prev.spaces[activeSpaceId];
+                if (!space)
+                    return null;
                 const patchOps = [putOp("Payload", newPayloadId, newPayloadValue)];
+                const newLayerIdx = space.layerCount;
+                const newCount = space.layerCount + 1;
+                // 1. Increment layerCount
+                const updatedSpace = { ...space, layerCount: newCount };
+                patchOps.push(putOp("Space", activeSpaceId, updatedSpace));
+                // 2. Extend layer order — insert new slice right above the source slice
+                const existingOrder = findLayerOrder(prev, activeSpaceId);
+                if (existingOrder) {
+                    const orderArr = [...existingOrder.order];
+                    const sourcePos = orderArr.indexOf(index);
+                    if (sourcePos >= 0) {
+                        orderArr.splice(sourcePos + 1, 0, newLayerIdx);
+                    }
+                    else {
+                        orderArr.push(newLayerIdx);
+                    }
+                    const orderAnnotation = {
+                        id: existingOrder.annotationId,
+                        kind: "Annotation",
+                        target: { kind: "Space", id: activeSpaceId },
+                        schema: "ui.layers.order",
+                        data: { order: serializeOrder(orderArr) },
+                        createdAt: new Date().toISOString(),
+                    };
+                    patchOps.push(putOp("Annotation", existingOrder.annotationId, orderAnnotation));
+                }
+                // 3. Select the new slice
+                const existingSel = findLayerSelection(prev, activeSpaceId);
+                const selAnnId = existingSel
+                    ? existingSel.annotationId
+                    : makeId("annotation");
+                const selAnnotation = {
+                    id: selAnnId,
+                    kind: "Annotation",
+                    target: { kind: "Space", id: activeSpaceId },
+                    schema: "ui.selection.layerIndex",
+                    data: { layerIndex: String(newLayerIdx) },
+                    createdAt: new Date().toISOString(),
+                };
+                patchOps.push(putOp("Annotation", selAnnId, selAnnotation));
+                // 4. AI history for the new slice
                 const { sliceIds, ops: sliceOps } = getOrCreateSliceIds(prev, activeSpaceId);
-                const sliceId = sliceIds[index];
                 patchOps.push(...sliceOps);
-                if (sliceId) {
-                    const { history, annotationId, ops: histOps } = getOrCreateAIHistory(prev, activeSpaceId, sliceIds);
+                // The new slice needs a sliceId; re-derive after bumping count
+                const newSliceIds = [...sliceIds];
+                while (newSliceIds.length < newCount) {
+                    newSliceIds.push(makeId("slice"));
+                }
+                const newSliceId = newSliceIds[newLayerIdx];
+                if (newSliceId) {
+                    const { history, annotationId, ops: histOps } = getOrCreateAIHistory(prev, activeSpaceId, newSliceIds);
                     patchOps.push(...histOps);
-                    const existingPid = layerPayloadId(findLayerRender(prev, activeSpaceId), index);
-                    const rootAssets = {};
-                    if (existingPid)
-                        rootAssets.image = existingPid;
-                    let updatedHistory = ensureHistoryGraphForSlice(history, sliceId, rootAssets);
-                    const graph = updatedHistory.slices[sliceId];
+                    const rootAssets = { image: newPayloadId };
+                    let updatedHistory = ensureHistoryGraphForSlice(history, newSliceId, rootAssets);
+                    const graph = updatedHistory.slices[newSliceId];
                     const result = addOpResultToGraph(graph, {
                         inputStateId: graph.operationStateId,
                         opType: "maskInvert",
                         outputAssets: [{ image: newPayloadId }],
-                        sliceIndex: index,
+                        sliceIndex: newLayerIdx,
                     });
-                    updatedHistory = { ...updatedHistory, slices: { ...updatedHistory.slices, [sliceId]: result.graph } };
+                    updatedHistory = { ...updatedHistory, slices: { ...updatedHistory.slices, [newSliceId]: result.graph } };
                     patchOps.push(buildHistoryPatchOp(updatedHistory, annotationId, activeSpaceId));
                 }
-                // Render annotation update
+                // 5. Render annotation: assign inverted payload to the new slice
                 const existing = findLayerRender(prev, activeSpaceId);
                 const annId = existing ? existing.annotationId : makeId("annotation");
                 const currentData = existing ? { ...existing.annotation.data } : {};
-                currentData[`payload.${String(index)}`] = newPayloadId;
+                currentData[`payload.${String(newLayerIdx)}`] = newPayloadId;
                 patchOps.push(putOp("Annotation", annId, {
                     id: annId, kind: "Annotation",
                     target: { kind: "Space", id: activeSpaceId },
@@ -963,20 +1633,18 @@ export default function App() {
                 }));
                 return newPatch({ baseRevision: prev.revision, ops: patchOps });
             });
-            // Toggle the maskInverted annotation flag
+            // Set maskInverted flag on the new slice (it is the inverted result)
             emitPropsUpdate((data) => {
-                const key = `maskInverted.${String(index)}`;
-                const currently = data[key] === "true";
-                if (currently) {
-                    return Object.fromEntries(Object.entries(data).filter(([k]) => k !== key));
-                }
-                return { ...data, [key]: "true" };
+                // Find the new layer index — it's layerCount at patch time
+                const space = state.spaces[activeSpaceId];
+                const newIdx = space ? space.layerCount : index;
+                return { ...data, [`maskInverted.${String(newIdx)}`]: "true" };
             });
         }
         catch (err) {
             console.error("[InvertMask] failed:", err);
         }
-    }, [layerRender, state.payloads, commitPatch, activeSpaceId, emitPropsUpdate, layerCropInfo, getOrCreateSliceIds, getOrCreateAIHistory, buildHistoryPatchOp]);
+    }, [layerRender, state.payloads, state.spaces, commitPatch, activeSpaceId, emitPropsUpdate, layerCropInfo, getOrCreateSliceIds, getOrCreateAIHistory, buildHistoryPatchOp]);
     /** Combine user-selected masks into a new layer. */
     const handleCombineMasks = useCallback(async (maskUrls) => {
         if (maskUrls.length === 0)
@@ -1120,11 +1788,11 @@ export default function App() {
         const payload = state.payloads[pid];
         if (!payload)
             return;
-        // Get the original (full) image from layer 0 for context
-        const origPid = layerPayloadId(layerRender, 0);
-        const origPayload = origPid ? state.payloads[origPid] : undefined;
-        if (!origPayload)
-            return;
+        // Capture the current display state for the slice so the 3D model
+        // is recorded against the node the user is actually viewing.
+        const sliceGraph = getSliceHistory(index);
+        const capturedDisplayStateId = sliceGraph?.displayStateId ?? null;
+        const capturedImagePid = pid;
         setGenerating3DLayer(index);
         // Hide the source image by default during generation
         setThreeDSourceHidden((prev) => new Set(prev).add(index));
@@ -1132,119 +1800,72 @@ export default function App() {
         const controller = new AbortController();
         abortRef.current = controller;
         try {
-            // Build a full-size binary mask from the segment layer's cropped+alpha payload.
-            // SAM-3 expects image_url = full scene, mask_urls = binary (white=object, black=bg).
-            const meta = payload.meta;
-            const cropX = Number(meta["cropX"] ?? 0);
-            const cropY = Number(meta["cropY"] ?? 0);
-            const origW = Number(meta["origW"] ?? 0);
-            const origH = Number(meta["origH"] ?? 0);
-            let maskDataUrl;
-            if (origW > 0 && origH > 0) {
-                // Load the cropped+alpha segment image
-                const segImg = await new Promise((resolve, reject) => {
-                    const img = new Image();
-                    img.onload = () => { resolve(img); };
-                    img.onerror = reject;
-                    img.src = payload.uri;
-                });
-                // Create full-size canvas, fill black, draw segment at crop position
-                const maskCanvas = document.createElement("canvas");
-                maskCanvas.width = origW;
-                maskCanvas.height = origH;
-                const mCtx = maskCanvas.getContext("2d");
-                mCtx.fillStyle = "#000000";
-                mCtx.fillRect(0, 0, origW, origH);
-                // Draw segment onto a temp canvas to read alpha
-                const tmpCanvas = document.createElement("canvas");
-                tmpCanvas.width = segImg.naturalWidth;
-                tmpCanvas.height = segImg.naturalHeight;
-                const tCtx = tmpCanvas.getContext("2d");
-                tCtx.drawImage(segImg, 0, 0);
-                const segData = tCtx.getImageData(0, 0, tmpCanvas.width, tmpCanvas.height);
-                // Build full-size mask: white where segment alpha > 128
-                const fullData = mCtx.getImageData(0, 0, origW, origH);
-                const fd = fullData.data;
-                const sd = segData.data;
-                for (let sy = 0; sy < tmpCanvas.height; sy++) {
-                    for (let sx = 0; sx < tmpCanvas.width; sx++) {
-                        const sIdx = (sy * tmpCanvas.width + sx) * 4;
-                        if (sd[sIdx + 3] > 128) {
-                            const fx = cropX + sx;
-                            const fy = cropY + sy;
-                            if (fx >= 0 && fx < origW && fy >= 0 && fy < origH) {
-                                const fIdx = (fy * origW + fx) * 4;
-                                fd[fIdx] = 255;
-                                fd[fIdx + 1] = 255;
-                                fd[fIdx + 2] = 255;
-                                fd[fIdx + 3] = 255;
-                            }
-                        }
+            // Determine which image to send to SAM-3 and build a matching mask.
+            // The image is the slice's current visible texture (reflecting AI edits
+            // and history navigation). The mask is derived from the visible image's
+            // alpha channel at the same resolution so image_url and mask_urls align.
+            const visibleUri = layerTextures[index] ?? payload.uri;
+            const imageUrl = visibleUri;
+            // Load the visible image to derive its mask
+            const visImg = await new Promise((resolve, reject) => {
+                const img = new Image();
+                img.onload = () => { resolve(img); };
+                img.onerror = reject;
+                img.src = visibleUri;
+            });
+            const visW = visImg.naturalWidth;
+            const visH = visImg.naturalHeight;
+            // Read pixel data from visible image
+            const tmpCanvas = document.createElement("canvas");
+            tmpCanvas.width = visW;
+            tmpCanvas.height = visH;
+            const tCtx = tmpCanvas.getContext("2d");
+            if (!tCtx)
+                throw new Error("Canvas 2D context unavailable");
+            tCtx.drawImage(visImg, 0, 0);
+            const visData = tCtx.getImageData(0, 0, visW, visH);
+            // Build binary mask at the same resolution as the visible image:
+            // white where alpha > 128, black elsewhere.
+            const maskCanvas = document.createElement("canvas");
+            maskCanvas.width = visW;
+            maskCanvas.height = visH;
+            const mCtx = maskCanvas.getContext("2d");
+            if (!mCtx)
+                throw new Error("Canvas 2D context unavailable");
+            mCtx.fillStyle = "#000000";
+            mCtx.fillRect(0, 0, visW, visH);
+            const maskImgData = mCtx.getImageData(0, 0, visW, visH);
+            const md = maskImgData.data;
+            const vd = visData.data;
+            // Check if the image has meaningful alpha (any pixel with alpha < 250)
+            let hasAlpha = false;
+            for (let i = 3; i < vd.length; i += 4) {
+                if ((vd[i] ?? 255) < 250) {
+                    hasAlpha = true;
+                    break;
+                }
+            }
+            if (hasAlpha) {
+                for (let i = 0; i < vd.length; i += 4) {
+                    if ((vd[i + 3] ?? 0) > 128) {
+                        md[i] = 255;
+                        md[i + 1] = 255;
+                        md[i + 2] = 255;
+                        md[i + 3] = 255;
                     }
                 }
-                mCtx.putImageData(fullData, 0, 0);
-                maskDataUrl = maskCanvas.toDataURL("image/png");
             }
             else {
-                // No crop info — send segment as-is (fallback)
-                maskDataUrl = payload.uri;
-            }
-            const imageUrl = origPayload.uri;
-            // SAM-3 requires image_url = full scene, mask_urls = binary masks.
-            // When mask is active, rebuild the binary mask from the current
-            // layer's visible texture (which reflects AI edits and mask changes)
-            // so 3D generation always uses up-to-date boundaries.
-            const maskOn = isMaskActive(layerProps, index, layerCount);
-            const visibleUri = layerTextures[index] ?? payload.uri;
-            if (maskOn && index > 0) {
-                // The visible texture already has alpha from segmentation / AI edits.
-                // Rebuild a full-size binary mask from it.
-                const segImg = await new Promise((resolve, reject) => {
-                    const img = new Image();
-                    img.onload = () => { resolve(img); };
-                    img.onerror = reject;
-                    img.src = visibleUri;
-                });
-                const visW = segImg.naturalWidth;
-                const visH = segImg.naturalHeight;
-                const tmpC = document.createElement("canvas");
-                tmpC.width = visW;
-                tmpC.height = visH;
-                const tCtx = tmpC.getContext("2d");
-                if (!tCtx)
-                    throw new Error("Canvas 2D context unavailable");
-                tCtx.drawImage(segImg, 0, 0);
-                const visData = tCtx.getImageData(0, 0, visW, visH);
-                const reMaskCanvas = document.createElement("canvas");
-                reMaskCanvas.width = origW > 0 ? origW : visW;
-                reMaskCanvas.height = origH > 0 ? origH : visH;
-                const rmCtx = reMaskCanvas.getContext("2d");
-                if (!rmCtx)
-                    throw new Error("Canvas 2D context unavailable");
-                rmCtx.fillStyle = "#000000";
-                rmCtx.fillRect(0, 0, reMaskCanvas.width, reMaskCanvas.height);
-                const fullMaskData = rmCtx.getImageData(0, 0, reMaskCanvas.width, reMaskCanvas.height);
-                const fmd = fullMaskData.data;
-                const vd = visData.data;
-                for (let sy = 0; sy < visH; sy++) {
-                    for (let sx = 0; sx < visW; sx++) {
-                        const sIdx = (sy * visW + sx) * 4;
-                        if ((vd[sIdx + 3] ?? 0) > 128) {
-                            const fx = cropX + sx;
-                            const fy = cropY + sy;
-                            if (fx >= 0 && fx < reMaskCanvas.width && fy >= 0 && fy < reMaskCanvas.height) {
-                                const fIdx = (fy * reMaskCanvas.width + fx) * 4;
-                                fmd[fIdx] = 255;
-                                fmd[fIdx + 1] = 255;
-                                fmd[fIdx + 2] = 255;
-                                fmd[fIdx + 3] = 255;
-                            }
-                        }
-                    }
+                // Fully opaque image (e.g. full scene or mask-off): fill mask white
+                for (let i = 0; i < md.length; i += 4) {
+                    md[i] = 255;
+                    md[i + 1] = 255;
+                    md[i + 2] = 255;
+                    md[i + 3] = 255;
                 }
-                rmCtx.putImageData(fullMaskData, 0, 0);
-                maskDataUrl = reMaskCanvas.toDataURL("image/png");
             }
+            mCtx.putImageData(maskImgData, 0, 0);
+            const maskDataUrl = maskCanvas.toDataURL("image/png");
             const result = await runImageTo3D({
                 imageUrl,
                 maskUrls: [maskDataUrl],
@@ -1322,10 +1943,19 @@ export default function App() {
                         rootAssets.image = existingPid;
                     let updatedHistory = ensureHistoryGraphForSlice(history, sliceId, rootAssets);
                     const graph = updatedHistory.slices[sliceId];
+                    // Use the display state captured at invocation time so the 3D
+                    // model is linked to the node the user was viewing, not the
+                    // operation cursor (which may differ after history navigation).
+                    const inputStateId = capturedDisplayStateId && graph.states[capturedDisplayStateId]
+                        ? capturedDisplayStateId
+                        : graph.displayStateId;
+                    // The output node keeps the same image as the source node and
+                    // attaches the new GLB.
+                    const sourceImagePid = (capturedImagePid ?? existingPid ?? glbPayloadId);
                     const histResult = addOpResultToGraph(graph, {
-                        inputStateId: graph.operationStateId,
+                        inputStateId,
                         opType: "imageTo3D",
-                        outputAssets: [{ image: (layerPayloadId(findLayerRender(prev, activeSpaceId), index) ?? glbPayloadId), glb: glbPayloadId }],
+                        outputAssets: [{ image: sourceImagePid, glb: glbPayloadId }],
                         summary: { model: "sam3" },
                         sliceIndex: index,
                     });
@@ -1352,7 +1982,7 @@ export default function App() {
             setGenerating3DLayer(null);
             abortRef.current = null;
         }
-    }, [generating3DLayer, layerRender, state.payloads, commitPatch, activeSpaceId, layerProps, layerCount, layerTextures, getOrCreateSliceIds, getOrCreateAIHistory, buildHistoryPatchOp]);
+    }, [generating3DLayer, layerRender, state.payloads, commitPatch, activeSpaceId, layerTextures, getOrCreateSliceIds, getOrCreateAIHistory, buildHistoryPatchOp, getSliceHistory]);
     /** Import an image file into the selected layer. */
     const handleImportImage = useCallback(async () => {
         if (effectiveSelectedIndex === null)
@@ -1432,19 +2062,17 @@ export default function App() {
             return newPatch({ baseRevision: prev.revision, ops: patchOps });
         });
     }, [effectiveSelectedIndex, commitPatch, activeSpaceId, getOrCreateSliceIds, getOrCreateAIHistory, buildHistoryPatchOp]);
-    /** Run AI edit on the selected layer's current image using the preferred model. */
-    const handleAiEdit = useCallback(async (prompt, strength) => {
-        if (effectiveSelectedIndex === null)
-            return;
-        setAiError(null);
-        setAiRunning(true);
-        // Cancel any in-flight request
-        abortRef.current?.abort();
+    /** Run AI edit on a specific layer's current image using the preferred model. */
+    const handleAiEditForLayer = useCallback(async (layerIndex, prompt, strength) => {
+        setAiErrors((prev) => { const next = { ...prev }; delete next[layerIndex]; return next; });
+        setAiEditingLayers((prev) => new Set(prev).add(layerIndex));
+        // Cancel any in-flight request for this layer
+        abortRefs.current[layerIndex]?.abort();
         const controller = new AbortController();
-        abortRef.current = controller;
+        abortRefs.current[layerIndex] = controller;
         try {
-            // Get the current layer's image
-            const pid = layerPayloadId(layerRender, effectiveSelectedIndex);
+            // Get the target layer's image
+            const pid = layerPayloadId(layerRender, layerIndex);
             if (!pid) {
                 throw new Error("No image on this layer. Import an image first.");
             }
@@ -1454,16 +2082,43 @@ export default function App() {
             }
             // Use the *visible* texture (accounts for mask-off fallback, inversions,
             // combined masks, etc.) so the AI receives what the user actually sees.
-            const visibleUri = layerTextures[effectiveSelectedIndex] ?? payload.uri;
+            const visibleUri = layerTextures[layerIndex] ?? payload.uri;
             const inputPayloadId = pid;
             const modelDef = getAiEditModel(preferences.defaultAiEditModelId);
+            // Preserve source dimensions so the AI output matches the input aspect ratio.
+            // The Flux 2 API requires image_size width/height between 512 and 2048.
+            const srcW = Number(payload.meta.width);
+            const srcH = Number(payload.meta.height);
+            let sourceImageSize;
+            if (srcW > 0 && srcH > 0) {
+                let w = srcW;
+                let h = srcH;
+                // Scale down if either dimension exceeds 2048
+                const longest = Math.max(w, h);
+                if (longest > 2048) {
+                    const scale = 2048 / longest;
+                    w = Math.round(w * scale);
+                    h = Math.round(h * scale);
+                }
+                // Scale up if either dimension is below 512
+                const shortest = Math.min(w, h);
+                if (shortest < 512) {
+                    const scale = 512 / shortest;
+                    w = Math.round(w * scale);
+                    h = Math.round(h * scale);
+                }
+                // Clamp to valid range
+                w = Math.max(512, Math.min(2048, w));
+                h = Math.max(512, Math.min(2048, h));
+                sourceImageSize = { width: w, height: h };
+            }
             // Run the selected model
             let result;
             if (modelDef.id === "nano-banana") {
                 result = await runNanoBananaEdit({ imageDataUrls: [visibleUri], prompt }, controller.signal);
             }
             else {
-                result = await runImg2Img({ imageDataUrl: visibleUri, prompt, strength: strength ?? 0.75 }, controller.signal);
+                result = await runFlux2Edit({ imageDataUrls: [visibleUri], prompt, ...(sourceImageSize ? { imageSize: sourceImageSize } : {}) }, controller.signal);
             }
             const firstImage = result.images[0];
             if (!firstImage)
@@ -1474,8 +2129,8 @@ export default function App() {
             // If the visible input was the masked payload (not the full original
             // fallback), check if the AI result still fits the original mask shape.
             // If not, run background removal to create a fresh segment.
-            const maskOn = isMaskActive(layerProps, effectiveSelectedIndex, layerCount);
-            const sentMaskedInput = maskOn && effectiveSelectedIndex > 0;
+            const maskOn = isMaskActive(layerProps, layerIndex, layerCount);
+            const sentMaskedInput = maskOn && layerIndex > 0;
             // Parse source crop metadata if present
             const srcCrop = payload.meta.cropX !== undefined
                 ? {
@@ -1689,7 +2344,7 @@ export default function App() {
                 finalPayloadId = regenPayloadId;
                 console.info("[Mask Regen] Fresh mask generated and recorded as separate operation");
             }
-            const layerIdx = effectiveSelectedIndex;
+            const layerIdx = layerIndex;
             // Record in AI history
             commitPatch((prev) => {
                 const { sliceIds, ops: sliceOps } = getOrCreateSliceIds(prev, activeSpaceId);
@@ -1742,13 +2397,19 @@ export default function App() {
             if (err instanceof DOMException && err.name === "AbortError")
                 return;
             const msg = err instanceof Error ? err.message : "Unknown error";
-            setAiError(msg);
+            setAiErrors((prev) => ({ ...prev, [layerIndex]: msg }));
         }
         finally {
-            setAiRunning(false);
-            abortRef.current = null;
+            setAiEditingLayers((prev) => { const next = new Set(prev); next.delete(layerIndex); return next; });
+            delete abortRefs.current[layerIndex];
         }
-    }, [effectiveSelectedIndex, layerRender, state.payloads, commitPatch, activeSpaceId, preferences.defaultAiEditModelId, layerProps, layerCount, layerTextures, getOrCreateSliceIds, getOrCreateAIHistory, buildHistoryPatchOp]);
+    }, [layerRender, state.payloads, commitPatch, activeSpaceId, preferences.defaultAiEditModelId, layerProps, layerCount, layerTextures, getOrCreateSliceIds, getOrCreateAIHistory, buildHistoryPatchOp]);
+    /** Run AI edit on the selected layer (backward-compat wrapper). */
+    const handleAiEdit = useCallback((prompt, strength) => {
+        if (effectiveSelectedIndex === null)
+            return;
+        void handleAiEditForLayer(effectiveSelectedIndex, prompt, strength);
+    }, [effectiveSelectedIndex, handleAiEditForLayer]);
     /* ── Ingest flow: Tabula Rasa → Image → BrickUI ── */
     /** Proxy function for text-to-image generation via fal.ai */
     const proxyGenerate = useCallback(async (prompt, signal) => {
@@ -1839,17 +2500,19 @@ export default function App() {
                     const allOps = [...opResult.ops];
                     // Build the render annotation mapping from prev (latest state)
                     const maskIds = opResult.maskPayloadIds ?? [];
+                    // Build a complete payload-per-layer map that includes the segment
+                    // payloads being added in this same patch (prev doesn't have them yet).
+                    const existing = findLayerRender(prev, activeSpaceId);
+                    const annId = existing
+                        ? existing.annotationId
+                        : makeId("annotation");
+                    const currentData = existing ? { ...existing.annotation.data } : {};
+                    for (let i = 0; i < maskIds.length; i++) {
+                        const pid = maskIds[i];
+                        if (pid)
+                            currentData[`payload.${String(i + 1)}`] = pid;
+                    }
                     if (maskIds.length > 0) {
-                        const existing = findLayerRender(prev, activeSpaceId);
-                        const annId = existing
-                            ? existing.annotationId
-                            : makeId("annotation");
-                        const currentData = existing ? { ...existing.annotation.data } : {};
-                        for (let i = 0; i < maskIds.length; i++) {
-                            const pid = maskIds[i];
-                            if (pid)
-                                currentData[`payload.${String(i + 1)}`] = pid;
-                        }
                         const annotationValue = {
                             id: annId,
                             kind: "Annotation",
@@ -1860,10 +2523,45 @@ export default function App() {
                         };
                         allOps.push(putOp("Annotation", annId, annotationValue));
                     }
-                    // Initialize AI history with root states for each slice
+                    // Initialize AI history with root states for each slice.
+                    // We must use the segment payload IDs directly (from currentData)
+                    // because they are being added in this same patch and won't be
+                    // visible via findLayerRender(prev).
                     const { sliceIds, ops: sliceOps } = getOrCreateSliceIds(prev, activeSpaceId);
                     allOps.push(...sliceOps);
-                    const { history, annotationId: histAnnId, ops: histOps } = getOrCreateAIHistory(prev, activeSpaceId, sliceIds);
+                    const existingHist = findAIHistory(prev, activeSpaceId);
+                    let history;
+                    let histAnnId;
+                    let histOps;
+                    if (existingHist) {
+                        history = existingHist.history;
+                        histAnnId = existingHist.annotationId;
+                        histOps = [];
+                    }
+                    else {
+                        history = createSpaceAIHistory();
+                        // Use currentData (which includes the segment payloads) to
+                        // initialize each slice's root state with the correct image.
+                        for (let i = 0; i < sliceIds.length; i++) {
+                            const sliceId = sliceIds[i];
+                            const pid = currentData[`payload.${String(i)}`];
+                            if (pid) {
+                                history = ensureHistoryGraphForSlice(history, sliceId, {
+                                    image: pid,
+                                });
+                            }
+                        }
+                        histAnnId = makeId("annotation");
+                        const ann = {
+                            id: histAnnId,
+                            kind: "Annotation",
+                            target: { kind: "Space", id: activeSpaceId },
+                            schema: SPACE_AI_HISTORY_SCHEMA,
+                            data: serializeAIHistory(history),
+                            createdAt: new Date().toISOString(),
+                        };
+                        histOps = [putOp("Annotation", histAnnId, ann)];
+                    }
                     allOps.push(...histOps);
                     // Set documentSourceImageId to the layer-0 payload (source image)
                     const updatedHistory = {
@@ -1977,6 +2675,12 @@ export default function App() {
                 handleStepLayer(1);
                 return;
             }
+            // Delete selected layer: Delete / Backspace
+            if ((e.key === "Delete" || e.key === "Backspace") && effectiveSelectedIndex !== null && layerCount > 1) {
+                e.preventDefault();
+                handleDeleteSlice(effectiveSelectedIndex);
+                return;
+            }
             // Peek overlays: hold Tab = layers, hold Shift = rail
             if (e.key === "Tab" && !mod) {
                 e.preventDefault();
@@ -2002,7 +2706,7 @@ export default function App() {
             window.removeEventListener("keydown", onKeyDown);
             window.removeEventListener("keyup", onKeyUp);
         };
-    }, [handleClearSelection, handleUndo, handleRedo, handleStepLayer, handleSetViewMode]);
+    }, [handleClearSelection, handleUndo, handleRedo, handleStepLayer, handleSetViewMode, handleDeleteSlice, effectiveSelectedIndex, layerCount]);
     return (_jsxs("div", { className: "app-shell", style: { height: "100%", display: "grid", gridTemplateRows: "0px 1fr" }, children: [_jsxs("header", { ref: headerRef, style: {
                     display: "flex",
                     alignItems: "center",
@@ -2090,7 +2794,7 @@ export default function App() {
                             cursor: "pointer",
                             fontSize: 13,
                             opacity: 0.6,
-                        }, children: "Reset project" })] }), _jsxs("div", { style: { position: "relative", overflow: "hidden" }, children: [_jsx(SpaceViewport, { layerCount: layerCount, selectedLayerIndex: effectiveSelectedIndex, onSelectLayer: handleSelectLayer, onPreviewLayer: setPreviewLayerIndex, layerVisibility: layerVisibility, soloIndex: solo, onToggleHidden: handleToggleHidden, onToggleSolo: handleToggleSolo, onToggleMask: handleToggleMask, maskActive: effectiveSelectedIndex !== null ? isMaskActive(layerProps, effectiveSelectedIndex, layerCount) : true, onPreviewOpacity: setPreviewOpacity, onCommitOpacity: handleCommitOpacity, persistedOpacity: effectiveSelectedIndex !== null ? opacityMultiplier(layerProps, effectiveSelectedIndex, layerCount) : 1.0, persistedOpacityFn: persistedOpacityFn, isHiddenFn: isHiddenFn, layerOrder: effectiveOrder, onPreviewOrder: setPreviewOrder, onCommitOrder: handleCommitOrder, animPhase: animPhase, onAnimDone: handleAnimDone, viewMode: viewMode, peekLayers: peekLayers, peekRail: peekRail, onClearSelection: handleClearSelection, layerTextures: layerTextures, layerThumbnails: layerThumbnails, colorLayerTextures: colorLayerTextures, layerCropInfo: layerCropInfo, segmentDisplayMode: segmentDisplayMode, onToggleSegmentDisplay: () => { setSegmentDisplayMode((m) => m === "masked" ? "colored" : "masked"); }, revealActive: revealActive, onRevealDone: () => { setRevealActive(false); }, imageAspect: imageAspect, onImportImage: () => { void handleImportImage(); }, onAiEdit: (prompt, strength) => { void handleAiEdit(prompt, strength); }, aiRunning: aiRunning, aiError: aiError, onPromptVisibilityChange: setAiPromptOpen, onAddSlice: handleAddSlice, isMaskActiveFn: isMaskActiveFn, isMaskInvertedFn: isMaskInvertedFn, onInvertMask: (index) => { void handleInvertMask(index); }, aiEditModelId: preferences.defaultAiEditModelId, onChangeAiEditModel: (id) => { handleChangePreference("defaultAiEditModelId", id); }, onGenerate3D: (index) => { void handleGenerate3D(index); }, generating3DLayer: generating3DLayer, layerGlbUrls: layerGlbUrls, threeDSourceHidden: threeDSourceHidden, onToggle3DSourceImage: handleToggle3DSourceImage, getSliceHistory: getSliceHistory, onSetDisplayCursor: handleSetDisplayCursor, onSetOperationCursor: handleSetOperationCursor, payloads: state.payloads, keyframePreviewUrl: keyframePreviewUrl, documentSourceImageId: aiHistory?.history.documentSourceImageId }), _jsx(SpaceAddressHUD, { fallbackSpaceId: rootSpaceId, spaces: state.spaces }), _jsx(PortalOverlay, { portalEdges: portalEdges, spaces: state.spaces, onEnter: handleNavigateToSpace }), isTabulaRasa && !showIngest && (_jsx(TabulaRasa, { onTap: () => { setShowIngest(true); } })), showIngest && (_jsx(ImageIngestPanel, { defaultOperationId: preferences.defaultImageOperationId, onCommit: (result) => void handleIngestCommit(result), onCancel: () => { setShowIngest(false); }, proxyGenerate: proxyGenerate })), slicingImageUrl && opProgress && opProgress.phase === "running" && (_jsx(SlicingOverlay, { imageUrl: slicingImageUrl, label: opLabel })), opProgress && !slicingImageUrl && (_jsx(OperationProgressHUD, { progress: opProgress, operationLabel: opLabel, onRetry: () => {
+                        }, children: "Reset project" })] }), _jsxs("div", { style: { position: "relative", overflow: "hidden" }, children: [_jsx(SpaceViewport, { layerCount: layerCount, selectedLayerIndex: effectiveSelectedIndex, onSelectLayer: handleSelectLayer, onPreviewLayer: setPreviewLayerIndex, layerVisibility: layerVisibility, soloIndex: solo, onToggleHidden: handleToggleHidden, onToggleSolo: handleToggleSolo, onToggleMask: handleToggleMask, maskActive: effectiveSelectedIndex !== null ? isMaskActive(layerProps, effectiveSelectedIndex, layerCount) : true, onPreviewOpacity: setPreviewOpacity, onCommitOpacity: handleCommitOpacity, persistedOpacity: effectiveSelectedIndex !== null ? opacityMultiplier(layerProps, effectiveSelectedIndex, layerCount) : 1.0, persistedOpacityFn: persistedOpacityFn, isHiddenFn: isHiddenFn, layerOrder: effectiveOrder, onPreviewOrder: setPreviewOrder, onCommitOrder: handleCommitOrder, animPhase: animPhase, onAnimDone: handleAnimDone, viewMode: viewMode, peekLayers: peekLayers, peekRail: peekRail, onClearSelection: handleClearSelection, layerTextures: layerTextures, layerThumbnails: layerThumbnails, layerNames: layerNames, onRenameLayer: handleRenameLayer, colorLayerTextures: colorLayerTextures, layerCropInfo: layerCropInfo, segmentDisplayMode: segmentDisplayMode, onToggleSegmentDisplay: () => { setSegmentDisplayMode((m) => m === "masked" ? "colored" : "masked"); }, revealActive: revealActive, onRevealDone: () => { setRevealActive(false); }, imageAspect: imageAspect, onImportImage: () => { void handleImportImage(); }, onAiEdit: (prompt, strength) => { void handleAiEdit(prompt, strength); }, onAiEditForLayer: (layerIndex, prompt, strength) => { void handleAiEditForLayer(layerIndex, prompt, strength); }, aiEditingLayers: aiEditingLayers, aiErrors: aiErrors, onPromptVisibilityChange: setAiPromptOpen, onAddSlice: handleAddSlice, onDeleteSlice: handleDeleteSlice, isMaskActiveFn: isMaskActiveFn, isMaskInvertedFn: isMaskInvertedFn, onInvertMask: (index) => { void handleInvertMask(index); }, aiEditModelId: preferences.defaultAiEditModelId, onChangeAiEditModel: (id) => { handleChangePreference("defaultAiEditModelId", id); }, onGenerate3D: (index) => { void handleGenerate3D(index); }, generating3DLayer: generating3DLayer, layerGlbUrls: layerGlbUrls, threeDSourceHidden: threeDSourceHidden, onToggle3DSourceImage: handleToggle3DSourceImage, getSliceHistory: getSliceHistory, onSetDisplayCursor: handleSetDisplayCursor, onSetOperationCursor: handleSetOperationCursor, payloads: state.payloads, keyframePreviewUrl: keyframePreviewUrl, onCompositeKeyframe: () => { void handleCompositeKeyframe(); }, compositeResultUrl: compositeResultUrl, compositeBusy: compositeBusy, documentSourceImageId: aiHistory?.history.documentSourceImageId }), _jsx(SpaceAddressHUD, { fallbackSpaceId: rootSpaceId, spaces: state.spaces }), _jsx(PortalOverlay, { portalEdges: portalEdges, spaces: state.spaces, onEnter: handleNavigateToSpace }), isTabulaRasa && !showIngest && (_jsx(TabulaRasa, { onTap: () => { setShowIngest(true); } })), showIngest && (_jsx(ImageIngestPanel, { defaultOperationId: preferences.defaultImageOperationId, onCommit: (result) => void handleIngestCommit(result), onCancel: () => { setShowIngest(false); }, proxyGenerate: proxyGenerate })), slicingImageUrl && opProgress && opProgress.phase === "running" && (_jsx(SlicingOverlay, { imageUrl: slicingImageUrl, label: opLabel })), opProgress && !slicingImageUrl && (_jsx(OperationProgressHUD, { progress: opProgress, operationLabel: opLabel, onRetry: () => {
                             setOpProgress(null);
                             if (lastIngestRef.current) {
                                 const ctx = lastIngestRef.current;
@@ -2111,15 +2815,17 @@ export default function App() {
                                             commitPatch((prev) => {
                                                 const allOps = [...opResult.ops];
                                                 const maskIds = opResult.maskPayloadIds ?? [];
+                                                // Build the complete payload-per-layer map including
+                                                // segment payloads being added in this same patch.
+                                                const existing = findLayerRender(prev, activeSpaceId);
+                                                const annId = existing ? existing.annotationId : makeId("annotation");
+                                                const currentData = existing ? { ...existing.annotation.data } : {};
+                                                for (let i = 0; i < maskIds.length; i++) {
+                                                    const pid = maskIds[i];
+                                                    if (pid)
+                                                        currentData[`payload.${String(i + 1)}`] = pid;
+                                                }
                                                 if (maskIds.length > 0) {
-                                                    const existing = findLayerRender(prev, activeSpaceId);
-                                                    const annId = existing ? existing.annotationId : makeId("annotation");
-                                                    const currentData = existing ? { ...existing.annotation.data } : {};
-                                                    for (let i = 0; i < maskIds.length; i++) {
-                                                        const pid = maskIds[i];
-                                                        if (pid)
-                                                            currentData[`payload.${String(i + 1)}`] = pid;
-                                                    }
                                                     const annotationValue = {
                                                         id: annId,
                                                         kind: "Annotation",
@@ -2131,9 +2837,40 @@ export default function App() {
                                                     allOps.push(putOp("Annotation", annId, annotationValue));
                                                 }
                                                 // Initialize AI history with root states (retry path)
+                                                // Use currentData (includes segment payloads from this patch)
                                                 const { sliceIds: retrySliceIds, ops: retrySliceOps } = getOrCreateSliceIds(prev, activeSpaceId);
                                                 allOps.push(...retrySliceOps);
-                                                const { history: retryHist, annotationId: retryHistAnnId, ops: retryHistOps } = getOrCreateAIHistory(prev, activeSpaceId, retrySliceIds);
+                                                const existingRetryHist = findAIHistory(prev, activeSpaceId);
+                                                let retryHist;
+                                                let retryHistAnnId;
+                                                let retryHistOps;
+                                                if (existingRetryHist) {
+                                                    retryHist = existingRetryHist.history;
+                                                    retryHistAnnId = existingRetryHist.annotationId;
+                                                    retryHistOps = [];
+                                                }
+                                                else {
+                                                    retryHist = createSpaceAIHistory();
+                                                    for (let i = 0; i < retrySliceIds.length; i++) {
+                                                        const sliceId = retrySliceIds[i];
+                                                        const pid = currentData[`payload.${String(i)}`];
+                                                        if (pid) {
+                                                            retryHist = ensureHistoryGraphForSlice(retryHist, sliceId, {
+                                                                image: pid,
+                                                            });
+                                                        }
+                                                    }
+                                                    retryHistAnnId = makeId("annotation");
+                                                    const ann = {
+                                                        id: retryHistAnnId,
+                                                        kind: "Annotation",
+                                                        target: { kind: "Space", id: activeSpaceId },
+                                                        schema: SPACE_AI_HISTORY_SCHEMA,
+                                                        data: serializeAIHistory(retryHist),
+                                                        createdAt: new Date().toISOString(),
+                                                    };
+                                                    retryHistOps = [putOp("Annotation", retryHistAnnId, ann)];
+                                                }
                                                 allOps.push(...retryHistOps);
                                                 const updatedRetryHist = { ...retryHist, documentSourceImageId: ctx.payloadId };
                                                 allOps.push(buildHistoryPatchOp(updatedRetryHist, retryHistAnnId, activeSpaceId));

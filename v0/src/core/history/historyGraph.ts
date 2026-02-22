@@ -56,7 +56,34 @@ export function ensureHistoryGraphForSlice(
     glb?: PayloadId;
   },
 ): SpaceAIHistory {
-  if (history.slices[sliceId]) return history;
+  const existing = history.slices[sliceId];
+  if (existing) {
+    // Back-fill root state assets only when the root was created without
+    // an image (e.g. ingest race where the payload wasn't available yet).
+    // Do NOT overwrite an existing root image — subsequent AI edits pass
+    // the currently-rendered payload which differs from the original
+    // segment, and overwriting would corrupt the root node's thumbnail,
+    // crop metadata, mask, and aspect ratio.
+    const rootNode = existing.states[existing.rootStateId];
+    const needsBackfill = rootNode
+      && rootAssets.image
+      && !rootNode.assetRefs.image;
+    if (needsBackfill) {
+      const updatedRoot: StateNode = {
+        ...rootNode,
+        assetRefs: { ...rootNode.assetRefs, ...rootAssets },
+      };
+      const updatedGraph: SliceHistoryGraph = {
+        ...existing,
+        states: { ...existing.states, [existing.rootStateId]: updatedRoot },
+      };
+      return {
+        ...history,
+        slices: { ...history.slices, [sliceId]: updatedGraph },
+      };
+    }
+    return history;
+  }
 
   const rootStateId = makeStateId();
   const rootNode: StateNode = {

@@ -1,59 +1,46 @@
-import React, { useEffect, useState } from "react";
+import React, { useCallback, useEffect, useState } from "react";
 
 interface TabulaRasaProps {
   onTap: () => void;
 }
 
 /**
- * Tabula Rasa — the blank-slate start state.
- * Shows a blinking unbrick-cube cursor and "Tap to begin." hint.
+ * Tabula Rasa — the cosmological root state.
+ * A minimal, centered opening message before the first node is created.
  */
 export default function TabulaRasa({ onTap }: TabulaRasaProps): React.JSX.Element {
-  const [visible, setVisible] = useState(true);
+  const [phase, setPhase] = useState<"in" | "visible" | "out" | "gone">("in");
 
-  // Blink the cursor
+  // Fade in on mount
   useEffect(() => {
-    const id = setInterval(() => { setVisible((v) => !v); }, 600);
-    return () => { clearInterval(id); };
+    const id = requestAnimationFrame(() => { setPhase("visible"); });
+    return () => { cancelAnimationFrame(id); };
   }, []);
+
+  const handleClick = useCallback(() => {
+    if (phase === "out" || phase === "gone") return;
+    setPhase("out");
+    setTimeout(() => {
+      setPhase("gone");
+      onTap();
+    }, 150);
+  }, [phase, onTap]);
+
+  if (phase === "gone") return <></>;
 
   return (
     <div
-      onClick={onTap}
+      className="tabula-rasa"
+      onClick={handleClick}
       style={{
-        position: "absolute",
-        inset: 0,
-        display: "flex",
-        flexDirection: "column",
-        alignItems: "center",
-        justifyContent: "center",
-        cursor: "pointer",
-        zIndex: 90,
-        userSelect: "none",
+        opacity: phase === "visible" ? 1 : 0,
       }}
     >
-      {/* Unbrick cube cursor */}
-      <div
-        style={{
-          width: 32,
-          height: 32,
-          border: "2px solid var(--scrubber-active)",
-          borderRadius: 4,
-          opacity: visible ? 0.9 : 0.15,
-          transition: "opacity 0.15s ease",
-          marginBottom: 16,
-          boxShadow: visible ? "0 0 12px var(--shadow-medium)" : "none",
-        }}
-      />
-      <span
-        style={{
-          color: "var(--hud-muted)",
-          fontSize: 14,
-          letterSpacing: 0.5,
-        }}
-      >
-        Tap to begin.
-      </span>
+      <div className="tabula-rasa-content">
+        <p className="tabula-rasa-line1">Unbricked</p>
+        <p className="tabula-rasa-line2">The unexamined brick is not worth editing.</p>
+        <p className="tabula-rasa-line3">Tap to begin.</p>
+      </div>
     </div>
   );
 }

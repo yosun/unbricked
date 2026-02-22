@@ -84,6 +84,7 @@ export function sliceHistoryToSubwayGraph(
       ...(!isRoot && parentOp?.summary?.model ? { subtitle: parentOp.summary.model } : {}),
       createdAt: new Date(state.meta.createdAt).getTime(),
       ...(state.assetRefs.thumb ? { artifactId: state.assetRefs.thumb } : state.assetRefs.image ? { artifactId: state.assetRefs.image } : {}),
+      ...(state.assetRefs.glb ? { has3D: true } : {}),
     };
 
     if (!isRoot && parentOp) {

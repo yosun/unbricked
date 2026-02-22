@@ -1,8 +1,9 @@
 import { jsx as _jsx, jsxs as _jsxs, Fragment as _Fragment } from "react/jsx-runtime";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Canvas, useThree, useFrame, invalidate } from "@react-three/fiber";
-import { OrbitControls, TransformControls, useGLTF } from "@react-three/drei";
-import { Box3, CanvasTexture, Color, DoubleSide, Euler, GridHelper as ThreeGridHelper, Group, MathUtils, MeshBasicMaterial, MeshStandardMaterial, PlaneGeometry, Plane, Quaternion, Raycaster, SRGBColorSpace, Vector3, TextureLoader, BufferGeometry, Float32BufferAttribute, LineBasicMaterial } from "three";
+import { Line, OrbitControls, TransformControls, useGLTF } from "@react-three/drei";
+import { Box3, BoxGeometry, CanvasTexture, Color, DoubleSide, EdgesGeometry, Euler, GridHelper as ThreeGridHelper, Group, MathUtils, MeshBasicMaterial, MeshStandardMaterial, PlaneGeometry, Plane, Quaternion, Raycaster, SRGBColorSpace, Vector3, TextureLoader, BufferGeometry, Float32BufferAttribute, LineBasicMaterial } from "three";
+import { AI_EDIT_MODELS, getAiEditModel } from "../services/falProxy";
 import LayerScrubber from "./LayerScrubber";
 import LayerControlsHUD from "./LayerControlsHUD";
 import LayersPanel from "./LayersPanel";
@@ -30,12 +31,14 @@ function layerHue(layerIdx, layerCount) {
     const hue = Math.round((layerIdx / Math.max(layerCount, 1)) * 360);
     return `hsl(${String(hue)}, 55%, 65%)`;
 }
-function layerY(index, layerCount) {
+function layerY(index, layerCount, spread = 1) {
+    const h = PRISM_H * spread;
     const t = layerCount <= 1 ? 0.5 : index / (layerCount - 1);
-    return -PRISM_H / 2 + t * PRISM_H;
+    return -h / 2 + t * h;
 }
-function yToLayerContinuous(y, layerCount) {
-    const t = (y + PRISM_H / 2) / PRISM_H;
+function yToLayerContinuous(y, layerCount, spread = 1) {
+    const h = PRISM_H * spread;
+    const t = (y + h / 2) / h;
     return t * (layerCount - 1);
 }
 function clampLayerIndex(raw, layerCount) {
@@ -67,9 +70,9 @@ function getLabelTexture(text, color) {
     return tex;
 }
 /** A lightweight label sprite — replaces the expensive drei <Text> (troika SDF). */
-function LayerLabel({ text, color, opacity, renderOrder }) {
+function LayerLabel({ text, color, opacity, renderOrder, position }) {
     const tex = useMemo(() => getLabelTexture(text, color), [text, color]);
-    return (_jsx("sprite", { position: [0, 0.01, 0], scale: [0.5, 0.5, 0.5], renderOrder: renderOrder, children: _jsx("spriteMaterial", { map: tex, transparent: true, opacity: opacity, depthWrite: false, sizeAttenuation: true }) }));
+    return (_jsx("sprite", { position: position ?? [0, 0.01, 0], scale: [0.35, 0.35, 0.35], renderOrder: renderOrder, children: _jsx("spriteMaterial", { map: tex, transparent: true, opacity: opacity, depthWrite: false, sizeAttenuation: true }) }));
 }
 /** Lerp speed for position animations (higher = faster). */
 const LERP_SPEED = 4.0;
@@ -136,7 +139,7 @@ function useLayerTexture(uri) {
     return texture;
 }
 /** A single textured layer plane. Handles crop offset, AI pulse glow, and fade-in. */
-function TexturedLayerPlane({ uri, width, depth, layerIdx, opacity, crop, aiEditing, generating3D, positionIndex, selected, }) {
+function TexturedLayerPlane({ uri, width, depth, layerIdx, opacity, crop, aiEditing, generating3D, positionIndex, selected, onSelect, }) {
     const texture = useLayerTexture(uri);
     const matRef = useRef(null);
     const glowRef = useRef(null);
@@ -208,7 +211,7 @@ function TexturedLayerPlane({ uri, width, depth, layerIdx, opacity, crop, aiEdit
     }
     // Use position in stack for render ordering so upper layers draw on top
     const baseOrder = (positionIndex ?? 0) * 10;
-    return (_jsxs("group", { children: [_jsxs("mesh", { rotation: [-Math.PI / 2, 0, 0], position: [offX, 0.02, offZ], renderOrder: baseOrder + 2, children: [_jsx("planeGeometry", { args: [planeW, planeD] }), _jsx("meshBasicMaterial", { ref: matRef, map: texture, transparent: true, opacity: opacity * fadeProgress.current, depthWrite: false, side: DoubleSide })] }), _jsxs("mesh", { rotation: [-Math.PI / 2, 0, 0], position: [offX, 0.03, offZ], renderOrder: baseOrder + 3, children: [_jsx("planeGeometry", { args: [planeW, planeD] }), _jsx("meshBasicMaterial", { ref: glowRef, transparent: true, opacity: 0, color: glowColor, depthWrite: false, side: DoubleSide })] })] }));
+    return (_jsxs("group", { children: [_jsxs("mesh", { rotation: [-Math.PI / 2, 0, 0], position: [offX, 0.04, offZ], renderOrder: baseOrder + 2, ...(onSelect ? { onClick: (e) => { e.stopPropagation(); onSelect(); } } : {}), children: [_jsx("planeGeometry", { args: [planeW, planeD] }), _jsx("meshBasicMaterial", { ref: matRef, map: texture, transparent: true, opacity: opacity * fadeProgress.current, depthWrite: false, side: DoubleSide, polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -1 })] }), _jsxs("mesh", { rotation: [-Math.PI / 2, 0, 0], position: [offX, 0.06, offZ], renderOrder: baseOrder + 3, children: [_jsx("planeGeometry", { args: [planeW, planeD] }), _jsx("meshBasicMaterial", { ref: glowRef, transparent: true, opacity: 0, color: glowColor, depthWrite: false, side: DoubleSide, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 })] })] }));
 }
 /**
  * Compute how many brick-space Y-units correspond to one screen pixel,
@@ -397,9 +400,12 @@ function GLBLayerModel({ url, width, depth, crop, selected, transformPivot, tran
     // Auto-yaw: if rotating 90° around Y makes the XZ footprint aspect better
     // match the target image aspect, apply it.
     const { orientationQuat, scaledMetrics } = useMemo(() => {
-        // 1. Determine if yaw correction is needed (using unscaled probe first)
+        // Base rotation: SAM-3 outputs Z-up models; Three.js is Y-up → −90° X
+        const baseQ = new Quaternion().setFromEuler(new Euler(-Math.PI / 2, 0, 0));
+        // 1. Determine if yaw correction is needed (using base-rotated probe)
         const rawProbe = cloned.clone(true);
         const rawGroup = new Group();
+        rawGroup.quaternion.copy(baseQ);
         rawGroup.add(rawProbe);
         rawGroup.updateMatrixWorld(true);
         const rawBox = new Box3().setFromObject(rawGroup);
@@ -422,9 +428,9 @@ function GLBLayerModel({ url, width, depth, crop, selected, transformPivot, tran
         const modelAspect90 = rawSize.z / Math.max(rawSize.x, 0.001);
         const needsYaw90 = Math.abs(modelAspect - imageAspect) > Math.abs(modelAspect90 - imageAspect) &&
             Math.abs(modelAspect - imageAspect) > 0.3;
-        const q = new Quaternion();
+        const q = baseQ.clone();
         if (needsYaw90) {
-            q.setFromEuler(new Euler(0, Math.PI / 2, 0));
+            q.premultiply(new Quaternion().setFromEuler(new Euler(0, Math.PI / 2, 0)));
         }
         // 2. Compute fitScale from oriented (but unscaled) bbox
         const orientProbe = cloned.clone(true);
@@ -513,6 +519,8 @@ function GLBLayerModel({ url, width, depth, crop, selected, transformPivot, tran
         const { size } = scaledMetrics;
         return [size.x, size.y, size.z];
     }, [scaledMetrics]);
+    // Edge-only geometry for bounding box (no triangle diagonals)
+    const bboxEdgesGeo = useMemo(() => new EdgesGeometry(new BoxGeometry(...bboxSize)), [bboxSize]);
     // ── Bounding box center offset from pivot point (for wireframe positioning) ──
     const bboxCenterOffset = useMemo(() => {
         const { center, min, max } = scaledMetrics;
@@ -636,7 +644,7 @@ function GLBLayerModel({ url, width, depth, crop, selected, transformPivot, tran
         invalidate();
     }, [appliedTransform]);
     const effectiveMode = transformMode ?? "rotate";
-    return (_jsxs(_Fragment, { children: [_jsx("group", { position: [offX, 0.05, offZ], children: _jsx("group", { ref: pivotCompRef, children: _jsxs("group", { ref: tcTargetRef, children: [_jsx("group", { ref: contentRef, position: contentOffset, children: _jsx("group", { ref: scaleGroupRef, scale: [fitScale, fitScale, fitScale], children: _jsx("group", { quaternion: orientationQuat, children: _jsx("primitive", { object: cloned }) }) }) }), selected && (_jsxs("mesh", { position: bboxCenterOffset, children: [_jsx("boxGeometry", { args: bboxSize }), _jsx("meshBasicMaterial", { wireframe: true, transparent: true, opacity: 0.25, color: selectionWireframe, depthWrite: false })] })), selected && (_jsxs("mesh", { rotation: [0, Math.PI / 4, 0], position: [0, 0, 0], children: [_jsx("boxGeometry", { args: [0.06, 0.06, 0.06] }), _jsx("meshBasicMaterial", { color: pivotColor, depthTest: false, transparent: true, opacity: 0.9 })] })), selected && onSetTransformPivot && (_jsx(BBoxFaceProxies, { size: bboxSize, centerOffset: bboxCenterOffset, currentFace: pivotFace, onSelectFace: onSetTransformPivot })), selected && snapEnabled && (_jsx(GizmoChildSnapHelpers, { mode: effectiveMode, snapTranslation: snapTranslation, snapRotation: snapRotation, snapScale: snapScale, radius: Math.max(width, depth) * 0.6 }))] }) }) }), selected && tcReady && tcTargetRef.current && (_jsx(TransformControls, { object: tcTargetRef.current, mode: effectiveMode, size: 0.6, space: pivotFace !== "center" ? "local" : "world", translationSnap: snapTranslation ?? null, rotationSnap: snapRotation != null ? MathUtils.degToRad(snapRotation) : null, scaleSnap: snapScale ?? null, onChange: () => { invalidate(); reportTransform(); }, onMouseDown: () => { if (orbitControls)
+    return (_jsxs(_Fragment, { children: [_jsx("group", { position: [offX, 0.05, offZ], children: _jsx("group", { ref: pivotCompRef, children: _jsxs("group", { ref: tcTargetRef, children: [_jsx("group", { ref: contentRef, position: contentOffset, children: _jsx("group", { ref: scaleGroupRef, scale: [fitScale, fitScale, fitScale], children: _jsx("group", { quaternion: orientationQuat, children: _jsx("primitive", { object: cloned }) }) }) }), selected && (_jsx("lineSegments", { geometry: bboxEdgesGeo, position: bboxCenterOffset, children: _jsx("lineBasicMaterial", { transparent: true, opacity: 0.25, color: selectionWireframe, depthWrite: false }) })), selected && (_jsxs("mesh", { rotation: [0, Math.PI / 4, 0], position: [0, 0, 0], children: [_jsx("boxGeometry", { args: [0.06, 0.06, 0.06] }), _jsx("meshBasicMaterial", { color: pivotColor, depthTest: false, transparent: true, opacity: 0.9 })] })), selected && onSetTransformPivot && (_jsx(BBoxFaceProxies, { size: bboxSize, centerOffset: bboxCenterOffset, currentFace: pivotFace, onSelectFace: onSetTransformPivot })), selected && snapEnabled && (_jsx(GizmoChildSnapHelpers, { mode: effectiveMode, snapTranslation: snapTranslation, snapRotation: snapRotation, snapScale: snapScale, radius: Math.max(width, depth) * 0.6 }))] }) }) }), selected && tcReady && tcTargetRef.current && (_jsx(TransformControls, { object: tcTargetRef.current, mode: effectiveMode, size: 0.6, space: pivotFace !== "center" ? "local" : "world", translationSnap: snapTranslation ?? null, rotationSnap: snapRotation != null ? MathUtils.degToRad(snapRotation) : null, scaleSnap: snapScale ?? null, onChange: () => { invalidate(); reportTransform(); }, onMouseDown: () => { if (orbitControls)
                     orbitControls.enabled = false; }, onMouseUp: () => { if (orbitControls)
                     orbitControls.enabled = true; invalidate(); reportTransform(); } }))] }));
 }
@@ -756,7 +764,8 @@ function GizmoChildSnapHelpers({ mode, snapTranslation, snapRotation, snapScale,
     return (_jsx("group", { ref: counterRef, children: _jsx(SnapHelpers, { mode: mode, snapTranslation: snapTranslation, snapRotation: snapRotation, snapScale: snapScale, radius: radius }) }));
 }
 function SpacePrism(props) {
-    const { layerCount, selectedLayerIndex, layerVisibility, layerOrder, onSelectLayer, dragOverride, suppressClicks, layerTextures, layerCropInfo, imageAspect, revealActive, onRevealDone, aiEditingLayer, layerGlbUrls, generating3DLayer, transformPivot, transformMode, snapTranslation, snapRotation, snapScale, snapEnabled, onSetTransformPivot, onTransformChange, appliedTransform, modelTransform } = props;
+    const { layerCount, selectedLayerIndex, layerVisibility, layerOrder, onSelectLayer, dragOverride, suppressClicks, layerTextures, layerCropInfo, imageAspect, layerSpread: spreadProp, threeDSourceHidden, revealActive, onRevealDone, aiEditingLayers, layerGlbUrls, generating3DLayer, transformPivot, transformMode, snapTranslation, snapRotation, snapScale, snapEnabled, onSetTransformPivot, onTransformChange, appliedTransform, modelTransform } = props;
+    const spread = spreadProp ?? 1;
     const { prismW, prismD } = prismDims(imageAspect);
     const hiddenSlideX = -(prismW + 0.5);
     const template = useUIStyle((s) => s.template);
@@ -790,14 +799,14 @@ function SpacePrism(props) {
     const staticPositions = useMemo(() => {
         const result = [];
         for (let posIdx = 0; posIdx < layerOrder.length; posIdx++) {
-            result.push({ layerIdx: layerOrder[posIdx] ?? posIdx, y: layerY(posIdx, layerCount), isDragged: false });
+            result.push({ layerIdx: layerOrder[posIdx] ?? posIdx, y: layerY(posIdx, layerCount, spread), isDragged: false });
         }
         return result;
-    }, [layerOrder, layerCount]);
+    }, [layerOrder, layerCount, spread]);
     let positions;
     if (dragActive) {
         // Figure out which slot the dragged layer would snap to
-        const continuous = yToLayerContinuous(dragOverride.y, layerCount);
+        const continuous = yToLayerContinuous(dragOverride.y, layerCount, spread);
         const targetSlot = clampLayerIndex(continuous, layerCount);
         // Build a temporary order with the dragged layer removed, then inserted at target
         const tempOrder = layerOrder.filter(li => li !== dragIdx);
@@ -809,7 +818,7 @@ function SpacePrism(props) {
                 positions.push({ layerIdx: li, y: dragOverride.y, isDragged: true });
             }
             else {
-                positions.push({ layerIdx: li, y: layerY(posIdx, layerCount), isDragged: false });
+                positions.push({ layerIdx: li, y: layerY(posIdx, layerCount, spread), isDragged: false });
             }
         }
     }
@@ -818,7 +827,16 @@ function SpacePrism(props) {
     }
     // Shared geometry for all brick planes — avoids N allocations per frame
     const brickGeo = useMemo(() => new PlaneGeometry(prismW * 0.96, prismD * 0.96), [prismW, prismD]);
-    return (_jsxs("group", { children: [_jsxs("mesh", { children: [_jsx("boxGeometry", { args: [prismW, PRISM_H, prismD] }), _jsx("meshBasicMaterial", { wireframe: true, transparent: true, opacity: 0.15, color: template.colors.foreground })] }), positions.map(({ layerIdx, y, isDragged }, positionIndex) => {
+    // Rectangle corner points for slice border (closed loop)
+    const sliceEdgePoints = useMemo(() => {
+        const hw = (prismW * 0.96) / 2;
+        const hd = (prismD * 0.96) / 2;
+        return [[-hw, -hd, 0], [hw, -hd, 0], [hw, hd, 0], [-hw, hd, 0], [-hw, -hd, 0]];
+    }, [prismW, prismD]);
+    // Edge-only geometry for the prism wireframe (no triangle diagonals)
+    const prismH = PRISM_H * spread;
+    const prismEdgesGeo = useMemo(() => new EdgesGeometry(new BoxGeometry(prismW, prismH, prismD)), [prismW, prismD, prismH]);
+    return (_jsxs("group", { children: [_jsx("lineSegments", { geometry: prismEdgesGeo, children: _jsx("lineBasicMaterial", { transparent: true, opacity: 0.15, color: template.colors.foreground }) }), _jsxs("mesh", { rotation: [-Math.PI / 2, 0, 0], position: [0, -prismH / 2 - 0.01, 0], renderOrder: -1, children: [_jsx("planeGeometry", { args: [prismW * 1.3, prismD * 1.3] }), _jsx("meshBasicMaterial", { transparent: true, opacity: 0.06, color: "#000000", depthWrite: false })] }), positions.map(({ layerIdx, y, isDragged }, positionIndex) => {
                 const vis = layerVisibility[layerIdx];
                 const hidden = vis ? !vis.visible : false;
                 // Hidden / solo-aside layers slide to the right with smooth animation
@@ -835,18 +853,15 @@ function SpacePrism(props) {
                 const color = selected ? template.colors.accent : template.brick.color;
                 // Use position in stack for render ordering so upper layers draw on top
                 const baseOrder = positionIndex * 10;
-                return (_jsxs(AnimatedLayerGroup, { targetX: targetX, targetY: targetY, children: [_jsx("mesh", { geometry: brickGeo, rotation: [Math.PI / 2, 0, 0], scale: scale, renderOrder: baseOrder, onClick: (e) => {
-                                e.stopPropagation();
-                                if (!suppressClicks)
-                                    onSelectLayer(layerIdx);
-                            }, children: _jsx("meshBasicMaterial", { transparent: true, opacity: isDragged ? Math.max(opacity, 0.5) : opacity, color: color, depthWrite: false, side: DoubleSide }) }), layerTextures[layerIdx] && (_jsx(TexturedLayerPlane, { uri: layerTextures[layerIdx], width: prismW, depth: prismD, layerIdx: layerIdx, opacity: vis ? vis.textureOpacity : 1, crop: layerCropInfo[layerIdx], aiEditing: aiEditingLayer === layerIdx, generating3D: generating3DLayer === layerIdx, positionIndex: positionIndex, selected: selected })), generating3DLayer === layerIdx && !layerGlbUrls?.[layerIdx] && (_jsx(Generating3DPlaceholder, { width: prismW, depth: prismD, ...(layerCropInfo[layerIdx] ? { crop: layerCropInfo[layerIdx] } : {}) })), layerGlbUrls?.[layerIdx] && (_jsx(GLBLayerModel, { url: layerGlbUrls[layerIdx], width: prismW, depth: prismD, selected: selected, transformPivot: transformPivot, transformMode: transformMode, snapTranslation: snapTranslation, snapRotation: snapRotation, snapScale: snapScale, snapEnabled: snapEnabled, onTransformChange: selected ? onTransformChange : undefined, appliedTransform: selected ? appliedTransform : undefined, onSetTransformPivot: selected ? onSetTransformPivot : undefined, ...(layerCropInfo[layerIdx] ? { crop: layerCropInfo[layerIdx] } : {}) })), _jsx(LayerLabel, { text: String(layerIdx), color: template.colors.foreground, opacity: hidden ? 0.2 : Math.min(0.5, opacity * 2), renderOrder: baseOrder + 1 })] }, layerIdx));
+                return (_jsxs(AnimatedLayerGroup, { targetX: targetX, targetY: targetY, children: [_jsx("mesh", { geometry: brickGeo, rotation: [Math.PI / 2, 0, 0], scale: scale, renderOrder: baseOrder, children: _jsx("meshBasicMaterial", { transparent: true, opacity: isDragged ? Math.max(opacity, 0.5) : opacity, color: color, depthWrite: false, side: DoubleSide, polygonOffset: true, polygonOffsetFactor: 0, polygonOffsetUnits: 1 }) }), _jsx(Line, { points: sliceEdgePoints, color: selected ? template.colors.selectionWireframe : template.colors.foreground, lineWidth: selected ? 2.5 : 1, rotation: [Math.PI / 2, 0, 0], scale: scale, position: [0, 0.08, 0], renderOrder: baseOrder + 4, depthWrite: false, transparent: true, opacity: selected ? 1 : 0.25 }), layerTextures[layerIdx] && !threeDSourceHidden?.has(layerIdx) && (_jsx(TexturedLayerPlane, { uri: layerTextures[layerIdx], width: prismW, depth: prismD, layerIdx: layerIdx, opacity: vis ? vis.textureOpacity : 1, crop: layerCropInfo[layerIdx], aiEditing: aiEditingLayers?.has(layerIdx) ?? false, generating3D: generating3DLayer === layerIdx, positionIndex: positionIndex, selected: selected, onSelect: suppressClicks ? undefined : () => onSelectLayer(layerIdx) })), generating3DLayer === layerIdx && !layerGlbUrls?.[layerIdx] && (_jsx(Generating3DPlaceholder, { width: prismW, depth: prismD, ...(layerCropInfo[layerIdx] ? { crop: layerCropInfo[layerIdx] } : {}) })), layerGlbUrls?.[layerIdx] && threeDSourceHidden?.has(layerIdx) && (_jsx(GLBLayerModel, { url: layerGlbUrls[layerIdx], width: prismW, depth: prismD, selected: selected, transformPivot: transformPivot, transformMode: transformMode, snapTranslation: snapTranslation, snapRotation: snapRotation, snapScale: snapScale, snapEnabled: snapEnabled, onTransformChange: selected ? onTransformChange : undefined, appliedTransform: selected ? appliedTransform : undefined, onSetTransformPivot: selected ? onSetTransformPivot : undefined, ...(layerCropInfo[layerIdx] ? { crop: layerCropInfo[layerIdx] } : {}) })), _jsx(LayerLabel, { text: String(layerIdx), color: template.colors.foreground, opacity: hidden ? 0.2 : Math.min(0.5, opacity * 2), renderOrder: baseOrder + 1, position: [-(prismW * 0.96) / 2 + 0.15, 0.09, -(prismD * 0.96) / 2 + 0.15] })] }, layerIdx));
             })] }));
 }
 const _dragPlane = new Plane(new Vector3(0, 0, 1), 0);
 const _intersection = new Vector3();
 const _raycaster = new Raycaster();
 function ScrubberPlane(props) {
-    const { layerCount, selectedLayerIndex, layerOrder, onPreviewLayer, onCommitLayer, imageAspect } = props;
+    const { layerCount, selectedLayerIndex, layerOrder, onPreviewLayer, onCommitLayer, imageAspect, layerSpread: spreadProp } = props;
+    const spread = spreadProp ?? 1;
     const { prismW, prismD } = prismDims(imageAspect);
     const { camera, controls } = useThree();
     const scrubber3d = useUIStyle((s) => s.template.colors.scrubber3d);
@@ -857,7 +872,7 @@ function ScrubberPlane(props) {
     const currentLogical = selectedLayerIndex ?? 0;
     const visualPos = layerOrder.indexOf(currentLogical);
     const currentVisual = visualPos >= 0 ? visualPos : 0;
-    const y = layerY(currentVisual, layerCount);
+    const y = layerY(currentVisual, layerCount, spread);
     const handlePointerDown = useCallback((e) => {
         e.stopPropagation();
         const target = e.eventObject;
@@ -871,8 +886,8 @@ function ScrubberPlane(props) {
         camera.getWorldDirection(camDir);
         _dragPlane.setFromNormalAndCoplanarPoint(camDir, e.point);
         startY.current = e.point.y;
-        startLayerY.current = layerY(currentVisual, layerCount);
-    }, [camera, controls, currentVisual, layerCount]);
+        startLayerY.current = layerY(currentVisual, layerCount, spread);
+    }, [camera, controls, currentVisual, layerCount, spread]);
     const handlePointerMove = useCallback((e) => {
         if (!dragging.current)
             return;
@@ -882,7 +897,7 @@ function ScrubberPlane(props) {
         if (_raycaster.ray.intersectPlane(_dragPlane, _intersection)) {
             const deltaY = _intersection.y - startY.current;
             const newY = startLayerY.current + deltaY;
-            const continuous = yToLayerContinuous(newY, layerCount);
+            const continuous = yToLayerContinuous(newY, layerCount, spread);
             const snappedVisual = clampLayerIndex(continuous, layerCount);
             // Map visual position back to logical layer index
             const logicalIdx = layerOrder[snappedVisual] ?? snappedVisual;
@@ -903,7 +918,7 @@ function ScrubberPlane(props) {
         if (_raycaster.ray.intersectPlane(_dragPlane, _intersection)) {
             const deltaY = _intersection.y - startY.current;
             const newY = startLayerY.current + deltaY;
-            const continuous = yToLayerContinuous(newY, layerCount);
+            const continuous = yToLayerContinuous(newY, layerCount, spread);
             const snappedVisual = clampLayerIndex(continuous, layerCount);
             finalLogical = layerOrder[snappedVisual] ?? snappedVisual;
         }
@@ -919,15 +934,30 @@ function ScrubberPlane(props) {
     return (_jsxs("group", { position: [0, y, 0], rotation: [Math.PI / 2, 0, 0], children: [_jsxs("mesh", { children: [_jsx("planeGeometry", { args: [prismW * 0.98, prismD * 0.02] }), _jsx("meshBasicMaterial", { transparent: true, opacity: 0.4, color: scrubber3d, depthWrite: false, side: DoubleSide })] }), _jsxs("mesh", { onPointerDown: handlePointerDown, onPointerMove: handlePointerMove, onPointerUp: handlePointerUp, children: [_jsx("planeGeometry", { args: [prismW * 0.5, prismD * 0.5] }), _jsx("meshBasicMaterial", { transparent: true, opacity: 0, depthWrite: false, side: DoubleSide })] })] }));
 }
 export default function SpaceViewport(props) {
-    const { layerCount, selectedLayerIndex, onSelectLayer, onPreviewLayer, layerVisibility, soloIndex, onToggleHidden, onToggleSolo, onToggleMask, maskActive, onPreviewOpacity, onCommitOpacity, persistedOpacity, persistedOpacityFn, isHiddenFn, layerOrder, onPreviewOrder, onCommitOrder, animPhase, onAnimDone, viewMode, peekLayers, peekRail, layerTextures, layerThumbnails, colorLayerTextures, layerCropInfo, segmentDisplayMode, onToggleSegmentDisplay, revealActive, onRevealDone, imageAspect, onImportImage, onAiEdit, aiRunning, aiError, onPromptVisibilityChange, onAddSlice, isMaskActiveFn, isMaskInvertedFn, onInvertMask, aiEditModelId, onChangeAiEditModel, onGenerate3D, generating3DLayer, layerGlbUrls, threeDSourceHidden, onToggle3DSourceImage, getSliceHistory, onSetDisplayCursor, onSetOperationCursor, payloads, keyframePreviewUrl, documentSourceImageId, } = props;
+    const { layerCount, selectedLayerIndex, onSelectLayer, onPreviewLayer, layerVisibility, soloIndex, onToggleHidden, onToggleSolo, onToggleMask, maskActive, onPreviewOpacity, onCommitOpacity, persistedOpacity, persistedOpacityFn, isHiddenFn, layerOrder, onPreviewOrder, onCommitOrder, animPhase, onAnimDone, viewMode, peekLayers, peekRail, layerTextures, layerThumbnails, layerNames, onRenameLayer, colorLayerTextures, layerCropInfo, segmentDisplayMode, onToggleSegmentDisplay, revealActive, onRevealDone, imageAspect, onImportImage, onAiEdit, onAiEditForLayer, aiEditingLayers, aiErrors, onPromptVisibilityChange, onAddSlice, onDeleteSlice, isMaskActiveFn, isMaskInvertedFn, onInvertMask, aiEditModelId, onChangeAiEditModel, onGenerate3D, generating3DLayer, layerGlbUrls, threeDSourceHidden, onToggle3DSourceImage, getSliceHistory, onSetDisplayCursor, onSetOperationCursor, payloads, keyframePreviewUrl, documentSourceImageId, onCompositeKeyframe, compositeResultUrl, compositeBusy, } = props;
     const animating = animPhase !== "idle";
     // Transform pivot face for 3D models: which bbox face the gizmo anchors to
     const [transformPivot, setTransformPivot] = useState("center");
+    // Keyframe expanded preview + composite state
+    const [keyframeExpanded, setKeyframeExpanded] = useState(false);
+    const [compositeFade, setCompositeFade] = useState(0.5);
+    // AI panel pinned to a specific layer (persists across selection changes)
+    const [aiPanelLayer, setAiPanelLayer] = useState(null);
+    const [aiPanelPrompt, setAiPanelPrompt] = useState("");
+    const [aiPanelStrength, setAiPanelStrength] = useState(0.75);
     // Universal AI History panel: which layer index is open, or null
     const [historyPanelLayer, setHistoryPanelLayer] = useState(null);
     // Screen-space anchor for the 3D-attached history HUD
     const [sliceAnchor, setSliceAnchor] = useState({ x: 0, y: 0, visible: false });
     const stableSetSliceAnchor = useCallback((a) => { setSliceAnchor(a); }, []);
+    // Screen-space anchor for the AI edit button on the selected node
+    const [selectedSliceAnchor, setSelectedSliceAnchor] = useState({ x: 0, y: 0, visible: false });
+    const stableSetSelectedSliceAnchor = useCallback((a) => { setSelectedSliceAnchor(a); }, []);
+    // Screen-space anchor for the pinned AI panel layer
+    const [aiPanelAnchor, setAiPanelAnchor] = useState({ x: 0, y: 0, visible: false });
+    const stableSetAiPanelAnchor = useCallback((a) => { setAiPanelAnchor(a); }, []);
+    // Layer spread multiplier (1 = default, 0.2 = compressed, 3.0 = expanded)
+    const [layerSpread, setLayerSpread] = useState(1);
     // Transform gizmo mode
     const [transformMode, setTransformMode] = useState("rotate");
     // Snap settings
@@ -1059,9 +1089,10 @@ export default function SpaceViewport(props) {
                 const screenDeltaY = dragStartY.current - lastDragY.current;
                 const brickDeltaY = screenDeltaY * stb;
                 const posIdx = dragOriginalPosIdx.current;
-                const origY = layerY(posIdx, layerCount);
-                const continuousY = Math.max(-PRISM_H / 2, Math.min(PRISM_H / 2, origY + brickDeltaY));
-                const continuous = yToLayerContinuous(continuousY, layerCount);
+                const origY = layerY(posIdx, layerCount, layerSpread);
+                const spreadH = PRISM_H * layerSpread;
+                const continuousY = Math.max(-spreadH / 2, Math.min(spreadH / 2, origY + brickDeltaY));
+                const continuous = yToLayerContinuous(continuousY, layerCount, layerSpread);
                 const newPos = clampLayerIndex(continuous, layerCount);
                 if (newPos !== posIdx) {
                     finalOrder = [...layerOrder];
@@ -1098,9 +1129,10 @@ export default function SpaceViewport(props) {
             const screenDeltaY = dragStartY.current - e.clientY;
             const brickDeltaY = screenDeltaY * stb;
             const posIdx = dragOriginalPosIdx.current;
-            const origY = layerY(posIdx, layerCount);
+            const origY = layerY(posIdx, layerCount, layerSpread);
             // Continuous Y, clamped to brick bounds
-            const continuousY = Math.max(-PRISM_H / 2, Math.min(PRISM_H / 2, origY + brickDeltaY));
+            const spreadH = PRISM_H * layerSpread;
+            const continuousY = Math.max(-spreadH / 2, Math.min(spreadH / 2, origY + brickDeltaY));
             // Update the visual override so the 3D plane follows the mouse.
             // We do NOT call onPreviewOrder here — SpacePrism computes visual
             // positions locally from dragOverride to avoid parent re-render ghosts.
@@ -1172,15 +1204,89 @@ export default function SpaceViewport(props) {
             touchAction: viewMode === "minimalist" ? "none" : "auto",
             userSelect: "none",
             cursor: dragReorder ? "grabbing" : "auto",
-        }, onPointerDown: handleCanvasPointerDown, onPointerUp: handleCanvasPointerUp, onPointerMove: handleCanvasPointerMove, children: [_jsxs(Canvas, { frameloop: "demand", camera: { position: [0, 10, 0.01], fov: 50 }, style: { background: template.colors.background }, children: [_jsx("ambientLight", { intensity: 1.0 }), _jsx("directionalLight", { position: [10, 10, 5], intensity: 0.8, castShadow: false }), _jsx("directionalLight", { position: [-5, -3, -5], intensity: 0.3 }), _jsx(SpacePrism, { layerCount: layerCount, selectedLayerIndex: selectedLayerIndex, layerVisibility: layerVisibility, layerOrder: layerOrder, onSelectLayer: onSelectLayer, dragOverride: dragOverride, suppressClicks: longPressSelected || dragReorder, layerTextures: segmentDisplayMode === "colored" ? colorLayerTextures : layerTextures, layerCropInfo: layerCropInfo, imageAspect: imageAspect, revealActive: revealActive, onRevealDone: onRevealDone, aiEditingLayer: aiRunning ? selectedLayerIndex : null, layerGlbUrls: layerGlbUrls, generating3DLayer: generating3DLayer, transformPivot: transformPivot, transformMode: transformMode, snapTranslation: snapTranslation, snapRotation: snapRotation, snapScale: snapScale, snapEnabled: snapEnabled, onSetTransformPivot: setTransformPivot, onTransformChange: setModelTransform, appliedTransform: appliedTransform, modelTransform: modelTransform }), _jsx(ScrubberPlane, { layerCount: layerCount, selectedLayerIndex: selectedLayerIndex, layerOrder: layerOrder, onPreviewLayer: onPreviewLayer, onCommitLayer: onSelectLayer, imageAspect: imageAspect }), _jsx(CameraRef, { cameraRef: cameraRef }), viewMode === "universal" && selectedLayerIndex !== null && getSliceHistory && onSetDisplayCursor && payloads && (() => {
+        }, onPointerDown: handleCanvasPointerDown, onPointerUp: handleCanvasPointerUp, onPointerMove: handleCanvasPointerMove, children: [_jsxs(Canvas, { frameloop: "demand", camera: { position: [0, 10, 0.01], fov: 50 }, style: { background: template.colors.background }, children: [_jsx("ambientLight", { intensity: 1.0 }), _jsx("directionalLight", { position: [10, 10, 5], intensity: 0.8, castShadow: false }), _jsx("directionalLight", { position: [-5, -3, -5], intensity: 0.3 }), _jsx(SpacePrism, { layerCount: layerCount, selectedLayerIndex: selectedLayerIndex, layerVisibility: layerVisibility, layerOrder: layerOrder, onSelectLayer: onSelectLayer, dragOverride: dragOverride, suppressClicks: longPressSelected || dragReorder, layerTextures: segmentDisplayMode === "colored" ? colorLayerTextures : layerTextures, layerCropInfo: layerCropInfo, imageAspect: imageAspect, layerSpread: layerSpread, threeDSourceHidden: threeDSourceHidden, revealActive: revealActive, onRevealDone: onRevealDone, aiEditingLayers: aiEditingLayers, layerGlbUrls: layerGlbUrls, generating3DLayer: generating3DLayer, transformPivot: transformPivot, transformMode: transformMode, snapTranslation: snapTranslation, snapRotation: snapRotation, snapScale: snapScale, snapEnabled: snapEnabled, onSetTransformPivot: setTransformPivot, onTransformChange: setModelTransform, appliedTransform: appliedTransform, modelTransform: modelTransform }), _jsx(ScrubberPlane, { layerCount: layerCount, selectedLayerIndex: selectedLayerIndex, layerOrder: layerOrder, onPreviewLayer: onPreviewLayer, onCommitLayer: onSelectLayer, imageAspect: imageAspect, layerSpread: layerSpread }), _jsx(CameraRef, { cameraRef: cameraRef }), viewMode === "universal" && selectedLayerIndex !== null && getSliceHistory && onSetDisplayCursor && payloads && (() => {
                         const sliceGraph = getSliceHistory(selectedLayerIndex);
                         if (!sliceGraph)
                             return null;
                         const { prismW: pw } = prismDims(imageAspect);
                         const visualIdx = layerOrder.indexOf(selectedLayerIndex);
-                        const yPos = layerY(visualIdx < 0 ? selectedLayerIndex : visualIdx, layerCount);
-                        return (_jsx(HistoryGraph3D, { graph: sliceGraph, payloads: payloads, sliceY: yPos, prismW: pw, onSelectNode: (id) => { onSetDisplayCursor(selectedLayerIndex, id); }, onSetOperationCursor: (id) => { onSetOperationCursor?.(selectedLayerIndex, id); }, ...(documentSourceImageId ? { documentSourceImageId } : {}) }));
-                    })(), _jsx(SliceAnchorTracker, { layerIndex: historyPanelLayer, layerCount: layerCount, layerOrder: layerOrder, onUpdate: stableSetSliceAnchor }), _jsx(CameraRig, { animPhase: animPhase, onAnimDone: onAnimDone }), _jsx(OrbitControls, { makeDefault: true, onChange: () => { invalidate(); }, enabled: !animating && !longPressSelected && !dragReorder, target: [0, 0, 0], enableDamping: true, dampingFactor: 0.12, minPolarAngle: 0.05, maxPolarAngle: Math.PI * 0.48, minDistance: 5, maxDistance: 20 })] }), _jsx("button", { type: "button", onClick: toggleChrome, title: shouldShowChrome ? "Hide toolbar" : "Show toolbar", className: `chrome-toggle-btn${shouldShowChrome ? " chrome-toggle-open" : ""}`, children: shouldShowChrome ? "✕" : "☰" }), keyframePreviewUrl && (_jsxs("div", { title: "Keyframe preview (top-down composite)", style: {
+                        const yPos = layerY(visualIdx < 0 ? selectedLayerIndex : visualIdx, layerCount, layerSpread);
+                        return (_jsx(HistoryGraph3D, { graph: sliceGraph, payloads: payloads, sliceY: yPos, prismW: pw, onSelectNode: (id) => { onSetDisplayCursor(selectedLayerIndex, id); }, onSetOperationCursor: (id) => { onSetOperationCursor?.(selectedLayerIndex, id); }, ...(documentSourceImageId ? { documentSourceImageId } : {}), onToggleAiPanel: () => { setAiPanelLayer((prev) => prev === selectedLayerIndex ? null : selectedLayerIndex); }, aiEditing: aiEditingLayers.has(selectedLayerIndex), aiPanelOpen: aiPanelLayer === selectedLayerIndex }));
+                    })(), _jsx(SliceAnchorTracker, { layerIndex: historyPanelLayer, layerCount: layerCount, layerOrder: layerOrder, onUpdate: stableSetSliceAnchor }), _jsx(SliceAnchorTracker, { layerIndex: selectedLayerIndex, layerCount: layerCount, layerOrder: layerOrder, onUpdate: stableSetSelectedSliceAnchor }), _jsx(SliceAnchorTracker, { layerIndex: aiPanelLayer, layerCount: layerCount, layerOrder: layerOrder, onUpdate: stableSetAiPanelAnchor }), _jsx(CameraRig, { animPhase: animPhase, onAnimDone: onAnimDone }), _jsx(OrbitControls, { makeDefault: true, onChange: () => { invalidate(); }, enabled: !animating && !longPressSelected && !dragReorder, target: [0, 0, 0], enableDamping: true, dampingFactor: 0.12, minPolarAngle: 0.05, maxPolarAngle: Math.PI * 0.48, minDistance: 5, maxDistance: 20 })] }), viewMode === "universal" && aiPanelLayer !== null && aiPanelAnchor.visible && (_jsxs("div", { style: {
+                    position: "absolute",
+                    left: Math.min(aiPanelAnchor.x + 60, (typeof window !== "undefined" ? window.innerWidth : 800) - 260),
+                    top: Math.max(aiPanelAnchor.y - 100, 10),
+                    display: "flex",
+                    flexDirection: "column",
+                    gap: 6,
+                    padding: "8px 10px",
+                    borderRadius: 6,
+                    background: "var(--hud-bg)",
+                    border: "1px solid var(--hud-border)",
+                    color: "var(--hud-text)",
+                    fontSize: 12,
+                    minWidth: 220,
+                    maxWidth: 280,
+                    zIndex: 25,
+                    pointerEvents: "auto",
+                    backdropFilter: "blur(12px)",
+                    boxShadow: "0 4px 16px rgba(0,0,0,0.35)",
+                }, children: [_jsxs("div", { style: { display: "flex", alignItems: "center", gap: 6 }, children: [_jsxs("span", { style: { fontSize: 10, fontWeight: 600, opacity: 0.7, flex: 1 }, children: ["AI Edit \u2014 ", layerNames[aiPanelLayer] ?? `Layer ${String(aiPanelLayer)}`] }), aiEditingLayers.has(aiPanelLayer) && (_jsx("span", { style: { fontSize: 10, color: "var(--scrubber-active)" }, children: "\u23F3 Running" })), _jsx("button", { type: "button", onClick: () => { setAiPanelLayer(null); }, style: { background: "none", border: "none", color: "var(--hud-muted)", cursor: "pointer", fontSize: 12, padding: "0 2px" }, children: "\u2715" })] }), _jsxs("label", { style: { display: "flex", flexDirection: "column", gap: 2 }, children: [_jsx("span", { style: { opacity: 0.6 }, children: "Model" }), _jsx("select", { value: aiEditModelId, onChange: (e) => { onChangeAiEditModel(e.target.value); }, style: {
+                                    background: "var(--hud-active)",
+                                    border: "1px solid var(--hud-border-btn)",
+                                    borderRadius: 4,
+                                    padding: "4px 6px",
+                                    color: "var(--hud-text)",
+                                    fontSize: 12,
+                                    outline: "none",
+                                }, children: AI_EDIT_MODELS.map((m) => (_jsx("option", { value: m.id, children: m.label }, m.id))) })] }), _jsxs("label", { style: { display: "flex", flexDirection: "column", gap: 2 }, children: [_jsx("span", { style: { opacity: 0.6 }, children: "Prompt" }), _jsx("input", { type: "text", value: aiPanelPrompt, onChange: (e) => { setAiPanelPrompt(e.target.value); }, onKeyDown: (e) => {
+                                    e.stopPropagation();
+                                    if (e.key === "Enter" && aiPanelPrompt.trim() && !aiEditingLayers.has(aiPanelLayer)) {
+                                        onAiEditForLayer(aiPanelLayer, aiPanelPrompt.trim(), aiPanelStrength);
+                                    }
+                                }, placeholder: "Describe the edit...", style: {
+                                    background: "var(--hud-active)",
+                                    border: "1px solid var(--hud-border-btn)",
+                                    borderRadius: 4,
+                                    padding: "4px 6px",
+                                    color: "var(--hud-text)",
+                                    fontSize: 12,
+                                    outline: "none",
+                                } })] }), getAiEditModel(aiEditModelId).hasStrength && (_jsxs("label", { style: { display: "flex", alignItems: "center", gap: 6 }, children: [_jsx("span", { style: { opacity: 0.6, minWidth: 52 }, children: "Strength" }), _jsx("input", { type: "range", min: 0, max: 100, step: 1, value: Math.round(aiPanelStrength * 100), onChange: (e) => { setAiPanelStrength(Number(e.target.value) / 100); }, onKeyDown: (e) => { e.stopPropagation(); }, style: { flex: 1, accentColor: "var(--scrubber-active)", cursor: "pointer" } }), _jsxs("span", { style: { opacity: 0.5, minWidth: 30, textAlign: "right" }, children: [Math.round(aiPanelStrength * 100), "%"] })] })), _jsx("button", { type: "button", disabled: !aiPanelPrompt.trim() || aiEditingLayers.has(aiPanelLayer), onClick: () => {
+                            if (aiPanelPrompt.trim())
+                                onAiEditForLayer(aiPanelLayer, aiPanelPrompt.trim(), aiPanelStrength);
+                        }, style: {
+                            background: aiEditingLayers.has(aiPanelLayer) ? "var(--hud-muted)" : "var(--scrubber-active)",
+                            border: "none",
+                            borderRadius: 4,
+                            padding: "5px 10px",
+                            color: "var(--btn-primary-text)",
+                            cursor: aiEditingLayers.has(aiPanelLayer) ? "wait" : "pointer",
+                            fontWeight: 600,
+                            fontSize: 12,
+                        }, children: aiEditingLayers.has(aiPanelLayer) ? "Running…" : "Run AI Edit" }), aiErrors[aiPanelLayer] && (_jsx("div", { style: { color: "var(--color-error)", fontSize: 11, wordBreak: "break-word", maxHeight: 60, overflowY: "auto" }, children: aiErrors[aiPanelLayer] }))] })), _jsx("button", { type: "button", onClick: toggleChrome, title: shouldShowChrome ? "Hide toolbar" : "Show toolbar", className: `chrome-toggle-btn${shouldShowChrome ? " chrome-toggle-open" : ""}`, children: shouldShowChrome ? "✕" : "☰" }), layerCount > 1 && (_jsxs("div", { style: {
+                    position: "absolute",
+                    left: 12,
+                    top: "50%",
+                    transform: "translateY(-50%)",
+                    display: "flex",
+                    flexDirection: "column",
+                    alignItems: "center",
+                    gap: 4,
+                    padding: "8px 4px",
+                    borderRadius: 6,
+                    background: "var(--hud-bg)",
+                    border: "1px solid var(--hud-border)",
+                    zIndex: 11,
+                    pointerEvents: "auto",
+                }, children: [_jsx("span", { style: { fontSize: 8, color: "var(--hud-muted)", writingMode: "vertical-rl", textOrientation: "mixed" }, children: "Spread" }), _jsx("input", { type: "range", min: 20, max: 300, step: 5, value: Math.round(layerSpread * 100), onChange: (e) => { setLayerSpread(Number(e.target.value) / 100); }, title: `Slice spread: ${Math.round(layerSpread * 100)}%`, style: {
+                            writingMode: "vertical-lr",
+                            direction: "rtl",
+                            height: 100,
+                            width: 18,
+                            accentColor: "var(--scrubber-active)",
+                            cursor: "pointer",
+                        } }), _jsxs("span", { style: { fontSize: 8, color: "var(--hud-muted)" }, children: [Math.round(layerSpread * 100), "%"] })] })), keyframePreviewUrl && !keyframeExpanded && (_jsxs("div", { title: "Keyframe preview (top-down composite) \u2014 click to expand", onClick: () => { setKeyframeExpanded(true); }, style: {
                     position: "absolute",
                     // Layers mode: top-left so the bottom history drawer never covers it.
                     // Other modes: bottom-left, above the LayerControlsHUD (bottom: 12).
@@ -1192,11 +1298,19 @@ export default function SpaceViewport(props) {
                     border: "1px solid var(--hud-border)",
                     background: "var(--hud-bg)",
                     zIndex: 11,
+                    cursor: "pointer",
                 }, children: [_jsx("img", { src: keyframePreviewUrl, alt: "Keyframe", style: {
                             width: "100%",
                             height: "100%",
                             objectFit: "contain",
                         } }), _jsx("span", { style: {
+                            position: "absolute",
+                            top: 3,
+                            right: 3,
+                            fontSize: 10,
+                            color: "var(--hud-muted)",
+                            opacity: 0.7,
+                        }, children: "\u2922" }), _jsx("span", { style: {
                             position: "absolute",
                             bottom: 2,
                             left: 0,
@@ -1206,7 +1320,95 @@ export default function SpaceViewport(props) {
                             color: "var(--hud-muted)",
                             textTransform: "uppercase",
                             letterSpacing: 0.5,
-                        }, children: "Keyframe" })] })), viewMode !== "universal" && selectedLayerIndex !== null && getSliceHistory && (() => {
+                        }, children: "Keyframe" })] })), keyframePreviewUrl && keyframeExpanded && (_jsx("div", { style: {
+                    position: "absolute",
+                    inset: 0,
+                    zIndex: 100,
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    background: "rgba(0,0,0,0.7)",
+                }, onClick: (e) => { if (e.target === e.currentTarget)
+                    setKeyframeExpanded(false); }, children: _jsxs("div", { style: {
+                        position: "relative",
+                        background: "var(--hud-bg, #1a1a2e)",
+                        border: "1px solid var(--hud-border, #333)",
+                        borderRadius: 12,
+                        padding: 16,
+                        maxWidth: "80vw",
+                        maxHeight: "80vh",
+                        display: "flex",
+                        flexDirection: "column",
+                        alignItems: "center",
+                        gap: 12,
+                    }, children: [_jsx("button", { type: "button", onClick: () => { setKeyframeExpanded(false); }, style: {
+                                position: "absolute",
+                                top: 8,
+                                right: 8,
+                                background: "none",
+                                border: "none",
+                                color: "var(--hud-text, #ccc)",
+                                fontSize: 18,
+                                cursor: "pointer",
+                                lineHeight: 1,
+                            }, children: "\u2715" }), _jsx("span", { style: {
+                                fontSize: 11,
+                                fontWeight: 600,
+                                color: "var(--hud-text, #ccc)",
+                                textTransform: "uppercase",
+                                letterSpacing: 1,
+                            }, children: "Keyframe Preview" }), _jsxs("div", { style: {
+                                position: "relative",
+                                width: "min(60vw, 480px)",
+                                aspectRatio: "1",
+                                borderRadius: 8,
+                                overflow: "hidden",
+                                background: "#000",
+                            }, children: [_jsx("img", { src: keyframePreviewUrl, alt: "Keyframe raw", style: {
+                                        position: "absolute",
+                                        inset: 0,
+                                        width: "100%",
+                                        height: "100%",
+                                        objectFit: "contain",
+                                    } }), compositeResultUrl && (_jsx("img", { src: compositeResultUrl, alt: "Composited", style: {
+                                        position: "absolute",
+                                        inset: 0,
+                                        width: "100%",
+                                        height: "100%",
+                                        objectFit: "contain",
+                                        opacity: compositeFade,
+                                        transition: "opacity 0.15s ease",
+                                    } })), compositeBusy && (_jsx("div", { style: {
+                                        position: "absolute",
+                                        inset: 0,
+                                        display: "flex",
+                                        alignItems: "center",
+                                        justifyContent: "center",
+                                        background: "rgba(0,0,0,0.4)",
+                                    }, children: _jsx("span", { style: {
+                                            fontSize: 14,
+                                            color: "#fff",
+                                            animation: "pulse 1.2s ease-in-out infinite",
+                                        }, children: "Compositing\u2026" }) }))] }), compositeResultUrl && (_jsxs("div", { style: {
+                                display: "flex",
+                                alignItems: "center",
+                                gap: 8,
+                                width: "min(60vw, 480px)",
+                            }, children: [_jsx("span", { style: { fontSize: 9, color: "var(--hud-muted, #888)", whiteSpace: "nowrap" }, children: "Raw" }), _jsx("input", { type: "range", min: 0, max: 1, step: 0.01, value: compositeFade, onChange: (e) => { setCompositeFade(Number(e.target.value)); }, style: {
+                                        flex: 1,
+                                        accentColor: "var(--scrubber-active, #5af)",
+                                        cursor: "pointer",
+                                    } }), _jsx("span", { style: { fontSize: 9, color: "var(--hud-muted, #888)", whiteSpace: "nowrap" }, children: "Composite" })] })), _jsx("button", { type: "button", disabled: compositeBusy, onClick: () => { onCompositeKeyframe?.(); }, style: {
+                                padding: "8px 20px",
+                                borderRadius: 6,
+                                border: "1px solid var(--hud-border, #444)",
+                                background: compositeBusy ? "#333" : "linear-gradient(135deg, #4a5af0, #7b2ff7)",
+                                color: "#fff",
+                                fontSize: 12,
+                                fontWeight: 600,
+                                cursor: compositeBusy ? "not-allowed" : "pointer",
+                                opacity: compositeBusy ? 0.6 : 1,
+                            }, children: compositeBusy ? "Compositing…" : compositeResultUrl ? "Re-composite" : "AI Composite" })] }) })), viewMode !== "universal" && selectedLayerIndex !== null && getSliceHistory && (() => {
                 const graph = getSliceHistory(selectedLayerIndex);
                 if (!graph)
                     return null;
@@ -1251,7 +1453,7 @@ export default function SpaceViewport(props) {
                 const sliceGraph = getSliceHistory(historyPanelLayer);
                 if (!sliceGraph)
                     return null;
-                return (_jsx(AIHistoryPanel, { layerIndex: historyPanelLayer, graph: sliceGraph, payloads: payloads, onSetDisplayCursor: onSetDisplayCursor, onSetOperationCursor: onSetOperationCursor, onClose: () => { setHistoryPanelLayer(null); }, documentSourceImageId: documentSourceImageId, style: { right: 260, bottom: 0, borderRadius: "10px 10px 0 0" } }));
+                return (_jsx(AIHistoryPanel, { layerIndex: historyPanelLayer, layerName: layerNames[historyPanelLayer], graph: sliceGraph, payloads: payloads, onSetDisplayCursor: onSetDisplayCursor, onSetOperationCursor: onSetOperationCursor, onClose: () => { setHistoryPanelLayer(null); }, documentSourceImageId: documentSourceImageId, style: { right: 260, bottom: 0, borderRadius: "10px 10px 0 0" } }));
             })(), layerCount > 1 && (_jsxs("button", { type: "button", onClick: onToggleSegmentDisplay, title: segmentDisplayMode === "masked" ? "Switch to colored segments" : "Switch to masked original", style: {
                     position: "absolute",
                     top: 12,
@@ -1268,7 +1470,7 @@ export default function SpaceViewport(props) {
                     cursor: "pointer",
                     zIndex: 10,
                     transition: "background 0.15s, border-color 0.15s",
-                }, children: [_jsx("span", { style: { fontSize: 14, lineHeight: 1 }, children: segmentDisplayMode === "masked" ? "🖼" : "🎨" }), segmentDisplayMode === "masked" ? "Masked" : "Colored"] })), showScrubber && (_jsx(LayerScrubber, { layerCount: layerCount, selectedIndex: selectedLayerIndex, layerOrder: layerOrder, onPreview: onPreviewLayer, onCommit: onSelectLayer, onPreviewOrder: onPreviewOrder, onCommitOrder: onCommitOrder, layerThumbnails: layerThumbnails, layerGlbUrls: layerGlbUrls })), showControlsHUD && selectedLayerIndex !== null && (_jsx(LayerControlsHUD, { layerIndex: selectedLayerIndex, isHidden: selectedIsHidden, isSolo: selectedIsSolo, maskActive: maskActive, opacity: persistedOpacity, onToggleHidden: onToggleHidden, onToggleSolo: onToggleSolo, onToggleMask: onToggleMask, onInvertMask: onInvertMask, onPreviewOpacity: onPreviewOpacity, onCommitOpacity: onCommitOpacity, hasImage: selectedLayerIndex in layerTextures, onImportImage: onImportImage, onAiEdit: onAiEdit, aiRunning: aiRunning, aiError: aiError, onAddSlice: onAddSlice, aiEditModelId: aiEditModelId, onChangeAiEditModel: onChangeAiEditModel, onPromptVisibilityChange: wrappedPromptVisibility, onGenerate3D: onGenerate3D, generating3D: generating3DLayer === selectedLayerIndex, has3DModel: selectedLayerIndex in layerGlbUrls, sourceImageHidden: threeDSourceHidden.has(selectedLayerIndex), onToggle3DSourceImage: onToggle3DSourceImage, transformPivot: transformPivot, onSetTransformPivot: setTransformPivot, transformMode: transformMode, onSetTransformMode: setTransformMode, snapEnabled: snapEnabled, onToggleSnap: () => { setSnapEnabled((s) => !s); }, modelTransform: selectedLayerIndex in layerGlbUrls ? modelTransform : undefined, onApplyTransform: handleApplyTransform })), showLayersPanel && (_jsx(LayersPanel, { layerCount: layerCount, order: layerOrder, selectedLayerIndex: selectedLayerIndex, soloIndex: soloIndex, layerVisibility: layerVisibility, isHidden: isHiddenFn, isMaskActive: isMaskActiveFn, isMaskInverted: isMaskInvertedFn, persistedOpacity: persistedOpacityFn, onSelectLayer: onSelectLayer, onToggleHidden: onToggleHidden, onToggleSolo: onToggleSolo, onToggleMask: onToggleMask, onInvertMask: onInvertMask, onPreviewOpacity: onPreviewOpacity, onCommitOpacity: onCommitOpacity, onPreviewOrder: onPreviewOrder, onCommitOrder: onCommitOrder, onImportImage: onImportImage, onAiEdit: onAiEdit, aiRunning: aiRunning, aiError: aiError, onAddSlice: onAddSlice, layerTextures: layerTextures, layerThumbnails: layerThumbnails, aiEditModelId: aiEditModelId, onChangeAiEditModel: onChangeAiEditModel, onGenerate3D: onGenerate3D, generating3DLayer: generating3DLayer, layerGlbUrls: layerGlbUrls, threeDSourceHidden: threeDSourceHidden, onToggle3DSourceImage: onToggle3DSourceImage, transformPivot: transformPivot, onSetTransformPivot: setTransformPivot, transformMode: transformMode, onSetTransformMode: setTransformMode, snapEnabled: snapEnabled, onToggleSnap: () => { setSnapEnabled((s) => !s); }, modelTransform: selectedLayerIndex !== null && selectedLayerIndex in layerGlbUrls ? modelTransform : undefined, onApplyTransform: handleApplyTransform, getSliceHistory: getSliceHistory, onSetDisplayCursor: onSetDisplayCursor, onSetOperationCursor: onSetOperationCursor, payloads: payloads })), viewMode === "minimalist" && (longPressSelected || selectedLayerIndex !== null) && !radialMenu && (_jsx("div", { style: {
+                }, children: [_jsx("span", { style: { fontSize: 14, lineHeight: 1 }, children: segmentDisplayMode === "masked" ? "🖼" : "🎨" }), segmentDisplayMode === "masked" ? "Masked" : "Colored"] })), showScrubber && (_jsx(LayerScrubber, { layerCount: layerCount, selectedIndex: selectedLayerIndex, layerOrder: layerOrder, onPreview: onPreviewLayer, onCommit: onSelectLayer, onPreviewOrder: onPreviewOrder, onCommitOrder: onCommitOrder, layerThumbnails: layerThumbnails, layerGlbUrls: layerGlbUrls, layerNames: layerNames, onRenameLayer: onRenameLayer, getSliceHistory: getSliceHistory })), showControlsHUD && selectedLayerIndex !== null && (_jsx(LayerControlsHUD, { layerIndex: selectedLayerIndex, layerName: layerNames[selectedLayerIndex], isHidden: selectedIsHidden, isSolo: selectedIsSolo, maskActive: maskActive, opacity: persistedOpacity, onToggleHidden: onToggleHidden, onToggleSolo: onToggleSolo, onToggleMask: onToggleMask, onInvertMask: onInvertMask, onPreviewOpacity: onPreviewOpacity, onCommitOpacity: onCommitOpacity, hasImage: selectedLayerIndex in layerTextures, onImportImage: onImportImage, onAiEdit: onAiEdit, aiRunning: aiEditingLayers.has(selectedLayerIndex), aiError: aiErrors[selectedLayerIndex] ?? null, onAddSlice: onAddSlice, aiEditModelId: aiEditModelId, onChangeAiEditModel: onChangeAiEditModel, onPromptVisibilityChange: wrappedPromptVisibility, onGenerate3D: onGenerate3D, generating3D: generating3DLayer === selectedLayerIndex, has3DModel: selectedLayerIndex in layerGlbUrls, sourceImageHidden: threeDSourceHidden.has(selectedLayerIndex), onToggle3DSourceImage: onToggle3DSourceImage, transformPivot: transformPivot, onSetTransformPivot: setTransformPivot, transformMode: transformMode, onSetTransformMode: setTransformMode, snapEnabled: snapEnabled, onToggleSnap: () => { setSnapEnabled((s) => !s); }, modelTransform: selectedLayerIndex in layerGlbUrls ? modelTransform : undefined, onApplyTransform: handleApplyTransform, onDeleteSlice: onDeleteSlice, layerCount: layerCount, onRenameLayer: onRenameLayer })), showLayersPanel && (_jsx(LayersPanel, { layerCount: layerCount, order: layerOrder, selectedLayerIndex: selectedLayerIndex, soloIndex: soloIndex, layerVisibility: layerVisibility, isHidden: isHiddenFn, isMaskActive: isMaskActiveFn, isMaskInverted: isMaskInvertedFn, persistedOpacity: persistedOpacityFn, onSelectLayer: onSelectLayer, onToggleHidden: onToggleHidden, onToggleSolo: onToggleSolo, onToggleMask: onToggleMask, onInvertMask: onInvertMask, onPreviewOpacity: onPreviewOpacity, onCommitOpacity: onCommitOpacity, onPreviewOrder: onPreviewOrder, onCommitOrder: onCommitOrder, onImportImage: onImportImage, onAiEdit: onAiEdit, aiEditingLayers: aiEditingLayers, aiErrors: aiErrors, onAddSlice: onAddSlice, onDeleteSlice: onDeleteSlice, layerTextures: layerTextures, layerThumbnails: layerThumbnails, layerNames: layerNames, onRenameLayer: onRenameLayer, aiEditModelId: aiEditModelId, onChangeAiEditModel: onChangeAiEditModel, onGenerate3D: onGenerate3D, generating3DLayer: generating3DLayer, layerGlbUrls: layerGlbUrls, threeDSourceHidden: threeDSourceHidden, onToggle3DSourceImage: onToggle3DSourceImage, transformPivot: transformPivot, onSetTransformPivot: setTransformPivot, transformMode: transformMode, onSetTransformMode: setTransformMode, snapEnabled: snapEnabled, onToggleSnap: () => { setSnapEnabled((s) => !s); }, modelTransform: selectedLayerIndex !== null && selectedLayerIndex in layerGlbUrls ? modelTransform : undefined, onApplyTransform: handleApplyTransform, getSliceHistory: getSliceHistory, onSetDisplayCursor: onSetDisplayCursor, onSetOperationCursor: onSetOperationCursor, payloads: payloads })), viewMode === "minimalist" && (longPressSelected || selectedLayerIndex !== null) && !radialMenu && (_jsx("div", { style: {
                     position: "absolute",
                     bottom: 16,
                     left: "50%",
@@ -1287,9 +1489,9 @@ export default function SpaceViewport(props) {
                     opacity: selectedLayerIndex !== null ? 0.85 : 0.5,
                     transition: "opacity 0.15s",
                 }, children: dragReorder && selectedLayerIndex !== null
-                    ? _jsxs(_Fragment, { children: [_jsx("span", { style: { fontSize: 14 }, children: "\u21D5" }), " Dragging Layer ", selectedLayerIndex] })
+                    ? _jsxs(_Fragment, { children: [_jsx("span", { style: { fontSize: 14 }, children: "\u21D5" }), " Dragging ", layerNames[selectedLayerIndex] ?? `Layer ${String(selectedLayerIndex)}`] })
                     : selectedLayerIndex !== null
-                        ? _jsxs(_Fragment, { children: [_jsx("span", { style: { fontSize: 14 }, children: "\u25C8" }), " Layer ", selectedLayerIndex, " \u2014 hold for menu"] })
+                        ? _jsxs(_Fragment, { children: [_jsx("span", { style: { fontSize: 14 }, children: "\u25C8" }), " ", layerNames[selectedLayerIndex] ?? `Layer ${String(selectedLayerIndex)}`, " \u2014 hold for menu"] })
                         : _jsx("span", { style: { color: "var(--hud-muted)" }, children: "long-press for menu" }) })), viewMode === "minimalist" && radialMenu && (_jsx(RadialMenu, { items: radialItems, x: radialMenu.x, y: radialMenu.y, selectedLayerIndex: selectedLayerIndex, onClose: () => { setRadialMenu(null); setLongPressSelected(false); } })), (peekLayers || peekRail) && (_jsx("div", { style: {
                     position: "absolute",
                     top: 8,

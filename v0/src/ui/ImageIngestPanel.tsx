@@ -443,7 +443,7 @@ export default function ImageIngestPanel({
                   />
                   <div style={{ display: "flex", gap: 10, justifyContent: "center" }}>
                     <button type="button" style={btnPrimary} onClick={() => void handleGenCommit()}>
-                      Create Space
+                      Enter the Image
                     </button>
                     <button
                       type="button"

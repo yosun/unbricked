@@ -24,6 +24,9 @@ export const FAL_ENDPOINTS = {
     imageTo3D: "fal-ai/sam-3/3d-objects",
     img2img: "fal-ai/flux/dev/image-to-image",
     textToImg: "fal-ai/flux/dev",
+    flux2: "fal-ai/flux-2",
+    flux2Edit: "fal-ai/flux-2/flash/edit",
+    inpainting: "fal-ai/flux-lora/inpainting",
 };
 /**
  * Max JSON body size (bytes) we allow for proxy requests.
@@ -33,6 +36,8 @@ export const FAL_ENDPOINTS = {
 const MAX_BODY_BYTES = 7 * 1024 * 1024; // 7 MB
 /** Max edge (px) when downscaling an image for the proxy. */
 const MAX_IMAGE_EDGE = 2048;
+/** Min edge (px) — fal rejects images smaller than 64×64. */
+const MIN_IMAGE_EDGE = 64;
 /* ── Helpers ──────────────────────────────────────── */
 /**
  * Downscale a data: URL image if the resulting JSON body would exceed the proxy
@@ -43,16 +48,30 @@ const MAX_IMAGE_EDGE = 2048;
 async function compressDataUrl(dataUrl, bodyOverhead) {
     if (!dataUrl.startsWith("data:"))
         return dataUrl;
-    // Fast check: if the encoded length is already safe, skip compression.
-    if (dataUrl.length + bodyOverhead <= MAX_BODY_BYTES)
-        return dataUrl;
+    // We must still load the image to check dimensions even if size is fine,
+    // because fal rejects images smaller than 64×64.
+    // Fast check: if the encoded length is already safe AND we can skip the
+    // dimension check, return early. We defer the dimension check to after load.
     return new Promise((resolve, reject) => {
         const img = new Image();
         img.onload = () => {
             const origW = img.naturalWidth;
             const origH = img.naturalHeight;
+            const shortest = Math.min(origW, origH);
+            const needsUpscale = shortest < MIN_IMAGE_EDGE;
+            // Fast path: no resize needed and payload fits
+            if (!needsUpscale && dataUrl.length + bodyOverhead <= MAX_BODY_BYTES) {
+                resolve(dataUrl);
+                return;
+            }
             let w = origW;
             let h = origH;
+            // Upscale if either dimension is below the minimum
+            if (needsUpscale) {
+                const scale = MIN_IMAGE_EDGE / shortest;
+                w = Math.round(w * scale);
+                h = Math.round(h * scale);
+            }
             const longest = Math.max(w, h);
             if (longest > MAX_IMAGE_EDGE) {
                 const scale = MAX_IMAGE_EDGE / longest;
@@ -140,7 +159,7 @@ async function proxyFetch(url, init, opts) {
 }
 /** Submit a request to the fal.ai queue. Returns the request_id + URLs. */
 async function falQueueSubmit(modelPath, body, signal) {
-    const url = `${PROXY_BASE}/${modelPath}?fal_webhook=`;
+    const url = `${PROXY_BASE}/${modelPath}`;
     const resp = await proxyFetch(url, {
         method: "POST",
         headers: {
@@ -419,7 +438,7 @@ export async function runAutoSegment(req, signal) {
 }
 export const AI_EDIT_MODELS = [
     { id: "nano-banana", label: "Nano Banana", proxyRoute: "fal-ai/nano-banana/edit", hasStrength: false },
-    { id: "flux1-img2img", label: "Flux 1 (img2img)", proxyRoute: "fal-ai/flux/dev/image-to-image", hasStrength: true },
+    { id: "flux2-flash-edit", label: "Flux 2 Flash (edit)", proxyRoute: "fal-ai/flux-2/flash/edit", hasStrength: false },
 ];
 export function getAiEditModel(id) {
     const found = AI_EDIT_MODELS.find((m) => m.id === id);
@@ -461,6 +480,142 @@ export async function runNanoBananaEdit(req, signal) {
     }
     const json = await response.json();
     return FalImg2ImgResponseSchema.parse(json);
+}
+export async function runFlux2Edit(req, signal) {
+    const body = {
+        prompt: req.prompt,
+        image_urls: req.imageDataUrls,
+    };
+    if (req.guidanceScale !== undefined)
+        body["guidance_scale"] = req.guidanceScale;
+    if (req.seed !== undefined)
+        body["seed"] = req.seed;
+    if (req.imageSize !== undefined)
+        body["image_size"] = req.imageSize;
+    if (req.numImages !== undefined)
+        body["num_images"] = req.numImages;
+    if (req.enablePromptExpansion !== undefined)
+        body["enable_prompt_expansion"] = req.enablePromptExpansion;
+    if (req.outputFormat !== undefined)
+        body["output_format"] = req.outputFormat;
+    // Compress each image URL if needed
+    const overhead = JSON.stringify({ ...body, image_urls: [] }).length + 128;
+    const perImageBudget = Math.max(1, Math.floor((MAX_BODY_BYTES - overhead) / Math.max(req.imageDataUrls.length, 1)));
+    const compressed = [];
+    for (const url of req.imageDataUrls) {
+        compressed.push(await compressDataUrl(url, MAX_BODY_BYTES - perImageBudget));
+    }
+    body["image_urls"] = compressed;
+    const url = `${PROXY_BASE}/fal-ai/flux-2/flash/edit`;
+    const response = await proxyFetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+    }, { timeoutMs: 120_000, signal });
+    if (!response.ok) {
+        const text = await response.text().catch(() => "");
+        throw new Error(`fal proxy error ${String(response.status)}: ${text}`);
+    }
+    const json = await response.json();
+    return FalImg2ImgResponseSchema.parse(json);
+}
+export async function runInpainting(req, signal) {
+    const body = {
+        prompt: req.prompt,
+        image_url: req.imageDataUrl,
+        mask_url: req.maskDataUrl,
+    };
+    if (req.strength !== undefined)
+        body["strength"] = req.strength;
+    if (req.numInferenceSteps !== undefined)
+        body["num_inference_steps"] = req.numInferenceSteps;
+    if (req.guidanceScale !== undefined)
+        body["guidance_scale"] = req.guidanceScale;
+    if (req.seed !== undefined)
+        body["seed"] = req.seed;
+    if (req.imageSize !== undefined)
+        body["image_size"] = req.imageSize;
+    if (req.outputFormat !== undefined)
+        body["output_format"] = req.outputFormat;
+    // Estimate overhead of the rest of the JSON body
+    const overhead = JSON.stringify({ ...body, image_url: "", mask_url: "" }).length + 128;
+    const perFieldBudget = Math.max(1, Math.floor((MAX_BODY_BYTES - overhead) / 2));
+    body["image_url"] = await compressDataUrl(req.imageDataUrl, MAX_BODY_BYTES - perFieldBudget);
+    body["mask_url"] = await compressDataUrl(req.maskDataUrl, MAX_BODY_BYTES - perFieldBudget);
+    const url = `${PROXY_BASE}/fal-ai/flux-lora/inpainting`;
+    const response = await proxyFetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+    }, { timeoutMs: 120_000, signal });
+    if (!response.ok) {
+        const text = await response.text().catch(() => "");
+        throw new Error(`fal inpainting proxy error ${String(response.status)}: ${text}`);
+    }
+    const json = await response.json();
+    return FalImg2ImgResponseSchema.parse(json);
+}
+/* ── Inpaint Mask From Slice Alpha ────────────────── */
+/**
+ * Create a binary mask (white = inpaint, black = keep) from a slice's alpha
+ * channel, projected back to the full original image size using crop metadata.
+ * Used for inpainting after slice deletion.
+ * Returns a PNG data URL at origW × origH.
+ */
+export async function extractSliceMaskForInpaint(sliceImageUrl, crop, signal) {
+    const { blob } = await fetchImageBlob(sliceImageUrl, signal);
+    const bitmap = await createImageBitmap(blob);
+    const sliceW = bitmap.width;
+    const sliceH = bitmap.height;
+    // Read the slice alpha channel
+    const sliceCanvas = document.createElement("canvas");
+    sliceCanvas.width = sliceW;
+    sliceCanvas.height = sliceH;
+    const sliceCtx = sliceCanvas.getContext("2d");
+    if (!sliceCtx)
+        throw new Error("Canvas 2D context unavailable");
+    sliceCtx.drawImage(bitmap, 0, 0);
+    const sliceData = sliceCtx.getImageData(0, 0, sliceW, sliceH).data;
+    bitmap.close();
+    // Full image dimensions
+    const fullW = crop?.origW ?? sliceW;
+    const fullH = crop?.origH ?? sliceH;
+    const offsetX = crop?.cropX ?? 0;
+    const offsetY = crop?.cropY ?? 0;
+    const regionW = crop?.cropW ?? sliceW;
+    const regionH = crop?.cropH ?? sliceH;
+    // Create full-size mask canvas (black = keep)
+    const maskCanvas = document.createElement("canvas");
+    maskCanvas.width = fullW;
+    maskCanvas.height = fullH;
+    const maskCtx = maskCanvas.getContext("2d");
+    if (!maskCtx)
+        throw new Error("Canvas 2D context unavailable");
+    maskCtx.fillStyle = "black";
+    maskCtx.fillRect(0, 0, fullW, fullH);
+    // Map slice pixels to full-image coordinates and paint white where alpha > 128
+    const maskImgData = maskCtx.getImageData(0, 0, fullW, fullH);
+    const md = maskImgData.data;
+    for (let sy = 0; sy < sliceH; sy++) {
+        for (let sx = 0; sx < sliceW; sx++) {
+            const sliceIdx = (sy * sliceW + sx) * 4;
+            const alpha = sliceData[sliceIdx + 3] ?? 0;
+            if (alpha > 128) {
+                // Map slice pixel to full image coordinates
+                const fx = offsetX + Math.round(sx * (regionW / sliceW));
+                const fy = offsetY + Math.round(sy * (regionH / sliceH));
+                if (fx >= 0 && fx < fullW && fy >= 0 && fy < fullH) {
+                    const fullIdx = (fy * fullW + fx) * 4;
+                    md[fullIdx] = 255; // R
+                    md[fullIdx + 1] = 255; // G
+                    md[fullIdx + 2] = 255; // B
+                    md[fullIdx + 3] = 255; // A
+                }
+            }
+        }
+    }
+    maskCtx.putImageData(maskImgData, 0, 0);
+    return maskCanvas.toDataURL("image/png");
 }
 /* ── Alpha Mask Compositing ──────────────────────── */
 /**
@@ -768,6 +923,47 @@ export async function runTextToImg(req, signal) {
     }
     const json = await response.json();
     return FalTextToImgResponseSchema.parse(json);
+}
+const FalFlux2ResponseSchema = z.object({
+    images: z.array(FalImageSchema).min(1),
+    seed: z.number().optional(),
+    prompt: z.string().optional(),
+    has_nsfw_concepts: z.array(z.boolean()).optional(),
+});
+export async function runFlux2TextToImg(req, signal) {
+    const body = {
+        prompt: req.prompt,
+    };
+    if (req.imageSize !== undefined)
+        body["image_size"] = req.imageSize;
+    if (req.guidanceScale !== undefined)
+        body["guidance_scale"] = req.guidanceScale;
+    if (req.numInferenceSteps !== undefined)
+        body["num_inference_steps"] = req.numInferenceSteps;
+    if (req.numImages !== undefined)
+        body["num_images"] = req.numImages;
+    if (req.seed !== undefined)
+        body["seed"] = req.seed;
+    if (req.acceleration !== undefined)
+        body["acceleration"] = req.acceleration;
+    if (req.enablePromptExpansion !== undefined)
+        body["enable_prompt_expansion"] = req.enablePromptExpansion;
+    if (req.enableSafetyChecker !== undefined)
+        body["enable_safety_checker"] = req.enableSafetyChecker;
+    if (req.outputFormat !== undefined)
+        body["output_format"] = req.outputFormat;
+    const url = `${PROXY_BASE}/fal-ai/flux-2`;
+    const response = await proxyFetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+    }, { timeoutMs: 120_000, signal });
+    if (!response.ok) {
+        const text = await response.text().catch(() => "");
+        throw new Error(`fal flux-2 proxy error ${String(response.status)}: ${text}`);
+    }
+    const json = await response.json();
+    return FalFlux2ResponseSchema.parse(json);
 }
 /* ── Layer Composite Rendering ───────────────────── */
 /**

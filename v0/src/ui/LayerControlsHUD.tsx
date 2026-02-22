@@ -5,6 +5,7 @@ import { PIVOT_FACES, PIVOT_FACE_LABELS } from "./SpaceViewport";
 
 interface LayerControlsHUDProps {
   layerIndex: number;
+  layerName?: string | undefined;
   isHidden: boolean;
   isSolo: boolean;
   maskActive: boolean;
@@ -37,6 +38,9 @@ interface LayerControlsHUDProps {
   onToggleSnap: () => void;
   modelTransform?: Object3DTransform | undefined;
   onApplyTransform: (t: Object3DTransform) => void;
+  onDeleteSlice: (index: number) => void;
+  layerCount: number;
+  onRenameLayer: (index: number, name: string) => void;
 }
 
 function clamp01(v: number): number {
@@ -206,7 +210,15 @@ export default function LayerControlsHUD(props: LayerControlsHUDProps): React.JS
     onToggleSnap,
     modelTransform,
     onApplyTransform,
+    onDeleteSlice,
+    layerCount,
+    onRenameLayer,
   } = props;
+
+  // Inline rename state
+  const [renaming, setRenaming] = useState(false);
+  const [renameText, setRenameText] = useState("");
+  const renameInputRef = useRef<HTMLInputElement>(null);
 
   // Local drag value: null when not dragging (use props instead)
   const [dragValue, setDragValue] = useState<number | null>(null);
@@ -232,6 +244,7 @@ export default function LayerControlsHUD(props: LayerControlsHUDProps): React.JS
     setShowPrompt(false);
     setPromptText("");
     setStrength(0.75);
+    setRenaming(false);
   }, [layerIndex]);
 
   // effectiveOpacity: drag value while dragging, persisted prop otherwise.
@@ -293,7 +306,51 @@ export default function LayerControlsHUD(props: LayerControlsHUDProps): React.JS
         userSelect: "none",
       }}
     >
-      <span style={{ opacity: 0.6, marginRight: 2 }}>L{layerIndex}</span>
+      {renaming ? (
+        <input
+          ref={renameInputRef}
+          type="text"
+          value={renameText}
+          onChange={(e) => { setRenameText(e.target.value); }}
+          onBlur={() => {
+            onRenameLayer(layerIndex, renameText);
+            setRenaming(false);
+          }}
+          onKeyDown={(e) => {
+            e.stopPropagation();
+            if (e.key === "Enter") {
+              onRenameLayer(layerIndex, renameText);
+              setRenaming(false);
+            } else if (e.key === "Escape") {
+              setRenaming(false);
+            }
+          }}
+          style={{
+            fontSize: 12,
+            width: 72,
+            background: "var(--hud-active)",
+            border: "1px solid var(--scrubber-active)",
+            borderRadius: 3,
+            padding: "1px 4px",
+            color: "var(--hud-text)",
+            outline: "none",
+            marginRight: 2,
+          }}
+        />
+      ) : (
+        <span
+          onDoubleClick={(e) => {
+            e.stopPropagation();
+            setRenaming(true);
+            setRenameText(props.layerName ?? `Layer ${String(layerIndex)}`);
+            setTimeout(() => { renameInputRef.current?.select(); }, 0);
+          }}
+          title="Double-click to rename"
+          style={{ opacity: 0.6, marginRight: 2, cursor: "default" }}
+        >
+          {props.layerName ?? `L${String(layerIndex)}`}
+        </span>
+      )}
 
       {/* Visibility toggle */}
       <button
@@ -414,6 +471,26 @@ export default function LayerControlsHUD(props: LayerControlsHUDProps): React.JS
       >
         ＋
       </button>
+
+      {/* Delete Slice */}
+      {layerCount > 1 && (
+        <button
+          type="button"
+          onClick={() => { onDeleteSlice(layerIndex); }}
+          title="Delete this slice"
+          style={{
+            background: "none",
+            border: "1px solid var(--hud-border-btn)",
+            color: "var(--hud-muted)",
+            borderRadius: 4,
+            padding: "2px 7px",
+            cursor: "pointer",
+            fontSize: 13,
+          }}
+        >
+          🗑
+        </button>
+      )}
 
       {/* Import Image */}
       <button

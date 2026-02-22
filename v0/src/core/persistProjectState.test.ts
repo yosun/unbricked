@@ -5,7 +5,10 @@ import {
   clearProjectState,
   loadProjectState,
   saveProjectState,
+  rehydrateBlobs,
 } from "./persistProjectState";
+import type { ProjectState, PayloadId } from "./types";
+import { makeId } from "./ids";
 
 /**
  * Node >=22 exposes a built-in globalThis.localStorage that lacks getItem/setItem.
@@ -73,5 +76,44 @@ describe("persistProjectState", () => {
     expect(globalThis.localStorage.getItem(STORAGE_KEY)).not.toBeNull();
     clearProjectState();
     expect(globalThis.localStorage.getItem(STORAGE_KEY)).toBeNull();
+  });
+
+  it("offloads large data-URL payloads so localStorage stays small", () => {
+    // Create a state with a huge base64 payload (> 64KB threshold)
+    const bigDataUrl = "data:model/gltf-binary;base64," + "A".repeat(100_000);
+    const pid = makeId("payload") as PayloadId;
+    const stateWithBlob: ProjectState = {
+      ...sampleProject.state,
+      payloads: {
+        ...sampleProject.state.payloads,
+        [pid]: {
+          id: pid,
+          kind: "Payload",
+          mediaType: "model/gltf-binary",
+          uri: bigDataUrl,
+          sha256: "fake",
+          bytes: 100_000,
+          meta: {},
+        },
+      },
+    };
+    saveProjectState(stateWithBlob);
+
+    // The localStorage copy should have an idb:// reference, not the full URI
+    const raw = globalThis.localStorage.getItem(STORAGE_KEY);
+    expect(raw).not.toBeNull();
+    expect(raw!).not.toContain("AAAAAAA");
+    expect(raw!).toContain("idb://blob/");
+
+    // loadProjectState still succeeds (returns idb:// refs as-is)
+    const loaded = loadProjectState();
+    expect(loaded).not.toBeNull();
+    expect(loaded!.payloads[pid]!.uri).toMatch(/^idb:\/\/blob\//);
+  });
+
+  it("rehydrateBlobs is a no-op when no idb refs present", async () => {
+    const state = sampleProject.state;
+    const result = await rehydrateBlobs(state);
+    expect(result).toBe(state); // same reference — nothing changed
   });
 });

@@ -120,6 +120,19 @@ export function soloIndex(
   return idx;
 }
 
+/**
+ * Get the user-assigned name for a layer, or null if unnamed.
+ */
+export function layerName(
+  props: LayerProps | null,
+  index: number,
+): string | null {
+  if (!props) return null;
+  const raw = props.annotation.data[`name.${String(index)}`];
+  if (!raw || raw.length === 0) return null;
+  return raw;
+}
+
 /* ── Layer order ─────────────────────────────────── */
 
 export interface LayerOrder {

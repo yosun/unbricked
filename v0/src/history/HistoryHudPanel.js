@@ -11,7 +11,7 @@ import { computeHistoryLayout } from "./historyLayout";
 import { buildActiveSet, getNode } from "./historyGraph";
 /** Compact layout for HUD: smaller spacing than the drawer panel */
 const HUD_LAYOUT_OPTS = { xStep: 110, yStep: 70 };
-export default function HistoryHudPanel({ anchor, graph, onSelectNode, onClose, operationNodeId, layerIndex, opCount, }) {
+export default function HistoryHudPanel({ anchor, graph, onSelectNode, onClose, operationNodeId, layerIndex, layerName, opCount, }) {
     const layout = useMemo(() => computeHistoryLayout(graph, HUD_LAYOUT_OPTS), [graph]);
     const activeSet = useMemo(() => buildActiveSet(graph), [graph]);
     // ── Offscreen: show collapsed chip near closest edge ──
@@ -32,7 +32,7 @@ export default function HistoryHudPanel({ anchor, graph, onSelectNode, onClose, 
                 zIndex: 14,
                 backdropFilter: "blur(8px)",
                 pointerEvents: "auto",
-            }, onClick: onClose, title: "Slice is off-screen \u2014 click to dismiss", children: ["\uD83D\uDD70 History \u2014 Layer ", layerIndex, " (", opCount, " op", opCount !== 1 ? "s" : "", ")"] }));
+            }, onClick: onClose, title: "Slice is off-screen \u2014 click to dismiss", children: ["\uD83D\uDD70 History \u2014 ", layerName ?? `Layer ${String(layerIndex)}`, " (", opCount, " op", opCount !== 1 ? "s" : "", ")"] }));
     }
     // ── Visible: render anchored subway map expanding rightward ──
     const pad = 40;
@@ -86,7 +86,7 @@ export default function HistoryHudPanel({ anchor, graph, onSelectNode, onClose, 
                                     color: "var(--hud-text)",
                                     textTransform: "uppercase",
                                     letterSpacing: 0.6,
-                                }, children: ["AI History \u2014 Layer ", layerIndex] }), _jsx("span", { style: { flex: 1 } }), _jsxs("span", { style: { fontSize: 8, color: "var(--hud-muted)" }, children: [opCount, " op", opCount !== 1 ? "s" : ""] }), _jsx("button", { type: "button", onClick: onClose, style: {
+                                }, children: ["AI History \u2014 ", layerName ?? `Layer ${String(layerIndex)}`] }), _jsx("span", { style: { flex: 1 } }), _jsxs("span", { style: { fontSize: 8, color: "var(--hud-muted)" }, children: [opCount, " op", opCount !== 1 ? "s" : ""] }), _jsx("button", { type: "button", onClick: onClose, style: {
                                     background: "none",
                                     border: "none",
                                     color: "var(--hud-muted)",
@@ -107,7 +107,7 @@ export default function HistoryHudPanel({ anchor, graph, onSelectNode, onClose, 
                                     const onActivePath = activeSet.has(ln.id);
                                     const isOperation = ln.id === operationNodeId;
                                     const r = isActive ? 8 : onActivePath ? 6 : 5;
-                                    return (_jsxs("g", { transform: `translate(${ln.x}, ${ln.y})`, style: { cursor: "pointer" }, onClick: () => onSelectNode(ln.id), children: [_jsx("circle", { r: r + 3, fill: "none", stroke: "currentColor", strokeWidth: 1.5, opacity: onActivePath ? 1 : 0.3 }), _jsx("circle", { r: r, fill: "currentColor", opacity: onActivePath ? 1 : 0.6 }), isActive && (_jsx("text", { x: r + 4, y: -r, fontSize: 8, fill: "currentColor", opacity: 0.8, children: "\uD83D\uDC41" })), isOperation && (_jsx("text", { x: r + 4, y: r + 10, fontSize: 8, fill: "currentColor", opacity: 0.8, children: "\u2699" })), _jsx("text", { x: 14, y: -4, fontSize: 11, fill: "currentColor", opacity: 0.9, children: stationTitle(n) }), stationSubtitle(n) && (_jsx("text", { x: 14, y: 10, fontSize: 9, fill: "currentColor", opacity: 0.6, children: stationSubtitle(n) }))] }, ln.id));
+                                    return (_jsxs("g", { transform: `translate(${ln.x}, ${ln.y})`, style: { cursor: "pointer" }, onClick: () => onSelectNode(ln.id), children: [_jsx("circle", { r: r + 3, fill: "none", stroke: "currentColor", strokeWidth: 1.5, opacity: onActivePath ? 1 : 0.3 }), _jsx("circle", { r: r, fill: "currentColor", opacity: onActivePath ? 1 : 0.6 }), isActive && (_jsx("text", { x: r + 4, y: -r, fontSize: 8, fill: "currentColor", opacity: 0.8, children: "\uD83D\uDC41" })), isOperation && (_jsx("text", { x: r + 4, y: r + 10, fontSize: 8, fill: "currentColor", opacity: 0.8, children: "\u2699" })), n.has3D && (_jsxs("g", { transform: `translate(${-(r + 4)}, ${-(r + 2)})`, children: [_jsx("rect", { x: -10, y: -6, width: 20, height: 12, rx: 3, fill: "#2299ff", opacity: 0.9 }), _jsx("text", { x: 0, y: 4, fontSize: 8, fontWeight: "bold", fill: "#fff", textAnchor: "middle", children: "3D" })] })), _jsx("text", { x: 14, y: -4, fontSize: 11, fill: "currentColor", opacity: 0.9, children: stationTitle(n) }), stationSubtitle(n) && (_jsx("text", { x: 14, y: 10, fontSize: 9, fill: "currentColor", opacity: 0.6, children: stationSubtitle(n) }))] }, ln.id));
                                 })] }) })] })] }));
 }
 function stationTitle(n) {

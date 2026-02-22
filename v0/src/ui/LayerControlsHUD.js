@@ -70,7 +70,11 @@ export function TransformPanel({ transform, onApply, style, }) {
         }, children: [_jsx("span", { style: { opacity: 0.5 } }), _jsx("span", { style: { opacity: 0.5, textAlign: "center" }, children: "X" }), _jsx("span", { style: { opacity: 0.5, textAlign: "center" }, children: "Y" }), _jsx("span", { style: { opacity: 0.5, textAlign: "center" }, children: "Z" }), _jsx("span", { style: { opacity: 0.5 }, children: "Pos" }), [0, 1, 2].map((i) => (_jsx(TransformInput, { value: transform.position[i], step: 0.05, onChange: (v) => { update("position", i, v); } }, `p${String(i)}`))), _jsx("span", { style: { opacity: 0.5 }, children: "Rot" }), [0, 1, 2].map((i) => (_jsx(TransformInput, { value: transform.rotation[i], step: 1, suffix: "\u00B0", onChange: (v) => { update("rotation", i, v); } }, `r${String(i)}`))), _jsx("span", { style: { opacity: 0.5 }, children: "Scl" }), [0, 1, 2].map((i) => (_jsx(TransformInput, { value: transform.scale[i], step: 0.05, onChange: (v) => { update("scale", i, v); } }, `s${String(i)}`)))] }));
 }
 export default function LayerControlsHUD(props) {
-    const { layerIndex, isHidden, isSolo, maskActive, opacity, onToggleHidden, onToggleSolo, onToggleMask, onInvertMask, onPreviewOpacity, onCommitOpacity, hasImage, onImportImage, onAiEdit, aiRunning, aiError, onAddSlice, aiEditModelId, onChangeAiEditModel, onGenerate3D, generating3D, has3DModel, sourceImageHidden, onToggle3DSourceImage, transformPivot, onSetTransformPivot, transformMode, onSetTransformMode, snapEnabled, onToggleSnap, modelTransform, onApplyTransform, } = props;
+    const { layerIndex, isHidden, isSolo, maskActive, opacity, onToggleHidden, onToggleSolo, onToggleMask, onInvertMask, onPreviewOpacity, onCommitOpacity, hasImage, onImportImage, onAiEdit, aiRunning, aiError, onAddSlice, aiEditModelId, onChangeAiEditModel, onGenerate3D, generating3D, has3DModel, sourceImageHidden, onToggle3DSourceImage, transformPivot, onSetTransformPivot, transformMode, onSetTransformMode, snapEnabled, onToggleSnap, modelTransform, onApplyTransform, onDeleteSlice, layerCount, onRenameLayer, } = props;
+    // Inline rename state
+    const [renaming, setRenaming] = useState(false);
+    const [renameText, setRenameText] = useState("");
+    const renameInputRef = useRef(null);
     // Local drag value: null when not dragging (use props instead)
     const [dragValue, setDragValue] = useState(null);
     const dragging = useRef(false);
@@ -94,6 +98,7 @@ export default function LayerControlsHUD(props) {
         setShowPrompt(false);
         setPromptText("");
         setStrength(0.75);
+        setRenaming(false);
     }, [layerIndex]);
     // effectiveOpacity: drag value while dragging, persisted prop otherwise.
     // Guard against NaN/undefined leaking from upstream — fall back to 100%.
@@ -143,7 +148,34 @@ export default function LayerControlsHUD(props) {
             pointerEvents: "auto",
             zIndex: 15,
             userSelect: "none",
-        }, children: [_jsxs("span", { style: { opacity: 0.6, marginRight: 2 }, children: ["L", layerIndex] }), _jsx("button", { type: "button", onClick: () => { onToggleHidden(layerIndex); }, title: isHidden ? "Show layer" : "Hide layer", style: {
+        }, children: [renaming ? (_jsx("input", { ref: renameInputRef, type: "text", value: renameText, onChange: (e) => { setRenameText(e.target.value); }, onBlur: () => {
+                    onRenameLayer(layerIndex, renameText);
+                    setRenaming(false);
+                }, onKeyDown: (e) => {
+                    e.stopPropagation();
+                    if (e.key === "Enter") {
+                        onRenameLayer(layerIndex, renameText);
+                        setRenaming(false);
+                    }
+                    else if (e.key === "Escape") {
+                        setRenaming(false);
+                    }
+                }, style: {
+                    fontSize: 12,
+                    width: 72,
+                    background: "var(--hud-active)",
+                    border: "1px solid var(--scrubber-active)",
+                    borderRadius: 3,
+                    padding: "1px 4px",
+                    color: "var(--hud-text)",
+                    outline: "none",
+                    marginRight: 2,
+                } })) : (_jsx("span", { onDoubleClick: (e) => {
+                    e.stopPropagation();
+                    setRenaming(true);
+                    setRenameText(props.layerName ?? `Layer ${String(layerIndex)}`);
+                    setTimeout(() => { renameInputRef.current?.select(); }, 0);
+                }, title: "Double-click to rename", style: { opacity: 0.6, marginRight: 2, cursor: "default" }, children: props.layerName ?? `L${String(layerIndex)}` })), _jsx("button", { type: "button", onClick: () => { onToggleHidden(layerIndex); }, title: isHidden ? "Show layer" : "Hide layer", style: {
                     background: "none",
                     border: "1px solid var(--hud-border-btn)",
                     color: isHidden ? "var(--hud-muted)" : "var(--hud-text)",
@@ -191,7 +223,15 @@ export default function LayerControlsHUD(props) {
                     padding: "2px 7px",
                     cursor: "pointer",
                     fontSize: 13,
-                }, children: "\uFF0B" }), _jsx("button", { type: "button", onClick: onImportImage, title: "Import image onto this layer", style: {
+                }, children: "\uFF0B" }), layerCount > 1 && (_jsx("button", { type: "button", onClick: () => { onDeleteSlice(layerIndex); }, title: "Delete this slice", style: {
+                    background: "none",
+                    border: "1px solid var(--hud-border-btn)",
+                    color: "var(--hud-muted)",
+                    borderRadius: 4,
+                    padding: "2px 7px",
+                    cursor: "pointer",
+                    fontSize: 13,
+                }, children: "\uD83D\uDDD1" })), _jsx("button", { type: "button", onClick: onImportImage, title: "Import image onto this layer", style: {
                     background: "none",
                     border: "1px solid var(--hud-border-btn)",
                     color: "var(--hud-text)",

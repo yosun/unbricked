@@ -182,7 +182,7 @@ pnpm format       # Prettier
 
 ## Deployment
 
-The app deploys to **AWS S3 + CloudFront** at [https://demo.unbricked.xyz](https://demo.unbricked.xyz).
+The app deploys to **AWS S3 + CloudFront** at [https://beta.unbricked.xyz](https://beta.unbricked.xyz).
 
 ### One-command deploy
 
@@ -192,13 +192,53 @@ pnpm deploy
 ./scripts/deploy.sh
 ```
 
-The deploy script builds the app, syncs to S3, and invalidates the CloudFront cache.
+The deploy script:
+1. Loads `.env` and validates required variables
+2. Runs `pnpm build` (TypeScript check + Vite production build)
+3. Syncs `dist/` to the S3 bucket (`--delete` removes stale files)
+4. Creates a CloudFront invalidation on `/*`
 
-**Prerequisites:**
-- AWS CLI installed (`brew install awscli`)
-- `.env` file with valid AWS credentials (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION`) and deployment config (`S3_BUCKET`, `CF_DISTRIBUTION_ID`) — see [docs/deployment.md](docs/deployment.md)
+CloudFront edge propagation takes 1–2 minutes after invalidation.
 
-See [docs/deployment.md](docs/deployment.md) for detailed deployment docs, manual steps, and rollback procedures.
+### Prerequisites
+
+- **pnpm** — `brew install pnpm`
+- **AWS CLI v2** — `brew install awscli`
+- **`.env`** file at the project root (never committed) with:
+
+| Variable | Purpose |
+|----------|---------|
+| `AWS_ACCESS_KEY_ID` | IAM access key |
+| `AWS_SECRET_ACCESS_KEY` | IAM secret key |
+| `AWS_DEFAULT_REGION` | AWS region (e.g. `us-east-1`) |
+| `S3_BUCKET` | Target S3 bucket name |
+| `CF_DISTRIBUTION_ID` | CloudFront distribution ID |
+| `CF_DOMAIN` | CloudFront domain (for display) |
+| `SITE_URL` | Public URL (for display) |
+
+### Manual deploy
+
+```bash
+# 1. Build
+pnpm build
+
+# 2. Upload to S3
+aws s3 sync ./dist s3://$S3_BUCKET --delete
+
+# 3. Invalidate CDN cache
+aws cloudfront create-invalidation \
+  --distribution-id $CF_DISTRIBUTION_ID \
+  --paths "/*"
+```
+
+### Rollback
+
+```bash
+git checkout <previous-commit>
+pnpm deploy
+```
+
+See [docs/deployment.md](docs/deployment.md) for the full deployment guide.
 
 ## Agent workflow
 

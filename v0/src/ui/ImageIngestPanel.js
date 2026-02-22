@@ -253,7 +253,7 @@ export default function ImageIngestPanel({ defaultOperationId, onCommit, onCance
                                                 borderRadius: 6,
                                                 objectFit: "contain",
                                                 marginBottom: 14,
-                                            } }), _jsxs("div", { style: { display: "flex", gap: 10, justifyContent: "center" }, children: [_jsx("button", { type: "button", style: btnPrimary, onClick: () => void handleGenCommit(), children: "Create Space" }), _jsx("button", { type: "button", style: btnSecondary, onClick: () => { setGenPreview(null); }, children: "Discard" })] })] }))] }))] }), _jsx("div", { style: {
+                                            } }), _jsxs("div", { style: { display: "flex", gap: 10, justifyContent: "center" }, children: [_jsx("button", { type: "button", style: btnPrimary, onClick: () => void handleGenCommit(), children: "Enter the Image" }), _jsx("button", { type: "button", style: btnSecondary, onClick: () => { setGenPreview(null); }, children: "Discard" })] })] }))] }))] }), _jsx("div", { style: {
                         padding: "10px 20px 14px",
                         borderTop: "1px solid var(--hud-border)",
                         textAlign: "right",

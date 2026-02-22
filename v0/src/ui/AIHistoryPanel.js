@@ -5,8 +5,9 @@ import { getSeedPathIds, getPathHeadStateId, getAncestryPath, getChildStates } f
  * Universal AI History panel — shows per-slice DAG for the selected layer.
  * Layout: left anchor (Root + Current), right side (N seed path lanes).
  */
-export default function AIHistoryPanel({ layerIndex, graph, payloads, onSetDisplayCursor, onSetOperationCursor, onClose, documentSourceImageId, style: containerStyle, }) {
+export default function AIHistoryPanel({ layerIndex, layerName, graph, payloads, onSetDisplayCursor, onSetOperationCursor, onClose, documentSourceImageId, style: containerStyle, }) {
     const [expandedPath, setExpandedPath] = useState(null);
+    const [thumbSize, setThumbSize] = useState(48);
     const seedPaths = getSeedPathIds(graph);
     const rootNode = graph.states[graph.rootStateId];
     // Thumbnail helper — resolve from node asset refs
@@ -34,16 +35,28 @@ export default function AIHistoryPanel({ layerIndex, graph, payloads, onSetDispl
     // Thumbnail box with optional ⚙ gear overlay
     const ThumbBox = ({ node, size = 48, active = false, onClick, onSetOperationCursor: onGear, label, children, imgUrl, }) => {
         const url = imgUrl !== undefined ? imgUrl : thumbUrl(node);
+        const has3D = !!node?.assetRefs.glb;
         return (_jsxs("div", { style: { textAlign: "center", flexShrink: 0 }, children: [_jsxs("div", { onClick: onClick, style: {
                         width: size,
                         height: size,
-                        borderRadius: 5,
+                        borderRadius: "50%",
                         overflow: "hidden",
                         border: active ? "2px solid var(--scrubber-active)" : "1px solid var(--hud-border-btn)",
                         cursor: onClick ? "pointer" : "default",
                         position: "relative",
                         background: "var(--hud-active)",
-                    }, children: [url && (_jsx("img", { src: url, alt: "", style: { width: "100%", height: "100%", objectFit: "cover" } })), node && cursorBadges(node.stateId), children, onGear && (_jsx("button", { type: "button", onClick: (e) => { e.stopPropagation(); onGear(); }, title: "Use as input for next AI op", className: "ai-history-gear", style: {
+                    }, children: [url && (_jsx("img", { src: url, alt: "", style: { width: "100%", height: "100%", objectFit: "cover", background: "var(--hud-active)" } })), node && cursorBadges(node.stateId), has3D && (_jsx("span", { style: {
+                                position: "absolute",
+                                top: 1,
+                                left: 1,
+                                fontSize: 6,
+                                fontWeight: 700,
+                                lineHeight: "10px",
+                                padding: "0 3px",
+                                borderRadius: 3,
+                                background: "#2299ff",
+                                color: "#fff",
+                            }, children: "3D" })), children, onGear && (_jsx("button", { type: "button", onClick: (e) => { e.stopPropagation(); onGear(); }, title: "Use as input for next AI op", className: "ai-history-gear", style: {
                                 position: "absolute",
                                 bottom: 1,
                                 left: 1,
@@ -91,7 +104,7 @@ export default function AIHistoryPanel({ layerIndex, graph, payloads, onSetDispl
                     padding: "8px 12px",
                     borderBottom: "1px solid var(--hud-border)",
                     flexShrink: 0,
-                }, children: [_jsxs("span", { style: { fontSize: 10, fontWeight: 600, color: "var(--hud-text)", textTransform: "uppercase", letterSpacing: 0.8 }, children: ["AI History \u2014 Layer ", layerIndex] }), _jsx("span", { style: { flex: 1 } }), _jsxs("span", { style: { fontSize: 9, color: "var(--hud-muted)" }, children: [Object.keys(graph.ops).length, " op", Object.keys(graph.ops).length !== 1 ? "s" : "", " \u00B7 ", seedPaths.length, " path", seedPaths.length !== 1 ? "s" : ""] }), _jsx("button", { type: "button", onClick: onClose, style: {
+                }, children: [_jsxs("span", { style: { fontSize: 10, fontWeight: 600, color: "var(--hud-text)", textTransform: "uppercase", letterSpacing: 0.8 }, children: ["AI History \u2014 ", layerName ?? `Layer ${String(layerIndex)}`] }), _jsx("span", { style: { flex: 1 } }), _jsxs("span", { style: { fontSize: 9, color: "var(--hud-muted)" }, children: [Object.keys(graph.ops).length, " op", Object.keys(graph.ops).length !== 1 ? "s" : "", " \u00B7 ", seedPaths.length, " path", seedPaths.length !== 1 ? "s" : ""] }), _jsx("input", { type: "range", min: 28, max: 96, step: 4, value: thumbSize, onChange: (e) => { setThumbSize(Number(e.target.value)); }, title: `Thumbnail size: ${String(thumbSize)}px`, style: { width: 50, height: 12, accentColor: "var(--scrubber-active)", cursor: "pointer" } }), _jsx("button", { type: "button", onClick: onClose, style: {
                             background: "none",
                             border: "none",
                             color: "var(--hud-muted)",
@@ -106,7 +119,7 @@ export default function AIHistoryPanel({ layerIndex, graph, payloads, onSetDispl
                             gap: 8,
                             padding: "10px 14px",
                             borderRight: "1px solid var(--hud-border)",
-                        }, children: _jsxs("div", { style: { display: "flex", gap: 8, alignItems: "flex-start" }, children: [_jsx(ThumbBox, { size: 44, imgUrl: sourceImageUrl, label: "Source Image" }), _jsx(ThumbBox, { node: rootNode, size: 44, active: graph.displayStateId === graph.rootStateId, onClick: () => { onSetDisplayCursor(layerIndex, graph.rootStateId); }, onSetOperationCursor: () => { onSetOperationCursor(layerIndex, graph.rootStateId); }, label: "Slice Root" })] }) }), _jsx("div", { style: { flex: 1, overflowY: "auto", padding: "8px 10px" }, children: seedPaths.length === 0 ? (_jsx("div", { style: { fontSize: 10, color: "var(--hud-muted)", padding: 12, textAlign: "center" }, children: "No AI operations yet. Run an AI edit to create seed paths." })) : (_jsx("div", { style: { display: "flex", flexDirection: "column", gap: 8 }, children: seedPaths.map((pathId, pathIdx) => {
+                        }, children: _jsxs("div", { style: { display: "flex", gap: 8, alignItems: "flex-start" }, children: [_jsx(ThumbBox, { size: thumbSize, imgUrl: sourceImageUrl, label: "Source Image" }), _jsx(ThumbBox, { node: rootNode, size: thumbSize, active: graph.displayStateId === graph.rootStateId, onClick: () => { onSetDisplayCursor(layerIndex, graph.rootStateId); }, onSetOperationCursor: () => { onSetOperationCursor(layerIndex, graph.rootStateId); }, label: "Slice Root" })] }) }), _jsx("div", { style: { flex: 1, overflowY: "auto", padding: "8px 10px" }, children: seedPaths.length === 0 ? (_jsx("div", { style: { fontSize: 10, color: "var(--hud-muted)", padding: 12, textAlign: "center" }, children: "No AI operations yet. Run an AI edit to create seed paths." })) : (_jsx("div", { style: { display: "flex", flexDirection: "column", gap: 8 }, children: seedPaths.map((pathId, pathIdx) => {
                                 const headId = getPathHeadStateId(graph, pathId);
                                 const isExpanded = expandedPath === pathId;
                                 // Get full path for this seed lane
@@ -140,7 +153,7 @@ export default function AIHistoryPanel({ layerIndex, graph, payloads, onSetDispl
                                                     return null;
                                                 const isDisplay = stateId === graph.displayStateId;
                                                 const lbl = stationLabel(node);
-                                                return (_jsx(ThumbBox, { node: node, size: 36, active: isDisplay, onClick: () => { onSetDisplayCursor(layerIndex, stateId); }, onSetOperationCursor: () => { onSetOperationCursor(layerIndex, stateId); }, children: lbl && (_jsx("span", { style: {
+                                                return (_jsx(ThumbBox, { node: node, size: Math.round(thumbSize * 0.75), active: isDisplay, onClick: () => { onSetDisplayCursor(layerIndex, stateId); }, onSetOperationCursor: () => { onSetOperationCursor(layerIndex, stateId); }, children: lbl && (_jsx("span", { style: {
                                                             position: "absolute", bottom: 0, left: 0, right: 0,
                                                             fontSize: 5, textAlign: "center",
                                                             background: "rgba(0,0,0,0.6)", color: "#fff",
@@ -162,7 +175,7 @@ export default function AIHistoryPanel({ layerIndex, graph, payloads, onSetDispl
                                                         borderRadius: 4,
                                                         background: isDisplay ? "var(--hud-active)" : "transparent",
                                                         cursor: "pointer",
-                                                    }, onClick: () => { onSetDisplayCursor(layerIndex, stateId); }, children: [_jsx(ThumbBox, { node: node, size: 32, active: isDisplay, onSetOperationCursor: () => { onSetOperationCursor(layerIndex, stateId); } }), _jsxs("div", { style: { flex: 1, minWidth: 0 }, children: [_jsx("div", { style: {
+                                                    }, onClick: () => { onSetDisplayCursor(layerIndex, stateId); }, children: [_jsx(ThumbBox, { node: node, size: Math.round(thumbSize * 0.67), active: isDisplay, onSetOperationCursor: () => { onSetOperationCursor(layerIndex, stateId); } }), _jsxs("div", { style: { flex: 1, minWidth: 0 }, children: [_jsx("div", { style: {
                                                                         fontSize: 10,
                                                                         color: isDisplay ? "var(--scrubber-active)" : "var(--hud-text)",
                                                                         fontWeight: isDisplay ? 600 : 400,

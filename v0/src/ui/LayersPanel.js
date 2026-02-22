@@ -13,7 +13,7 @@ function clamp01(v) {
     return Math.max(0, Math.min(1, v));
 }
 export default function LayersPanel(props) {
-    const { layerCount, order, selectedLayerIndex, soloIndex, isHidden, isMaskActive, isMaskInverted, persistedOpacity, onSelectLayer, onToggleHidden, onToggleSolo, onToggleMask, onInvertMask, onPreviewOpacity, onCommitOpacity, onPreviewOrder, onCommitOrder, onImportImage, onAiEdit, aiRunning, aiError, onAddSlice, layerTextures, layerThumbnails, aiEditModelId, onChangeAiEditModel, onGenerate3D, generating3DLayer, layerGlbUrls, threeDSourceHidden, onToggle3DSourceImage, transformPivot, onSetTransformPivot, getSliceHistory: getSliceHistoryProp, onSetDisplayCursor: onSetDisplayCursorProp, onSetOperationCursor: onSetOperationCursorProp, payloads: payloadsProp, transformMode, onSetTransformMode, snapEnabled, onToggleSnap, modelTransform, onApplyTransform, } = props;
+    const { layerCount, order, selectedLayerIndex, soloIndex, isHidden, isMaskActive, isMaskInverted, persistedOpacity, onSelectLayer, onToggleHidden, onToggleSolo, onToggleMask, onInvertMask, onPreviewOpacity, onCommitOpacity, onPreviewOrder, onCommitOrder, onImportImage, onAiEdit, aiEditingLayers, aiErrors, onAddSlice, onDeleteSlice, layerTextures, layerThumbnails, layerNames, onRenameLayer, aiEditModelId, onChangeAiEditModel, onGenerate3D, generating3DLayer, layerGlbUrls, threeDSourceHidden, onToggle3DSourceImage, transformPivot, onSetTransformPivot, getSliceHistory: getSliceHistoryProp, onSetDisplayCursor: onSetDisplayCursorProp, onSetOperationCursor: onSetOperationCursorProp, payloads: payloadsProp, transformMode, onSetTransformMode, snapEnabled, onToggleSnap, modelTransform, onApplyTransform, } = props;
     /* ── Drag reorder state ──────────────────────── */
     const [dragViewIdx, setDragViewIdx] = useState(null);
     const containerRef = useRef(null);
@@ -37,6 +37,10 @@ export default function LayersPanel(props) {
     const [historyPanelLayer, setHistoryPanelLayer] = useState(null);
     /** Which seed path is selected in the history panel */
     const [selectedPathId, setSelectedPathId] = useState(null);
+    // Inline rename state
+    const [renamingIdx, setRenamingIdx] = useState(null);
+    const [renameText, setRenameText] = useState("");
+    const renameInputRef = useRef(null);
     const handleDragPointerDown = useCallback((viewIdx, e) => {
         e.preventDefault();
         e.stopPropagation();
@@ -169,6 +173,7 @@ export default function LayersPanel(props) {
                                                     height: 36,
                                                     borderRadius: 4,
                                                     objectFit: "cover",
+                                                    background: "var(--hud-active)",
                                                     opacity: hidden ? 0.3 : 1,
                                                     border: isSelected
                                                         ? "1.5px solid var(--scrubber-active)"
@@ -192,7 +197,34 @@ export default function LayersPanel(props) {
                                                     background: "var(--scrubber-active)",
                                                     color: "var(--btn-primary-text)",
                                                     pointerEvents: "none",
-                                                }, children: "3D" }))] }), _jsxs("div", { style: { flex: 1, minWidth: 0, display: "flex", flexDirection: "column", gap: 2 }, children: [_jsxs("div", { style: { display: "flex", alignItems: "center", gap: 4 }, children: [_jsxs("span", { style: {
+                                                }, children: "3D" }))] }), _jsxs("div", { style: { flex: 1, minWidth: 0, display: "flex", flexDirection: "column", gap: 2 }, children: [_jsxs("div", { style: { display: "flex", alignItems: "center", gap: 4 }, children: [renamingIdx === layerIdx ? (_jsx("input", { ref: renameInputRef, type: "text", value: renameText, onClick: (e) => { e.stopPropagation(); }, onChange: (e) => { setRenameText(e.target.value); }, onBlur: () => {
+                                                            onRenameLayer(layerIdx, renameText);
+                                                            setRenamingIdx(null);
+                                                        }, onKeyDown: (e) => {
+                                                            e.stopPropagation();
+                                                            if (e.key === "Enter") {
+                                                                onRenameLayer(layerIdx, renameText);
+                                                                setRenamingIdx(null);
+                                                            }
+                                                            else if (e.key === "Escape") {
+                                                                setRenamingIdx(null);
+                                                            }
+                                                        }, style: {
+                                                            fontSize: 12,
+                                                            flex: 1,
+                                                            minWidth: 0,
+                                                            background: "var(--hud-active)",
+                                                            border: "1px solid var(--scrubber-active)",
+                                                            borderRadius: 3,
+                                                            padding: "1px 4px",
+                                                            color: "var(--hud-text)",
+                                                            outline: "none",
+                                                        } })) : (_jsx("span", { onDoubleClick: (e) => {
+                                                            e.stopPropagation();
+                                                            setRenamingIdx(layerIdx);
+                                                            setRenameText(layerNames[layerIdx] ?? `Layer ${String(layerIdx)}`);
+                                                            setTimeout(() => { renameInputRef.current?.select(); }, 0);
+                                                        }, title: "Double-click to rename", style: {
                                                             fontSize: 12,
                                                             color: isSelected ? "var(--scrubber-active)" : "var(--hud-text)",
                                                             fontWeight: isSelected ? 600 : 400,
@@ -202,7 +234,8 @@ export default function LayersPanel(props) {
                                                             textOverflow: "ellipsis",
                                                             whiteSpace: "nowrap",
                                                             opacity: hidden ? 0.4 : 1,
-                                                        }, children: ["Layer ", layerIdx] }), (() => {
+                                                            cursor: "default",
+                                                        }, children: layerNames[layerIdx] ?? `Layer ${String(layerIdx)}` })), (() => {
                                                         const graph = getSliceHistoryProp?.(layerIdx);
                                                         if (!graph)
                                                             return null;
@@ -295,7 +328,17 @@ export default function LayersPanel(props) {
                                                             padding: "1px 3px",
                                                             borderRadius: 3,
                                                             flexShrink: 0,
-                                                        }, children: "\uD83D\uDDBC" }))] })] })] }, layerIdx));
+                                                        }, children: "\uD83D\uDDBC" })), layerCount > 1 && (_jsx("button", { type: "button", onClick: (e) => { e.stopPropagation(); onDeleteSlice(layerIdx); }, title: "Delete layer", style: {
+                                                            background: "none",
+                                                            border: "none",
+                                                            color: "var(--hud-muted)",
+                                                            cursor: "pointer",
+                                                            fontSize: 10,
+                                                            padding: "1px 3px",
+                                                            borderRadius: 3,
+                                                            flexShrink: 0,
+                                                            opacity: 0.6,
+                                                        }, children: "\uD83D\uDDD1" }))] })] })] }, layerIdx));
                         }) }), selectedLayerIndex !== null && selectedLayerIndex in layerGlbUrls && (_jsxs("div", { style: { flexShrink: 0, borderTop: "1px solid var(--hud-border)" }, children: [_jsx("div", { style: {
                                     padding: "5px 10px 4px",
                                     fontSize: 9,
@@ -413,17 +456,17 @@ export default function LayersPanel(props) {
                                                         if (rootNode)
                                                             onSetDisplayCursorProp?.(historyPanelLayer, rootNode.stateId);
                                                     }, style: {
-                                                        width: 36, height: 36, borderRadius: 4, overflow: "hidden",
+                                                        width: 36, height: 36, borderRadius: "50%", overflow: "hidden",
                                                         border: graph.displayStateId === graph.rootStateId ? "2px solid var(--scrubber-active)" : "1px solid var(--hud-border-btn)",
                                                         cursor: "pointer",
                                                         position: "relative",
                                                         background: "var(--hud-active)",
-                                                    }, children: [thumbUrl(rootNode) && (_jsx("img", { src: thumbUrl(rootNode), alt: "Root", style: { width: "100%", height: "100%", objectFit: "cover" } })), graph.displayStateId === graph.rootStateId && (_jsx("span", { style: { position: "absolute", top: 0, right: 1, fontSize: 8 }, children: "\uD83D\uDC41" })), graph.operationStateId === graph.rootStateId && (_jsx("span", { style: { position: "absolute", bottom: 0, right: 1, fontSize: 8 }, children: "\u2699" }))] }), _jsx("div", { style: { fontSize: 7, color: "var(--hud-muted)", marginTop: 2 }, children: "Root" })] }), _jsx("span", { style: { fontSize: 10, color: "var(--hud-muted)" }, children: "\u2192" }), _jsxs("div", { style: { textAlign: "center" }, children: [_jsxs("div", { style: {
-                                                        width: 36, height: 36, borderRadius: 4, overflow: "hidden",
+                                                    }, children: [thumbUrl(rootNode) && (_jsx("img", { src: thumbUrl(rootNode), alt: "Root", style: { width: "100%", height: "100%", objectFit: "contain", background: "var(--hud-active)" } })), graph.displayStateId === graph.rootStateId && (_jsx("span", { style: { position: "absolute", top: 0, right: 1, fontSize: 8 }, children: "\uD83D\uDC41" })), graph.operationStateId === graph.rootStateId && (_jsx("span", { style: { position: "absolute", bottom: 0, right: 1, fontSize: 8 }, children: "\u2699" }))] }), _jsx("div", { style: { fontSize: 7, color: "var(--hud-muted)", marginTop: 2 }, children: "Root" })] }), _jsx("span", { style: { fontSize: 10, color: "var(--hud-muted)" }, children: "\u2192" }), _jsxs("div", { style: { textAlign: "center" }, children: [_jsxs("div", { style: {
+                                                        width: 36, height: 36, borderRadius: "50%", overflow: "hidden",
                                                         border: "2px solid var(--scrubber-active)",
                                                         background: "var(--hud-active)",
                                                         position: "relative",
-                                                    }, children: [thumbUrl(displayNode) && (_jsx("img", { src: thumbUrl(displayNode), alt: "Current", style: { width: "100%", height: "100%", objectFit: "cover" } })), _jsx("span", { style: { position: "absolute", top: 0, right: 1, fontSize: 8 }, children: "\uD83D\uDC41" }), graph.operationStateId === graph.displayStateId && (_jsx("span", { style: { position: "absolute", bottom: 0, right: 1, fontSize: 8 }, children: "\u2699" }))] }), _jsx("div", { style: { fontSize: 7, color: "var(--hud-muted)", marginTop: 2 }, children: "Current" })] }), _jsx("div", { style: { flex: 1 } }), _jsx("button", { type: "button", onClick: () => { setHistoryPanelLayer(null); }, style: {
+                                                    }, children: [thumbUrl(displayNode) && (_jsx("img", { src: thumbUrl(displayNode), alt: "Current", style: { width: "100%", height: "100%", objectFit: "contain", background: "var(--hud-active)" } })), _jsx("span", { style: { position: "absolute", top: 0, right: 1, fontSize: 8 }, children: "\uD83D\uDC41" }), graph.operationStateId === graph.displayStateId && (_jsx("span", { style: { position: "absolute", bottom: 0, right: 1, fontSize: 8 }, children: "\u2699" }))] }), _jsx("div", { style: { fontSize: 7, color: "var(--hud-muted)", marginTop: 2 }, children: "Current" })] }), _jsx("div", { style: { flex: 1 } }), _jsx("button", { type: "button", onClick: () => { setHistoryPanelLayer(null); }, style: {
                                                 background: "none", border: "none", color: "var(--hud-muted)",
                                                 cursor: "pointer", fontSize: 12,
                                             }, children: "\u2715" })] }), seedPaths.length > 0 && (_jsxs("div", { style: {
@@ -440,7 +483,7 @@ export default function LayersPanel(props) {
                                                         if (headNode)
                                                             onSetDisplayCursorProp?.(historyPanelLayer, headId);
                                                     }, style: {
-                                                        width: 40, height: 40, borderRadius: 4, overflow: "hidden",
+                                                        width: 40, height: 40, borderRadius: "50%", overflow: "hidden",
                                                         border: isCurrentPath
                                                             ? "2px solid var(--scrubber-active)"
                                                             : displayInPath
@@ -450,7 +493,7 @@ export default function LayersPanel(props) {
                                                         position: "relative",
                                                         background: "var(--hud-active)",
                                                         flexShrink: 0,
-                                                    }, title: `Path ${pathId.slice(0, 8)}${displayInPath ? " (current)" : ""}`, children: [thumbUrl(headNode) && (_jsx("img", { src: thumbUrl(headNode), alt: "Head", style: { width: "100%", height: "100%", objectFit: "cover" } })), displayInPath && (_jsx("span", { style: { position: "absolute", top: 0, right: 1, fontSize: 7 }, children: "\uD83D\uDC41" })), opInPath && (_jsx("span", { style: { position: "absolute", bottom: 0, right: 1, fontSize: 7 }, children: "\u2699" })), headNode?.meta.opType && (_jsx("span", { style: {
+                                                    }, title: `Path ${pathId.slice(0, 8)}${displayInPath ? " (current)" : ""}`, children: [thumbUrl(headNode) && (_jsx("img", { src: thumbUrl(headNode), alt: "Head", style: { width: "100%", height: "100%", objectFit: "contain", background: "var(--hud-active)" } })), displayInPath && (_jsx("span", { style: { position: "absolute", top: 0, right: 1, fontSize: 7 }, children: "\uD83D\uDC41" })), opInPath && (_jsx("span", { style: { position: "absolute", bottom: 0, right: 1, fontSize: 7 }, children: "\u2699" })), headNode?.meta.opType && (_jsx("span", { style: {
                                                                 position: "absolute", bottom: 0, left: 0, right: 0,
                                                                 fontSize: 6, textAlign: "center",
                                                                 background: "rgba(0,0,0,0.6)", color: "#fff",
@@ -470,11 +513,11 @@ export default function LayersPanel(props) {
                                                     }, onClick: () => {
                                                         onSetDisplayCursorProp?.(historyPanelLayer, stateId);
                                                     }, children: [_jsxs("div", { style: {
-                                                                width: 28, height: 28, borderRadius: 3, overflow: "hidden", flexShrink: 0,
+                                                                width: 28, height: 28, borderRadius: "50%", overflow: "hidden", flexShrink: 0,
                                                                 border: isDisplay ? "1.5px solid var(--scrubber-active)" : "1px solid var(--hud-border-btn)",
                                                                 background: "var(--hud-active)",
                                                                 position: "relative",
-                                                            }, children: [thumbUrl(node) && (_jsx("img", { src: thumbUrl(node), alt: "", style: { width: "100%", height: "100%", objectFit: "cover" } })), isDisplay && _jsx("span", { style: { position: "absolute", top: -1, right: 0, fontSize: 7 }, children: "\uD83D\uDC41" }), isOp && _jsx("span", { style: { position: "absolute", bottom: -1, right: 0, fontSize: 7 }, children: "\u2699" })] }), _jsxs("div", { style: { flex: 1, minWidth: 0 }, children: [_jsx("div", { style: {
+                                                            }, children: [thumbUrl(node) && (_jsx("img", { src: thumbUrl(node), alt: "", style: { width: "100%", height: "100%", objectFit: "contain", background: "var(--hud-active)" } })), isDisplay && _jsx("span", { style: { position: "absolute", top: -1, right: 0, fontSize: 7 }, children: "\uD83D\uDC41" }), isOp && _jsx("span", { style: { position: "absolute", bottom: -1, right: 0, fontSize: 7 }, children: "\u2699" })] }), _jsxs("div", { style: { flex: 1, minWidth: 0 }, children: [_jsx("div", { style: {
                                                                         fontSize: 10,
                                                                         color: isDisplay ? "var(--scrubber-active)" : "var(--hud-text)",
                                                                         fontWeight: isDisplay ? 600 : 400,
@@ -495,7 +538,7 @@ export default function LayersPanel(props) {
                             alignItems: "center",
                             gap: 8,
                             flexShrink: 0,
-                        }, children: [_jsxs("span", { style: { fontSize: 11, color: "var(--hud-muted)" }, children: ["L", editingOpacityLayer, " opacity"] }), _jsx("input", { type: "range", min: 0, max: 100, step: 1, value: Math.round(persistedOpacity(editingOpacityLayer) * 100), onChange: (e) => {
+                        }, children: [_jsxs("span", { style: { fontSize: 11, color: "var(--hud-muted)" }, children: [layerNames[editingOpacityLayer] ?? `L${String(editingOpacityLayer)}`, " opacity"] }), _jsx("input", { type: "range", min: 0, max: 100, step: 1, value: Math.round(persistedOpacity(editingOpacityLayer) * 100), onChange: (e) => {
                                     const v = clamp01(Number(e.target.value) / 100);
                                     onPreviewOpacity(v);
                                 }, onPointerUp: (e) => {
@@ -563,7 +606,7 @@ export default function LayersPanel(props) {
                                     cursor: "pointer",
                                     fontSize: 16,
                                     backdropFilter: "blur(8px)",
-                                }, children: "\uD83D\uDDBC" })), selectedLayerIndex in layerTextures && (_jsx("button", { type: "button", onClick: () => { setShowAiPromptLayer(showAiPromptLayer === selectedLayerIndex ? null : selectedLayerIndex); }, disabled: aiRunning, title: "AI Edit (img2img)", style: {
+                                }, children: "\uD83D\uDDBC" })), selectedLayerIndex in layerTextures && (_jsx("button", { type: "button", onClick: () => { setShowAiPromptLayer(showAiPromptLayer === selectedLayerIndex ? null : selectedLayerIndex); }, disabled: false, title: "AI Edit (img2img)", style: {
                                     width: 36,
                                     height: 36,
                                     display: "flex",
@@ -574,11 +617,11 @@ export default function LayersPanel(props) {
                                     border: showAiPromptLayer === selectedLayerIndex
                                         ? "1px solid var(--scrubber-active)"
                                         : "1px solid var(--hud-border)",
-                                    color: aiRunning ? "var(--hud-muted)" : "var(--scrubber-active)",
-                                    cursor: aiRunning ? "wait" : "pointer",
+                                    color: aiEditingLayers.has(selectedLayerIndex) ? "var(--hud-muted)" : "var(--scrubber-active)",
+                                    cursor: "pointer",
                                     fontSize: 16,
                                     backdropFilter: "blur(8px)",
-                                }, children: aiRunning ? "⏳" : "✨" }))] }), showAiPromptLayer !== null && (_jsxs("div", { style: {
+                                }, children: aiEditingLayers.has(selectedLayerIndex) ? "⏳" : "✨" }))] }), showAiPromptLayer !== null && (_jsxs("div", { style: {
                             width: 220,
                             padding: "10px 12px",
                             borderRadius: 8,
@@ -597,9 +640,9 @@ export default function LayersPanel(props) {
                                             color: "var(--hud-text)",
                                             fontSize: 12,
                                             outline: "none",
-                                        }, children: AI_EDIT_MODELS.map((m) => (_jsx("option", { value: m.id, children: m.label }, m.id))) })] }), _jsxs("label", { style: { display: "flex", flexDirection: "column", gap: 2 }, children: [_jsxs("span", { style: { opacity: 0.6, fontSize: 11 }, children: ["Prompt (L", showAiPromptLayer, ")"] }), _jsx("input", { type: "text", value: promptText, onChange: (e) => { setPromptText(e.target.value); }, onKeyDown: (e) => {
+                                        }, children: AI_EDIT_MODELS.map((m) => (_jsx("option", { value: m.id, children: m.label }, m.id))) })] }), _jsxs("label", { style: { display: "flex", flexDirection: "column", gap: 2 }, children: [_jsxs("span", { style: { opacity: 0.6, fontSize: 11 }, children: ["Prompt (", layerNames[showAiPromptLayer] ?? `L${String(showAiPromptLayer)}`, ")"] }), _jsx("input", { type: "text", value: promptText, onChange: (e) => { setPromptText(e.target.value); }, onKeyDown: (e) => {
                                             e.stopPropagation();
-                                            if (e.key === "Enter" && promptText.trim() && !aiRunning) {
+                                            if (e.key === "Enter" && promptText.trim() && !aiEditingLayers.has(showAiPromptLayer)) {
                                                 onAiEdit(promptText.trim(), strength);
                                             }
                                         }, placeholder: "Describe the edit...", style: {
@@ -610,17 +653,17 @@ export default function LayersPanel(props) {
                                             color: "var(--hud-text)",
                                             fontSize: 12,
                                             outline: "none",
-                                        } })] }), getAiEditModel(aiEditModelId).hasStrength && (_jsxs("label", { style: { display: "flex", alignItems: "center", gap: 6 }, children: [_jsx("span", { style: { opacity: 0.6, minWidth: 52 }, children: "Strength" }), _jsx("input", { type: "range", min: 0, max: 100, step: 1, value: Math.round(strength * 100), onChange: (e) => { setStrength(Number(e.target.value) / 100); }, onKeyDown: (e) => { e.stopPropagation(); }, style: { flex: 1, accentColor: "var(--scrubber-active)", cursor: "pointer" } }), _jsxs("span", { style: { opacity: 0.5, minWidth: 30, textAlign: "right" }, children: [Math.round(strength * 100), "%"] })] })), _jsx("button", { type: "button", disabled: !promptText.trim() || aiRunning, onClick: () => {
+                                        } })] }), getAiEditModel(aiEditModelId).hasStrength && (_jsxs("label", { style: { display: "flex", alignItems: "center", gap: 6 }, children: [_jsx("span", { style: { opacity: 0.6, minWidth: 52 }, children: "Strength" }), _jsx("input", { type: "range", min: 0, max: 100, step: 1, value: Math.round(strength * 100), onChange: (e) => { setStrength(Number(e.target.value) / 100); }, onKeyDown: (e) => { e.stopPropagation(); }, style: { flex: 1, accentColor: "var(--scrubber-active)", cursor: "pointer" } }), _jsxs("span", { style: { opacity: 0.5, minWidth: 30, textAlign: "right" }, children: [Math.round(strength * 100), "%"] })] })), _jsx("button", { type: "button", disabled: !promptText.trim() || aiEditingLayers.has(showAiPromptLayer), onClick: () => {
                                     if (promptText.trim())
                                         onAiEdit(promptText.trim(), strength);
                                 }, style: {
-                                    background: aiRunning ? "var(--hud-muted)" : "var(--scrubber-active)",
+                                    background: aiEditingLayers.has(showAiPromptLayer) ? "var(--hud-muted)" : "var(--scrubber-active)",
                                     border: "none",
                                     borderRadius: 4,
                                     padding: "5px 10px",
                                     color: "var(--btn-primary-text)",
-                                    cursor: aiRunning ? "wait" : "pointer",
+                                    cursor: aiEditingLayers.has(showAiPromptLayer) ? "wait" : "pointer",
                                     fontWeight: 600,
                                     fontSize: 12,
-                                }, children: aiRunning ? "Running…" : "Run AI Edit" }), aiError && (_jsx("div", { style: { color: "var(--color-error)", fontSize: 11, wordBreak: "break-word" }, children: aiError }))] }))] }))] }));
+                                }, children: aiEditingLayers.has(showAiPromptLayer) ? "Running…" : "Run AI Edit" }), aiErrors[showAiPromptLayer] && (_jsx("div", { style: { color: "var(--color-error)", fontSize: 11, wordBreak: "break-word" }, children: aiErrors[showAiPromptLayer] }))] }))] }))] }));
 }

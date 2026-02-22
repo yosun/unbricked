@@ -24,6 +24,7 @@ interface Props {
   onClose: () => void;
   operationNodeId?: HistoryNodeId;
   layerIndex: number;
+  layerName?: string | undefined;
   opCount: number;
 }
 
@@ -37,6 +38,7 @@ export default function HistoryHudPanel({
   onClose,
   operationNodeId,
   layerIndex,
+  layerName,
   opCount,
 }: Props): React.JSX.Element {
   const layout = useMemo(() => computeHistoryLayout(graph, HUD_LAYOUT_OPTS), [graph]);
@@ -66,7 +68,7 @@ export default function HistoryHudPanel({
         onClick={onClose}
         title="Slice is off-screen — click to dismiss"
       >
-        🕰 History — Layer {layerIndex} ({opCount} op{opCount !== 1 ? "s" : ""})
+        🕰 History — {layerName ?? `Layer ${String(layerIndex)}`} ({opCount} op{opCount !== 1 ? "s" : ""})
       </div>
     );
   }
@@ -158,7 +160,7 @@ export default function HistoryHudPanel({
             textTransform: "uppercase",
             letterSpacing: 0.6,
           }}>
-            AI History — Layer {layerIndex}
+            AI History — {layerName ?? `Layer ${String(layerIndex)}`}
           </span>
           <span style={{ flex: 1 }} />
           <span style={{ fontSize: 8, color: "var(--hud-muted)" }}>
@@ -234,6 +236,12 @@ export default function HistoryHudPanel({
                   )}
                   {isOperation && (
                     <text x={r + 4} y={r + 10} fontSize={8} fill="currentColor" opacity={0.8}>⚙</text>
+                  )}
+                  {n.has3D && (
+                    <g transform={`translate(${-(r + 4)}, ${-(r + 2)})`}>
+                      <rect x={-10} y={-6} width={20} height={12} rx={3} fill="#2299ff" opacity={0.9} />
+                      <text x={0} y={4} fontSize={8} fontWeight="bold" fill="#fff" textAnchor="middle">3D</text>
+                    </g>
                   )}
 
                   <text x={14} y={-4} fontSize={11} fill="currentColor" opacity={0.9}>

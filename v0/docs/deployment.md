@@ -5,9 +5,9 @@ Unbricked v0 is a static SPA hosted on **AWS S3 + CloudFront**.
 | Resource | Value |
 |---|---|
 | S3 bucket | `unbricked` |
-| CloudFront distribution | `E1XAHZ0HV2TJQG` |
-| CloudFront domain | `dnzgeou33fev3.cloudfront.net` |
-| Custom domain | `demo.unbricked.xyz` |
+| CloudFront distribution | `ERINU0TS4C07J` |
+| CloudFront domain | `d30v5146yng2cg.cloudfront.net` |
+| Custom domain | `beta.unbricked.xyz` |
 | Region | `us-east-1` |
 
 ---
@@ -25,9 +25,9 @@ AWS_ACCESS_KEY_ID=…
 AWS_SECRET_ACCESS_KEY=…
 AWS_DEFAULT_REGION=us-east-1
 S3_BUCKET=unbricked
-CF_DISTRIBUTION_ID=E1XAHZ0HV2TJQG
-CF_DOMAIN=dnzgeou33fev3.cloudfront.net
-SITE_URL=https://demo.unbricked.xyz
+CF_DISTRIBUTION_ID=ERINU0TS4C07J
+CF_DOMAIN=d30v5146yng2cg.cloudfront.net
+SITE_URL=https://beta.unbricked.xyz
 ```
 
 > **Never commit `.env`.** It is already listed in `.gitignore`.
@@ -61,7 +61,7 @@ aws s3 sync ./dist s3://unbricked --delete
 
 # 3. Invalidate CDN cache
 aws cloudfront create-invalidation \
-  --distribution-id E1XAHZ0HV2TJQG \
+  --distribution-id ERINU0TS4C07J \
   --paths "/*"
 ```
 
@@ -69,12 +69,12 @@ aws cloudfront create-invalidation \
 
 ## Verification
 
-- Open https://demo.unbricked.xyz and hard-refresh (`Cmd+Shift+R`).
+- Open https://beta.unbricked.xyz and hard-refresh (`Cmd+Shift+R`).
 - CloudFront edge propagation typically takes 1–2 minutes after invalidation.
 - Check invalidation status:
   ```bash
   aws cloudfront get-invalidation \
-    --distribution-id E1XAHZ0HV2TJQG \
+    --distribution-id ERINU0TS4C07J \
     --id <INVALIDATION_ID>
   ```
 

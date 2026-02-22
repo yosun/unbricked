@@ -68,7 +68,7 @@ Panel contains:
 * We show:
 
   * quick thumbnail preview
-  * “Create Space” (primary)
+  * “Create Space” (primary) - Enter the Image
   * “Cancel”
 * On commit:
 
@@ -269,7 +269,7 @@ If fal.ai generate fails:
 
 ## Demo Script (for the product narrative)
 
-“In the beginning, there was an idea.”
+“In the beginning, an idea.”
 Tap.
 Import or describe.
 The image arrives into space.

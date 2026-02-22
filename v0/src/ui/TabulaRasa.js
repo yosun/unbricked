@@ -1,38 +1,28 @@
-import { jsx as _jsx, jsxs as _jsxs } from "react/jsx-runtime";
-import { useEffect, useState } from "react";
+import { Fragment as _Fragment, jsx as _jsx, jsxs as _jsxs } from "react/jsx-runtime";
+import { useCallback, useEffect, useState } from "react";
 /**
- * Tabula Rasa — the blank-slate start state.
- * Shows a blinking unbrick-cube cursor and "Tap to begin." hint.
+ * Tabula Rasa — the cosmological root state.
+ * A minimal, centered opening message before the first node is created.
  */
 export default function TabulaRasa({ onTap }) {
-    const [visible, setVisible] = useState(true);
-    // Blink the cursor
+    const [phase, setPhase] = useState("in");
+    // Fade in on mount
     useEffect(() => {
-        const id = setInterval(() => { setVisible((v) => !v); }, 600);
-        return () => { clearInterval(id); };
+        const id = requestAnimationFrame(() => { setPhase("visible"); });
+        return () => { cancelAnimationFrame(id); };
     }, []);
-    return (_jsxs("div", { onClick: onTap, style: {
-            position: "absolute",
-            inset: 0,
-            display: "flex",
-            flexDirection: "column",
-            alignItems: "center",
-            justifyContent: "center",
-            cursor: "pointer",
-            zIndex: 90,
-            userSelect: "none",
-        }, children: [_jsx("div", { style: {
-                    width: 32,
-                    height: 32,
-                    border: "2px solid var(--scrubber-active)",
-                    borderRadius: 4,
-                    opacity: visible ? 0.9 : 0.15,
-                    transition: "opacity 0.15s ease",
-                    marginBottom: 16,
-                    boxShadow: visible ? "0 0 12px var(--shadow-medium)" : "none",
-                } }), _jsx("span", { style: {
-                    color: "var(--hud-muted)",
-                    fontSize: 14,
-                    letterSpacing: 0.5,
-                }, children: "Tap to begin." })] }));
+    const handleClick = useCallback(() => {
+        if (phase === "out" || phase === "gone")
+            return;
+        setPhase("out");
+        setTimeout(() => {
+            setPhase("gone");
+            onTap();
+        }, 150);
+    }, [phase, onTap]);
+    if (phase === "gone")
+        return _jsx(_Fragment, {});
+    return (_jsx("div", { className: "tabula-rasa", onClick: handleClick, style: {
+            opacity: phase === "visible" ? 1 : 0,
+        }, children: _jsxs("div", { className: "tabula-rasa-content", children: [_jsx("p", { className: "tabula-rasa-line1", children: "Unbricked" }), _jsx("p", { className: "tabula-rasa-line2", children: "The unexamined brick is not worth editing." }), _jsx("p", { className: "tabula-rasa-line3", children: "Tap to begin." })] }) }));
 }

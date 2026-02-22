@@ -6,6 +6,8 @@ import { getSeedPathIds, getPathHeadStateId, getAncestryPath, getChildStates } f
 export interface AIHistoryPanelProps {
   /** Which layer index this panel shows history for */
   layerIndex: number;
+  /** User-assigned layer name, if any */
+  layerName?: string | undefined;
   graph: SliceHistoryGraph;
   payloads?: Record<string, { uri: string; meta: Record<string, string> }> | undefined;
   onSetDisplayCursor: (layerIndex: number, stateId: string) => void;
@@ -23,6 +25,7 @@ export interface AIHistoryPanelProps {
  */
 export default function AIHistoryPanel({
   layerIndex,
+  layerName,
   graph,
   payloads,
   onSetDisplayCursor,
@@ -32,6 +35,7 @@ export default function AIHistoryPanel({
   style: containerStyle,
 }: AIHistoryPanelProps): React.JSX.Element {
   const [expandedPath, setExpandedPath] = useState<string | null>(null);
+  const [thumbSize, setThumbSize] = useState(48);
 
   const seedPaths = getSeedPathIds(graph);
   const rootNode = graph.states[graph.rootStateId];
@@ -92,6 +96,7 @@ export default function AIHistoryPanel({
     imgUrl?: string | null;
   }): React.JSX.Element => {
     const url = imgUrl !== undefined ? imgUrl : thumbUrl(node);
+    const has3D = !!node?.assetRefs.glb;
     return (
       <div style={{ textAlign: "center", flexShrink: 0 }}>
         <div
@@ -99,7 +104,7 @@ export default function AIHistoryPanel({
           style={{
             width: size,
             height: size,
-            borderRadius: 5,
+            borderRadius: "50%",
             overflow: "hidden",
             border: active ? "2px solid var(--scrubber-active)" : "1px solid var(--hud-border-btn)",
             cursor: onClick ? "pointer" : "default",
@@ -108,9 +113,23 @@ export default function AIHistoryPanel({
           }}
         >
           {url && (
-            <img src={url} alt="" style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+            <img src={url} alt="" style={{ width: "100%", height: "100%", objectFit: "cover", background: "var(--hud-active)" }} />
           )}
           {node && cursorBadges(node.stateId)}
+          {has3D && (
+            <span style={{
+              position: "absolute",
+              top: 1,
+              left: 1,
+              fontSize: 6,
+              fontWeight: 700,
+              lineHeight: "10px",
+              padding: "0 3px",
+              borderRadius: 3,
+              background: "#2299ff",
+              color: "#fff",
+            }}>3D</span>
+          )}
           {children}
           {/* ⚙ gear overlay — bottom-left, hover-visible */}
           {onGear && (
@@ -191,12 +210,22 @@ export default function AIHistoryPanel({
         }}
       >
         <span style={{ fontSize: 10, fontWeight: 600, color: "var(--hud-text)", textTransform: "uppercase", letterSpacing: 0.8 }}>
-          AI History — Layer {layerIndex}
+          AI History — {layerName ?? `Layer ${String(layerIndex)}`}
         </span>
         <span style={{ flex: 1 }} />
         <span style={{ fontSize: 9, color: "var(--hud-muted)" }}>
           {Object.keys(graph.ops).length} op{Object.keys(graph.ops).length !== 1 ? "s" : ""} · {seedPaths.length} path{seedPaths.length !== 1 ? "s" : ""}
         </span>
+        <input
+          type="range"
+          min={28}
+          max={96}
+          step={4}
+          value={thumbSize}
+          onChange={(e) => { setThumbSize(Number(e.target.value)); }}
+          title={`Thumbnail size: ${String(thumbSize)}px`}
+          style={{ width: 50, height: 12, accentColor: "var(--scrubber-active)", cursor: "pointer" }}
+        />
         <button
           type="button"
           onClick={onClose}
@@ -231,14 +260,14 @@ export default function AIHistoryPanel({
           <div style={{ display: "flex", gap: 8, alignItems: "flex-start" }}>
             {/* Document Source Image — visually inert */}
             <ThumbBox
-              size={44}
+              size={thumbSize}
               imgUrl={sourceImageUrl}
               label="Source Image"
             />
             {/* Slice Root — clickable */}
             <ThumbBox
               node={rootNode}
-              size={44}
+              size={thumbSize}
               active={graph.displayStateId === graph.rootStateId}
               onClick={() => { onSetDisplayCursor(layerIndex, graph.rootStateId); }}
               onSetOperationCursor={() => { onSetOperationCursor(layerIndex, graph.rootStateId); }}
@@ -320,7 +349,7 @@ export default function AIHistoryPanel({
                             <ThumbBox
                               key={stateId}
                               node={node}
-                              size={36}
+                              size={Math.round(thumbSize * 0.75)}
                               active={isDisplay}
                               onClick={() => { onSetDisplayCursor(layerIndex, stateId); }}
                               onSetOperationCursor={() => { onSetOperationCursor(layerIndex, stateId); }}
@@ -367,7 +396,7 @@ export default function AIHistoryPanel({
                             >
                               <ThumbBox
                                 node={node}
-                                size={32}
+                                size={Math.round(thumbSize * 0.67)}
                                 active={isDisplay}
                                 onSetOperationCursor={() => { onSetOperationCursor(layerIndex, stateId); }}
                               />

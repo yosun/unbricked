@@ -1,12 +1,13 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Canvas, useThree, useFrame, invalidate } from "@react-three/fiber";
-import { OrbitControls, TransformControls, useGLTF } from "@react-three/drei";
-import { Box3, CanvasTexture, Color, DoubleSide, Euler, GridHelper as ThreeGridHelper, Group, MathUtils, MeshBasicMaterial, MeshStandardMaterial, PlaneGeometry, Plane, Quaternion, Raycaster, SRGBColorSpace, Vector3, TextureLoader, BufferGeometry, Float32BufferAttribute, LineBasicMaterial } from "three";
+import { Line, OrbitControls, TransformControls, useGLTF } from "@react-three/drei";
+import { Box3, BoxGeometry, CanvasTexture, Color, DoubleSide, EdgesGeometry, Euler, GridHelper as ThreeGridHelper, Group, MathUtils, MeshBasicMaterial, MeshStandardMaterial, PlaneGeometry, Plane, Quaternion, Raycaster, SRGBColorSpace, Vector3, TextureLoader, BufferGeometry, Float32BufferAttribute, LineBasicMaterial } from "three";
 import type { Camera, Material, Mesh, Texture } from "three";
 import type { ThreeEvent } from "@react-three/fiber";
 
 export type SegmentDisplayMode = "masked" | "colored";
 import type { CropInfo } from "../services/falProxy";
+import { AI_EDIT_MODELS, getAiEditModel } from "../services/falProxy";
 import LayerScrubber from "./LayerScrubber";
 import LayerControlsHUD from "./LayerControlsHUD";
 import LayersPanel from "./LayersPanel";
@@ -42,13 +43,15 @@ function layerHue(layerIdx: number, layerCount: number): string {
   return `hsl(${String(hue)}, 55%, 65%)`;
 }
 
-function layerY(index: number, layerCount: number): number {
+function layerY(index: number, layerCount: number, spread: number = 1): number {
+  const h = PRISM_H * spread;
   const t = layerCount <= 1 ? 0.5 : index / (layerCount - 1);
-  return -PRISM_H / 2 + t * PRISM_H;
+  return -h / 2 + t * h;
 }
 
-function yToLayerContinuous(y: number, layerCount: number): number {
-  const t = (y + PRISM_H / 2) / PRISM_H;
+function yToLayerContinuous(y: number, layerCount: number, spread: number = 1): number {
+  const h = PRISM_H * spread;
+  const t = (y + h / 2) / h;
   return t * (layerCount - 1);
 }
 
@@ -80,11 +83,15 @@ interface SpacePrismProps {
   layerTextures: Record<number, string>;
   layerCropInfo: Record<number, CropInfo>;
   imageAspect: number | null;
+  /** Spread multiplier for layer spacing. */
+  layerSpread?: number;
+  /** Set of layer indices whose source image is hidden (show 3D instead). */
+  threeDSourceHidden?: Set<number>;
   /** When true, all layers start stacked at center and spread to final positions. */
   revealActive: boolean;
   onRevealDone?: () => void;
-  /** Layer index currently being AI-edited (for pulse animation), or null. */
-  aiEditingLayer?: number | null | undefined;
+  /** Set of layer indices currently being AI-edited (for pulse animation). */
+  aiEditingLayers?: Set<number> | undefined;
   /** GLB blob URLs keyed by layer index. */
   layerGlbUrls?: Record<number, string>;
   /** Layer index currently generating 3D. */
@@ -136,10 +143,10 @@ function getLabelTexture(text: string, color: string): CanvasTexture {
 }
 
 /** A lightweight label sprite — replaces the expensive drei <Text> (troika SDF). */
-function LayerLabel({ text, color, opacity, renderOrder }: { text: string; color: string; opacity: number; renderOrder: number }) {
+function LayerLabel({ text, color, opacity, renderOrder, position }: { text: string; color: string; opacity: number; renderOrder: number; position?: [number, number, number] }) {
   const tex = useMemo(() => getLabelTexture(text, color), [text, color]);
   return (
-    <sprite position={[0, 0.01, 0]} scale={[0.5, 0.5, 0.5]} renderOrder={renderOrder}>
+    <sprite position={position ?? [0, 0.01, 0]} scale={[0.35, 0.35, 0.35]} renderOrder={renderOrder}>
       <spriteMaterial map={tex} transparent opacity={opacity} depthWrite={false} sizeAttenuation />
     </sprite>
   );
@@ -240,6 +247,7 @@ function TexturedLayerPlane({
   generating3D,
   positionIndex,
   selected,
+  onSelect,
 }: {
   uri: string | undefined;
   width: number;
@@ -252,6 +260,7 @@ function TexturedLayerPlane({
   /** Visual stack position (0 = bottom) for correct render ordering. */
   positionIndex?: number | undefined;
   selected?: boolean | undefined;
+  onSelect?: (() => void) | undefined;
 }): React.JSX.Element | null {
   const texture = useLayerTexture(uri);
   const matRef = useRef<import("three").MeshBasicMaterial>(null);
@@ -331,7 +340,9 @@ function TexturedLayerPlane({
 
   return (
     <group>
-      <mesh rotation={[-Math.PI / 2, 0, 0]} position={[offX, 0.02, offZ]} renderOrder={baseOrder + 2}>
+      <mesh rotation={[-Math.PI / 2, 0, 0]} position={[offX, 0.04, offZ]} renderOrder={baseOrder + 2}
+        {...(onSelect ? { onClick: (e: import("@react-three/fiber").ThreeEvent<MouseEvent>) => { e.stopPropagation(); onSelect(); } } : {})}
+      >
         <planeGeometry args={[planeW, planeD]} />
         <meshBasicMaterial
           ref={matRef}
@@ -340,10 +351,13 @@ function TexturedLayerPlane({
           opacity={opacity * fadeProgress.current}
           depthWrite={false}
           side={DoubleSide}
+          polygonOffset
+          polygonOffsetFactor={-1}
+          polygonOffsetUnits={-1}
         />
       </mesh>
       {/* Glow overlay for AI editing pulse */}
-      <mesh rotation={[-Math.PI / 2, 0, 0]} position={[offX, 0.03, offZ]} renderOrder={baseOrder + 3}>
+      <mesh rotation={[-Math.PI / 2, 0, 0]} position={[offX, 0.06, offZ]} renderOrder={baseOrder + 3}>
         <planeGeometry args={[planeW, planeD]} />
         <meshBasicMaterial
           ref={glowRef}
@@ -352,6 +366,9 @@ function TexturedLayerPlane({
           color={glowColor}
           depthWrite={false}
           side={DoubleSide}
+          polygonOffset
+          polygonOffsetFactor={-2}
+          polygonOffsetUnits={-2}
         />
       </mesh>
     </group>
@@ -635,9 +652,13 @@ function GLBLayerModel({
   // Auto-yaw: if rotating 90° around Y makes the XZ footprint aspect better
   // match the target image aspect, apply it.
   const { orientationQuat, scaledMetrics } = useMemo(() => {
-    // 1. Determine if yaw correction is needed (using unscaled probe first)
+    // Base rotation: SAM-3 outputs Z-up models; Three.js is Y-up → −90° X
+    const baseQ = new Quaternion().setFromEuler(new Euler(-Math.PI / 2, 0, 0));
+
+    // 1. Determine if yaw correction is needed (using base-rotated probe)
     const rawProbe = cloned.clone(true);
     const rawGroup = new Group();
+    rawGroup.quaternion.copy(baseQ);
     rawGroup.add(rawProbe);
     rawGroup.updateMatrixWorld(true);
     const rawBox = new Box3().setFromObject(rawGroup);
@@ -663,9 +684,9 @@ function GLBLayerModel({
       Math.abs(modelAspect - imageAspect) > Math.abs(modelAspect90 - imageAspect) &&
       Math.abs(modelAspect - imageAspect) > 0.3;
 
-    const q = new Quaternion();
+    const q = baseQ.clone();
     if (needsYaw90) {
-      q.setFromEuler(new Euler(0, Math.PI / 2, 0));
+      q.premultiply(new Quaternion().setFromEuler(new Euler(0, Math.PI / 2, 0)));
     }
 
     // 2. Compute fitScale from oriented (but unscaled) bbox
@@ -763,6 +784,9 @@ function GLBLayerModel({
     const { size } = scaledMetrics;
     return [size.x, size.y, size.z];
   }, [scaledMetrics]);
+
+  // Edge-only geometry for bounding box (no triangle diagonals)
+  const bboxEdgesGeo = useMemo(() => new EdgesGeometry(new BoxGeometry(...bboxSize)), [bboxSize]);
 
   // ── Bounding box center offset from pivot point (for wireframe positioning) ──
   const bboxCenterOffset = useMemo<[number, number, number]>(() => {
@@ -903,10 +927,9 @@ function GLBLayerModel({
             </group>
             {/* Bounding box wireframe — centered on bbox, offset from pivot point */}
             {selected && (
-              <mesh position={bboxCenterOffset}>
-                <boxGeometry args={bboxSize} />
-                <meshBasicMaterial wireframe transparent opacity={0.25} color={selectionWireframe} depthWrite={false} />
-              </mesh>
+              <lineSegments geometry={bboxEdgesGeo} position={bboxCenterOffset}>
+                <lineBasicMaterial transparent opacity={0.25} color={selectionWireframe} depthWrite={false} />
+              </lineSegments>
             )}
             {/* Pivot indicator at gizmo origin (tcTarget space) */}
             {selected && (
@@ -1155,7 +1178,8 @@ function GizmoChildSnapHelpers({
 }
 
 function SpacePrism(props: SpacePrismProps): React.JSX.Element {
-  const { layerCount, selectedLayerIndex, layerVisibility, layerOrder, onSelectLayer, dragOverride, suppressClicks, layerTextures, layerCropInfo, imageAspect, revealActive, onRevealDone, aiEditingLayer, layerGlbUrls, generating3DLayer, transformPivot, transformMode, snapTranslation, snapRotation, snapScale, snapEnabled, onSetTransformPivot, onTransformChange, appliedTransform, modelTransform } = props;
+  const { layerCount, selectedLayerIndex, layerVisibility, layerOrder, onSelectLayer, dragOverride, suppressClicks, layerTextures, layerCropInfo, imageAspect, layerSpread: spreadProp, threeDSourceHidden, revealActive, onRevealDone, aiEditingLayers, layerGlbUrls, generating3DLayer, transformPivot, transformMode, snapTranslation, snapRotation, snapScale, snapEnabled, onSetTransformPivot, onTransformChange, appliedTransform, modelTransform } = props;
+  const spread = spreadProp ?? 1;
   const { prismW, prismD } = prismDims(imageAspect);
   const hiddenSlideX = -(prismW + 0.5);
   const template = useUIStyle((s) => s.template);
@@ -1194,15 +1218,15 @@ function SpacePrism(props: SpacePrismProps): React.JSX.Element {
   const staticPositions = useMemo(() => {
     const result: { layerIdx: number; y: number; isDragged: boolean }[] = [];
     for (let posIdx = 0; posIdx < layerOrder.length; posIdx++) {
-      result.push({ layerIdx: layerOrder[posIdx] ?? posIdx, y: layerY(posIdx, layerCount), isDragged: false });
+      result.push({ layerIdx: layerOrder[posIdx] ?? posIdx, y: layerY(posIdx, layerCount, spread), isDragged: false });
     }
     return result;
-  }, [layerOrder, layerCount]);
+  }, [layerOrder, layerCount, spread]);
 
   let positions: { layerIdx: number; y: number; isDragged: boolean }[];
   if (dragActive) {
     // Figure out which slot the dragged layer would snap to
-    const continuous = yToLayerContinuous(dragOverride.y, layerCount);
+    const continuous = yToLayerContinuous(dragOverride.y, layerCount, spread);
     const targetSlot = clampLayerIndex(continuous, layerCount);
 
     // Build a temporary order with the dragged layer removed, then inserted at target
@@ -1215,7 +1239,7 @@ function SpacePrism(props: SpacePrismProps): React.JSX.Element {
       if (li === dragIdx) {
         positions.push({ layerIdx: li, y: dragOverride.y, isDragged: true });
       } else {
-        positions.push({ layerIdx: li, y: layerY(posIdx, layerCount), isDragged: false });
+        positions.push({ layerIdx: li, y: layerY(posIdx, layerCount, spread), isDragged: false });
       }
     }
   } else {
@@ -1225,11 +1249,27 @@ function SpacePrism(props: SpacePrismProps): React.JSX.Element {
   // Shared geometry for all brick planes — avoids N allocations per frame
   const brickGeo = useMemo(() => new PlaneGeometry(prismW * 0.96, prismD * 0.96), [prismW, prismD]);
 
+  // Rectangle corner points for slice border (closed loop)
+  const sliceEdgePoints = useMemo((): [number, number, number][] => {
+    const hw = (prismW * 0.96) / 2;
+    const hd = (prismD * 0.96) / 2;
+    return [[-hw, -hd, 0], [hw, -hd, 0], [hw, hd, 0], [-hw, hd, 0], [-hw, -hd, 0]];
+  }, [prismW, prismD]);
+
+  // Edge-only geometry for the prism wireframe (no triangle diagonals)
+  const prismH = PRISM_H * spread;
+  const prismEdgesGeo = useMemo(() => new EdgesGeometry(new BoxGeometry(prismW, prismH, prismD)), [prismW, prismD, prismH]);
+
   return (
     <group>
-      <mesh>
-        <boxGeometry args={[prismW, PRISM_H, prismD]} />
-        <meshBasicMaterial wireframe transparent opacity={0.15} color={template.colors.foreground} />
+      <lineSegments geometry={prismEdgesGeo}>
+        <lineBasicMaterial transparent opacity={0.15} color={template.colors.foreground} />
+      </lineSegments>
+
+      {/* Subtle ground shadow beneath the prism */}
+      <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, -prismH / 2 - 0.01, 0]} renderOrder={-1}>
+        <planeGeometry args={[prismW * 1.3, prismD * 1.3]} />
+        <meshBasicMaterial transparent opacity={0.06} color="#000000" depthWrite={false} />
       </mesh>
 
       {positions.map(({ layerIdx, y, isDragged }, positionIndex) => {
@@ -1256,10 +1296,6 @@ function SpacePrism(props: SpacePrismProps): React.JSX.Element {
               rotation={[Math.PI / 2, 0, 0]}
               scale={scale}
               renderOrder={baseOrder}
-              onClick={(e) => {
-                e.stopPropagation();
-                if (!suppressClicks) onSelectLayer(layerIdx);
-              }}
             >
               <meshBasicMaterial
                 transparent
@@ -1267,11 +1303,27 @@ function SpacePrism(props: SpacePrismProps): React.JSX.Element {
                 color={color}
                 depthWrite={false}
                 side={DoubleSide}
+                polygonOffset
+                polygonOffsetFactor={0}
+                polygonOffsetUnits={1}
               />
 
             </mesh>
-            {/* Texture overlay if this layer has an image */}
-            {layerTextures[layerIdx] && (
+            {/* Slice border outline — subtle when idle, vivid when selected */}
+            <Line
+              points={sliceEdgePoints}
+              color={selected ? template.colors.selectionWireframe : template.colors.foreground}
+              lineWidth={selected ? 2.5 : 1}
+              rotation={[Math.PI / 2, 0, 0]}
+              scale={scale}
+              position={[0, 0.08, 0]}
+              renderOrder={baseOrder + 4}
+              depthWrite={false}
+              transparent
+              opacity={selected ? 1 : 0.25}
+            />
+            {/* Texture overlay if this layer has an image — hidden when 3D source toggle is on */}
+            {layerTextures[layerIdx] && !threeDSourceHidden?.has(layerIdx) && (
               <TexturedLayerPlane
                 uri={layerTextures[layerIdx]}
                 width={prismW}
@@ -1279,13 +1331,14 @@ function SpacePrism(props: SpacePrismProps): React.JSX.Element {
                 layerIdx={layerIdx}
                 opacity={vis ? vis.textureOpacity : 1}
                 crop={layerCropInfo[layerIdx]}
-                aiEditing={aiEditingLayer === layerIdx}
+                aiEditing={aiEditingLayers?.has(layerIdx) ?? false}
                 generating3D={generating3DLayer === layerIdx}
                 positionIndex={positionIndex}
                 selected={selected}
+                onSelect={suppressClicks ? undefined : () => onSelectLayer(layerIdx)}
               />
             )}
-            {/* GLB 3D model overlay */}
+            {/* GLB 3D model — only shown when source image is toggled hidden */}
             {generating3DLayer === layerIdx && !layerGlbUrls?.[layerIdx] && (
               <Generating3DPlaceholder
                 width={prismW}
@@ -1293,7 +1346,7 @@ function SpacePrism(props: SpacePrismProps): React.JSX.Element {
                 {...(layerCropInfo[layerIdx] ? { crop: layerCropInfo[layerIdx] } : {})}
               />
             )}
-            {layerGlbUrls?.[layerIdx] && (
+            {layerGlbUrls?.[layerIdx] && threeDSourceHidden?.has(layerIdx) && (
               <GLBLayerModel
                 url={layerGlbUrls[layerIdx]}
                 width={prismW}
@@ -1316,6 +1369,7 @@ function SpacePrism(props: SpacePrismProps): React.JSX.Element {
               color={template.colors.foreground}
               opacity={hidden ? 0.2 : Math.min(0.5, opacity * 2)}
               renderOrder={baseOrder + 1}
+              position={[-(prismW * 0.96) / 2 + 0.15, 0.09, -(prismD * 0.96) / 2 + 0.15]}
             />
           </AnimatedLayerGroup>
         );
@@ -1333,6 +1387,7 @@ interface ScrubberPlaneProps {
   onPreviewLayer: (index: number | null) => void;
   onCommitLayer: (index: number) => void;
   imageAspect: number | null;
+  layerSpread?: number;
 }
 
 const _dragPlane = new Plane(new Vector3(0, 0, 1), 0);
@@ -1340,7 +1395,8 @@ const _intersection = new Vector3();
 const _raycaster = new Raycaster();
 
 function ScrubberPlane(props: ScrubberPlaneProps): React.JSX.Element | null {
-  const { layerCount, selectedLayerIndex, layerOrder, onPreviewLayer, onCommitLayer, imageAspect } = props;
+  const { layerCount, selectedLayerIndex, layerOrder, onPreviewLayer, onCommitLayer, imageAspect, layerSpread: spreadProp } = props;
+  const spread = spreadProp ?? 1;
   const { prismW, prismD } = prismDims(imageAspect);
   const { camera, controls } = useThree();
   const scrubber3d = useUIStyle((s) => s.template.colors.scrubber3d);
@@ -1352,7 +1408,7 @@ function ScrubberPlane(props: ScrubberPlaneProps): React.JSX.Element | null {
   const currentLogical = selectedLayerIndex ?? 0;
   const visualPos = layerOrder.indexOf(currentLogical);
   const currentVisual = visualPos >= 0 ? visualPos : 0;
-  const y = layerY(currentVisual, layerCount);
+  const y = layerY(currentVisual, layerCount, spread);
 
   const handlePointerDown = useCallback(
     (e: ThreeEvent<PointerEvent>) => {
@@ -1369,9 +1425,9 @@ function ScrubberPlane(props: ScrubberPlaneProps): React.JSX.Element | null {
       camera.getWorldDirection(camDir);
       _dragPlane.setFromNormalAndCoplanarPoint(camDir, e.point);
       startY.current = e.point.y;
-      startLayerY.current = layerY(currentVisual, layerCount);
+      startLayerY.current = layerY(currentVisual, layerCount, spread);
     },
-    [camera, controls, currentVisual, layerCount],
+    [camera, controls, currentVisual, layerCount, spread],
   );
 
   const handlePointerMove = useCallback(
@@ -1384,7 +1440,7 @@ function ScrubberPlane(props: ScrubberPlaneProps): React.JSX.Element | null {
       if (_raycaster.ray.intersectPlane(_dragPlane, _intersection)) {
         const deltaY = _intersection.y - startY.current;
         const newY = startLayerY.current + deltaY;
-        const continuous = yToLayerContinuous(newY, layerCount);
+        const continuous = yToLayerContinuous(newY, layerCount, spread);
         const snappedVisual = clampLayerIndex(continuous, layerCount);
         // Map visual position back to logical layer index
         const logicalIdx = layerOrder[snappedVisual] ?? snappedVisual;
@@ -1409,7 +1465,7 @@ function ScrubberPlane(props: ScrubberPlaneProps): React.JSX.Element | null {
       if (_raycaster.ray.intersectPlane(_dragPlane, _intersection)) {
         const deltaY = _intersection.y - startY.current;
         const newY = startLayerY.current + deltaY;
-        const continuous = yToLayerContinuous(newY, layerCount);
+        const continuous = yToLayerContinuous(newY, layerCount, spread);
         const snappedVisual = clampLayerIndex(continuous, layerCount);
         finalLogical = layerOrder[snappedVisual] ?? snappedVisual;
       }
@@ -1484,6 +1540,8 @@ interface SpaceViewportProps {
   onClearSelection: () => void;
   layerTextures: Record<number, string>;
   layerThumbnails: Record<number, string>;
+  layerNames: Record<number, string>;
+  onRenameLayer: (index: number, name: string) => void;
   colorLayerTextures: Record<number, string>;
   layerCropInfo: Record<number, CropInfo>;
   segmentDisplayMode: SegmentDisplayMode;
@@ -1493,10 +1551,12 @@ interface SpaceViewportProps {
   imageAspect: number | null;
   onImportImage: () => void;
   onAiEdit: (prompt: string, strength?: number) => void;
-  aiRunning: boolean;
-  aiError: string | null;
+  onAiEditForLayer: (layerIndex: number, prompt: string, strength?: number) => void;
+  aiEditingLayers: Set<number>;
+  aiErrors: Record<number, string>;
   onPromptVisibilityChange?: (visible: boolean) => void;
   onAddSlice: () => void;
+  onDeleteSlice: (index: number) => void;
   isMaskActiveFn: (index: number) => boolean;
   isMaskInvertedFn: (index: number) => boolean;
   onInvertMask: (index: number) => void;
@@ -1516,6 +1576,12 @@ interface SpaceViewportProps {
   keyframePreviewUrl?: string | null;
   /** Document-level source image for AI history anchor. */
   documentSourceImageId?: PayloadId | undefined;
+  /** Trigger AI composite on the keyframe preview image. */
+  onCompositeKeyframe?: () => void;
+  /** Result URL from the AI composite operation. */
+  compositeResultUrl?: string | null;
+  /** Whether the AI composite is currently processing. */
+  compositeBusy?: boolean;
 }
 
 export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Element {
@@ -1545,6 +1611,8 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
     peekRail,
     layerTextures,
     layerThumbnails,
+    layerNames,
+    onRenameLayer,
     colorLayerTextures,
     layerCropInfo,
     segmentDisplayMode,
@@ -1554,10 +1622,12 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
     imageAspect,
     onImportImage,
     onAiEdit,
-    aiRunning,
-    aiError,
+    onAiEditForLayer,
+    aiEditingLayers,
+    aiErrors,
     onPromptVisibilityChange,
     onAddSlice,
+    onDeleteSlice,
     isMaskActiveFn,
     isMaskInvertedFn,
     onInvertMask,
@@ -1574,17 +1644,37 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
     payloads,
     keyframePreviewUrl,
     documentSourceImageId,
+    onCompositeKeyframe,
+    compositeResultUrl,
+    compositeBusy,
   } = props;
   const animating = animPhase !== "idle";
 
   // Transform pivot face for 3D models: which bbox face the gizmo anchors to
   const [transformPivot, setTransformPivot] = useState<PivotFace>("center");
 
+  // Keyframe expanded preview + composite state
+  const [keyframeExpanded, setKeyframeExpanded] = useState(false);
+  const [compositeFade, setCompositeFade] = useState(0.5);
+
+  // AI panel pinned to a specific layer (persists across selection changes)
+  const [aiPanelLayer, setAiPanelLayer] = useState<number | null>(null);
+  const [aiPanelPrompt, setAiPanelPrompt] = useState("");
+  const [aiPanelStrength, setAiPanelStrength] = useState(0.75);
+
   // Universal AI History panel: which layer index is open, or null
   const [historyPanelLayer, setHistoryPanelLayer] = useState<number | null>(null);
   // Screen-space anchor for the 3D-attached history HUD
   const [sliceAnchor, setSliceAnchor] = useState<AnchorPoint>({ x: 0, y: 0, visible: false });
   const stableSetSliceAnchor = useCallback((a: AnchorPoint) => { setSliceAnchor(a); }, []);
+  // Screen-space anchor for the AI edit button on the selected node
+  const [selectedSliceAnchor, setSelectedSliceAnchor] = useState<AnchorPoint>({ x: 0, y: 0, visible: false });
+  const stableSetSelectedSliceAnchor = useCallback((a: AnchorPoint) => { setSelectedSliceAnchor(a); }, []);
+  // Screen-space anchor for the pinned AI panel layer
+  const [aiPanelAnchor, setAiPanelAnchor] = useState<AnchorPoint>({ x: 0, y: 0, visible: false });
+  const stableSetAiPanelAnchor = useCallback((a: AnchorPoint) => { setAiPanelAnchor(a); }, []);
+  // Layer spread multiplier (1 = default, 0.2 = compressed, 3.0 = expanded)
+  const [layerSpread, setLayerSpread] = useState(1);
   // Transform gizmo mode
   const [transformMode, setTransformMode] = useState<"translate" | "rotate" | "scale">("rotate");
   // Snap settings
@@ -1723,9 +1813,10 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
         const screenDeltaY = dragStartY.current - lastDragY.current;
         const brickDeltaY = screenDeltaY * stb;
         const posIdx = dragOriginalPosIdx.current;
-        const origY = layerY(posIdx, layerCount);
-        const continuousY = Math.max(-PRISM_H / 2, Math.min(PRISM_H / 2, origY + brickDeltaY));
-        const continuous = yToLayerContinuous(continuousY, layerCount);
+        const origY = layerY(posIdx, layerCount, layerSpread);
+        const spreadH = PRISM_H * layerSpread;
+        const continuousY = Math.max(-spreadH / 2, Math.min(spreadH / 2, origY + brickDeltaY));
+        const continuous = yToLayerContinuous(continuousY, layerCount, layerSpread);
         const newPos = clampLayerIndex(continuous, layerCount);
         if (newPos !== posIdx) {
           finalOrder = [...layerOrder];
@@ -1766,9 +1857,10 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
         const brickDeltaY = screenDeltaY * stb;
 
         const posIdx = dragOriginalPosIdx.current;
-        const origY = layerY(posIdx, layerCount);
+        const origY = layerY(posIdx, layerCount, layerSpread);
         // Continuous Y, clamped to brick bounds
-        const continuousY = Math.max(-PRISM_H / 2, Math.min(PRISM_H / 2, origY + brickDeltaY));
+        const spreadH = PRISM_H * layerSpread;
+        const continuousY = Math.max(-spreadH / 2, Math.min(spreadH / 2, origY + brickDeltaY));
 
         // Update the visual override so the 3D plane follows the mouse.
         // We do NOT call onPreviewOrder here — SpacePrism computes visual
@@ -1867,9 +1959,11 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
           layerTextures={segmentDisplayMode === "colored" ? colorLayerTextures : layerTextures}
           layerCropInfo={layerCropInfo}
           imageAspect={imageAspect}
+          layerSpread={layerSpread}
+          threeDSourceHidden={threeDSourceHidden}
           revealActive={revealActive}
           onRevealDone={onRevealDone}
-          aiEditingLayer={aiRunning ? selectedLayerIndex : null}
+          aiEditingLayers={aiEditingLayers}
           layerGlbUrls={layerGlbUrls}
           generating3DLayer={generating3DLayer}
           transformPivot={transformPivot}
@@ -1890,6 +1984,7 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
           onPreviewLayer={onPreviewLayer}
           onCommitLayer={onSelectLayer}
           imageAspect={imageAspect}
+          layerSpread={layerSpread}
         />
         <CameraRef cameraRef={cameraRef} />
         {/* ── 3D AI History (Universal) — shown automatically when a slice is selected ── */}
@@ -1898,7 +1993,7 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
           if (!sliceGraph) return null;
           const { prismW: pw } = prismDims(imageAspect);
           const visualIdx = layerOrder.indexOf(selectedLayerIndex);
-          const yPos = layerY(visualIdx < 0 ? selectedLayerIndex : visualIdx, layerCount);
+          const yPos = layerY(visualIdx < 0 ? selectedLayerIndex : visualIdx, layerCount, layerSpread);
           return (
             <HistoryGraph3D
               graph={sliceGraph}
@@ -1908,6 +2003,9 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
               onSelectNode={(id) => { onSetDisplayCursor(selectedLayerIndex, id); }}
               onSetOperationCursor={(id) => { onSetOperationCursor?.(selectedLayerIndex, id); }}
               {...(documentSourceImageId ? { documentSourceImageId } : {})}
+              onToggleAiPanel={() => { setAiPanelLayer((prev) => prev === selectedLayerIndex ? null : selectedLayerIndex); }}
+              aiEditing={aiEditingLayers.has(selectedLayerIndex)}
+              aiPanelOpen={aiPanelLayer === selectedLayerIndex}
             />
           );
         })()}
@@ -1916,6 +2014,18 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
           layerCount={layerCount}
           layerOrder={layerOrder}
           onUpdate={stableSetSliceAnchor}
+        />
+        <SliceAnchorTracker
+          layerIndex={selectedLayerIndex}
+          layerCount={layerCount}
+          layerOrder={layerOrder}
+          onUpdate={stableSetSelectedSliceAnchor}
+        />
+        <SliceAnchorTracker
+          layerIndex={aiPanelLayer}
+          layerCount={layerCount}
+          layerOrder={layerOrder}
+          onUpdate={stableSetAiPanelAnchor}
         />
         <CameraRig animPhase={animPhase} onAnimDone={onAnimDone} />
         <OrbitControls
@@ -1932,6 +2042,132 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
         />
       </Canvas>
 
+      {/* Pinned AI prompt panel — floats near the pinned layer's node (universal view only) */}
+      {viewMode === "universal" && aiPanelLayer !== null && aiPanelAnchor.visible && (
+        <div
+          style={{
+            position: "absolute",
+            left: Math.min(aiPanelAnchor.x + 60, (typeof window !== "undefined" ? window.innerWidth : 800) - 260),
+            top: Math.max(aiPanelAnchor.y - 100, 10),
+            display: "flex",
+            flexDirection: "column",
+            gap: 6,
+            padding: "8px 10px",
+            borderRadius: 6,
+            background: "var(--hud-bg)",
+            border: "1px solid var(--hud-border)",
+            color: "var(--hud-text)",
+            fontSize: 12,
+            minWidth: 220,
+            maxWidth: 280,
+            zIndex: 25,
+            pointerEvents: "auto",
+            backdropFilter: "blur(12px)",
+            boxShadow: "0 4px 16px rgba(0,0,0,0.35)",
+          }}
+        >
+          <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+            <span style={{ fontSize: 10, fontWeight: 600, opacity: 0.7, flex: 1 }}>
+              AI Edit — {layerNames[aiPanelLayer] ?? `Layer ${String(aiPanelLayer)}`}
+            </span>
+            {aiEditingLayers.has(aiPanelLayer) && (
+              <span style={{ fontSize: 10, color: "var(--scrubber-active)" }}>⏳ Running</span>
+            )}
+            <button
+              type="button"
+              onClick={() => { setAiPanelLayer(null); }}
+              style={{ background: "none", border: "none", color: "var(--hud-muted)", cursor: "pointer", fontSize: 12, padding: "0 2px" }}
+            >✕</button>
+          </div>
+          <label style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+            <span style={{ opacity: 0.6 }}>Model</span>
+            <select
+              value={aiEditModelId}
+              onChange={(e) => { onChangeAiEditModel(e.target.value); }}
+              style={{
+                background: "var(--hud-active)",
+                border: "1px solid var(--hud-border-btn)",
+                borderRadius: 4,
+                padding: "4px 6px",
+                color: "var(--hud-text)",
+                fontSize: 12,
+                outline: "none",
+              }}
+            >
+              {AI_EDIT_MODELS.map((m) => (
+                <option key={m.id} value={m.id}>{m.label}</option>
+              ))}
+            </select>
+          </label>
+          <label style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+            <span style={{ opacity: 0.6 }}>Prompt</span>
+            <input
+              type="text"
+              value={aiPanelPrompt}
+              onChange={(e) => { setAiPanelPrompt(e.target.value); }}
+              onKeyDown={(e) => {
+                e.stopPropagation();
+                if (e.key === "Enter" && aiPanelPrompt.trim() && !aiEditingLayers.has(aiPanelLayer)) {
+                  onAiEditForLayer(aiPanelLayer, aiPanelPrompt.trim(), aiPanelStrength);
+                }
+              }}
+              placeholder="Describe the edit..."
+              style={{
+                background: "var(--hud-active)",
+                border: "1px solid var(--hud-border-btn)",
+                borderRadius: 4,
+                padding: "4px 6px",
+                color: "var(--hud-text)",
+                fontSize: 12,
+                outline: "none",
+              }}
+            />
+          </label>
+          {getAiEditModel(aiEditModelId).hasStrength && (
+            <label style={{ display: "flex", alignItems: "center", gap: 6 }}>
+              <span style={{ opacity: 0.6, minWidth: 52 }}>Strength</span>
+              <input
+                type="range"
+                min={0}
+                max={100}
+                step={1}
+                value={Math.round(aiPanelStrength * 100)}
+                onChange={(e) => { setAiPanelStrength(Number(e.target.value) / 100); }}
+                onKeyDown={(e) => { e.stopPropagation(); }}
+                style={{ flex: 1, accentColor: "var(--scrubber-active)", cursor: "pointer" }}
+              />
+              <span style={{ opacity: 0.5, minWidth: 30, textAlign: "right" }}>
+                {Math.round(aiPanelStrength * 100)}%
+              </span>
+            </label>
+          )}
+          <button
+            type="button"
+            disabled={!aiPanelPrompt.trim() || aiEditingLayers.has(aiPanelLayer)}
+            onClick={() => {
+              if (aiPanelPrompt.trim()) onAiEditForLayer(aiPanelLayer, aiPanelPrompt.trim(), aiPanelStrength);
+            }}
+            style={{
+              background: aiEditingLayers.has(aiPanelLayer) ? "var(--hud-muted)" : "var(--scrubber-active)",
+              border: "none",
+              borderRadius: 4,
+              padding: "5px 10px",
+              color: "var(--btn-primary-text)",
+              cursor: aiEditingLayers.has(aiPanelLayer) ? "wait" : "pointer",
+              fontWeight: 600,
+              fontSize: 12,
+            }}
+          >
+            {aiEditingLayers.has(aiPanelLayer) ? "Running…" : "Run AI Edit"}
+          </button>
+          {aiErrors[aiPanelLayer] && (
+            <div style={{ color: "var(--color-error)", fontSize: 11, wordBreak: "break-word", maxHeight: 60, overflowY: "auto" }}>
+              {aiErrors[aiPanelLayer]}
+            </div>
+          )}
+        </div>
+      )}
+
       {/* Chrome toggle button — always visible in top-left corner */}
       <button
         type="button"
@@ -1942,10 +2178,53 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
         {shouldShowChrome ? "✕" : "☰"}
       </button>
 
-      {/* Keyframe preview — persistent top-down composite */}
-      {keyframePreviewUrl && (
+      {/* Vertical slice distance slider — left edge, all views */}
+      {layerCount > 1 && (
         <div
-          title="Keyframe preview (top-down composite)"
+          style={{
+            position: "absolute",
+            left: 12,
+            top: "50%",
+            transform: "translateY(-50%)",
+            display: "flex",
+            flexDirection: "column",
+            alignItems: "center",
+            gap: 4,
+            padding: "8px 4px",
+            borderRadius: 6,
+            background: "var(--hud-bg)",
+            border: "1px solid var(--hud-border)",
+            zIndex: 11,
+            pointerEvents: "auto",
+          }}
+        >
+          <span style={{ fontSize: 8, color: "var(--hud-muted)", writingMode: "vertical-rl", textOrientation: "mixed" }}>Spread</span>
+          <input
+            type="range"
+            min={20}
+            max={300}
+            step={5}
+            value={Math.round(layerSpread * 100)}
+            onChange={(e) => { setLayerSpread(Number(e.target.value) / 100); }}
+            title={`Slice spread: ${Math.round(layerSpread * 100)}%`}
+            style={{
+              writingMode: "vertical-lr",
+              direction: "rtl",
+              height: 100,
+              width: 18,
+              accentColor: "var(--scrubber-active)",
+              cursor: "pointer",
+            }}
+          />
+          <span style={{ fontSize: 8, color: "var(--hud-muted)" }}>{Math.round(layerSpread * 100)}%</span>
+        </div>
+      )}
+
+      {/* Keyframe preview — persistent top-down composite */}
+      {keyframePreviewUrl && !keyframeExpanded && (
+        <div
+          title="Keyframe preview (top-down composite) — click to expand"
+          onClick={() => { setKeyframeExpanded(true); }}
           style={{
             position: "absolute",
             // Layers mode: top-left so the bottom history drawer never covers it.
@@ -1958,6 +2237,7 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
             border: "1px solid var(--hud-border)",
             background: "var(--hud-bg)",
             zIndex: 11,
+            cursor: "pointer",
           }}
         >
           <img
@@ -1969,6 +2249,15 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
               objectFit: "contain",
             }}
           />
+          {/* Expand icon */}
+          <span style={{
+            position: "absolute",
+            top: 3,
+            right: 3,
+            fontSize: 10,
+            color: "var(--hud-muted)",
+            opacity: 0.7,
+          }}>⤢</span>
           <span style={{
             position: "absolute",
             bottom: 2,
@@ -1980,6 +2269,163 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
             textTransform: "uppercase",
             letterSpacing: 0.5,
           }}>Keyframe</span>
+        </div>
+      )}
+
+      {/* Keyframe expanded modal with AI composite */}
+      {keyframePreviewUrl && keyframeExpanded && (
+        <div
+          style={{
+            position: "absolute",
+            inset: 0,
+            zIndex: 100,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            background: "rgba(0,0,0,0.7)",
+          }}
+          onClick={(e) => { if (e.target === e.currentTarget) setKeyframeExpanded(false); }}
+        >
+          <div
+            style={{
+              position: "relative",
+              background: "var(--hud-bg, #1a1a2e)",
+              border: "1px solid var(--hud-border, #333)",
+              borderRadius: 12,
+              padding: 16,
+              maxWidth: "80vw",
+              maxHeight: "80vh",
+              display: "flex",
+              flexDirection: "column",
+              alignItems: "center",
+              gap: 12,
+            }}
+          >
+            {/* Close button */}
+            <button
+              type="button"
+              onClick={() => { setKeyframeExpanded(false); }}
+              style={{
+                position: "absolute",
+                top: 8,
+                right: 8,
+                background: "none",
+                border: "none",
+                color: "var(--hud-text, #ccc)",
+                fontSize: 18,
+                cursor: "pointer",
+                lineHeight: 1,
+              }}
+            >✕</button>
+
+            <span style={{
+              fontSize: 11,
+              fontWeight: 600,
+              color: "var(--hud-text, #ccc)",
+              textTransform: "uppercase",
+              letterSpacing: 1,
+            }}>Keyframe Preview</span>
+
+            {/* Image container with before/after */}
+            <div style={{
+              position: "relative",
+              width: "min(60vw, 480px)",
+              aspectRatio: "1",
+              borderRadius: 8,
+              overflow: "hidden",
+              background: "#000",
+            }}>
+              {/* Raw keyframe (always visible as base) */}
+              <img
+                src={keyframePreviewUrl}
+                alt="Keyframe raw"
+                style={{
+                  position: "absolute",
+                  inset: 0,
+                  width: "100%",
+                  height: "100%",
+                  objectFit: "contain",
+                }}
+              />
+              {/* Composited result fading over the raw */}
+              {compositeResultUrl && (
+                <img
+                  src={compositeResultUrl}
+                  alt="Composited"
+                  style={{
+                    position: "absolute",
+                    inset: 0,
+                    width: "100%",
+                    height: "100%",
+                    objectFit: "contain",
+                    opacity: compositeFade,
+                    transition: "opacity 0.15s ease",
+                  }}
+                />
+              )}
+              {/* Loading spinner overlay */}
+              {compositeBusy && (
+                <div style={{
+                  position: "absolute",
+                  inset: 0,
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  background: "rgba(0,0,0,0.4)",
+                }}>
+                  <span style={{
+                    fontSize: 14,
+                    color: "#fff",
+                    animation: "pulse 1.2s ease-in-out infinite",
+                  }}>Compositing…</span>
+                </div>
+              )}
+            </div>
+
+            {/* Fade slider — only when composite result exists */}
+            {compositeResultUrl && (
+              <div style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 8,
+                width: "min(60vw, 480px)",
+              }}>
+                <span style={{ fontSize: 9, color: "var(--hud-muted, #888)", whiteSpace: "nowrap" }}>Raw</span>
+                <input
+                  type="range"
+                  min={0}
+                  max={1}
+                  step={0.01}
+                  value={compositeFade}
+                  onChange={(e) => { setCompositeFade(Number(e.target.value)); }}
+                  style={{
+                    flex: 1,
+                    accentColor: "var(--scrubber-active, #5af)",
+                    cursor: "pointer",
+                  }}
+                />
+                <span style={{ fontSize: 9, color: "var(--hud-muted, #888)", whiteSpace: "nowrap" }}>Composite</span>
+              </div>
+            )}
+
+            {/* AI Composite button */}
+            <button
+              type="button"
+              disabled={compositeBusy}
+              onClick={() => { onCompositeKeyframe?.(); }}
+              style={{
+                padding: "8px 20px",
+                borderRadius: 6,
+                border: "1px solid var(--hud-border, #444)",
+                background: compositeBusy ? "#333" : "linear-gradient(135deg, #4a5af0, #7b2ff7)",
+                color: "#fff",
+                fontSize: 12,
+                fontWeight: 600,
+                cursor: compositeBusy ? "not-allowed" : "pointer",
+                opacity: compositeBusy ? 0.6 : 1,
+              }}
+            >{compositeBusy ? "Compositing…" : compositeResultUrl ? "Re-composite" : "AI Composite"}</button>
+          </div>
         </div>
       )}
 
@@ -2052,6 +2498,7 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
         return (
           <AIHistoryPanel
             layerIndex={historyPanelLayer}
+            layerName={layerNames[historyPanelLayer]}
             graph={sliceGraph}
             payloads={payloads}
             onSetDisplayCursor={onSetDisplayCursor}
@@ -2104,6 +2551,9 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
           onCommitOrder={onCommitOrder}
           layerThumbnails={layerThumbnails}
           layerGlbUrls={layerGlbUrls}
+          layerNames={layerNames}
+          onRenameLayer={onRenameLayer}
+          getSliceHistory={getSliceHistory}
         />
       )}
 
@@ -2111,6 +2561,7 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
       {showControlsHUD && selectedLayerIndex !== null && (
         <LayerControlsHUD
           layerIndex={selectedLayerIndex}
+          layerName={layerNames[selectedLayerIndex]}
           isHidden={selectedIsHidden}
           isSolo={selectedIsSolo}
           maskActive={maskActive}
@@ -2124,8 +2575,8 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
           hasImage={selectedLayerIndex in layerTextures}
           onImportImage={onImportImage}
           onAiEdit={onAiEdit}
-          aiRunning={aiRunning}
-          aiError={aiError}
+          aiRunning={aiEditingLayers.has(selectedLayerIndex)}
+          aiError={aiErrors[selectedLayerIndex] ?? null}
           onAddSlice={onAddSlice}
           aiEditModelId={aiEditModelId}
           onChangeAiEditModel={onChangeAiEditModel}
@@ -2143,6 +2594,9 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
           onToggleSnap={() => { setSnapEnabled((s) => !s); }}
           modelTransform={selectedLayerIndex in layerGlbUrls ? modelTransform : undefined}
           onApplyTransform={handleApplyTransform}
+          onDeleteSlice={onDeleteSlice}
+          layerCount={layerCount}
+          onRenameLayer={onRenameLayer}
         />
       )}
 
@@ -2169,11 +2623,14 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
           onCommitOrder={onCommitOrder}
           onImportImage={onImportImage}
           onAiEdit={onAiEdit}
-          aiRunning={aiRunning}
-          aiError={aiError}
+          aiEditingLayers={aiEditingLayers}
+          aiErrors={aiErrors}
           onAddSlice={onAddSlice}
+          onDeleteSlice={onDeleteSlice}
           layerTextures={layerTextures}
           layerThumbnails={layerThumbnails}
+          layerNames={layerNames}
+          onRenameLayer={onRenameLayer}
           aiEditModelId={aiEditModelId}
           onChangeAiEditModel={onChangeAiEditModel}
           onGenerate3D={onGenerate3D}
@@ -2220,9 +2677,9 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
           }}
         >
           {dragReorder && selectedLayerIndex !== null
-            ? <><span style={{ fontSize: 14 }}>⇕</span> Dragging Layer {selectedLayerIndex}</>
+            ? <><span style={{ fontSize: 14 }}>⇕</span> Dragging {layerNames[selectedLayerIndex] ?? `Layer ${String(selectedLayerIndex)}`}</>
             : selectedLayerIndex !== null
-              ? <><span style={{ fontSize: 14 }}>◈</span> Layer {selectedLayerIndex} — hold for menu</>
+              ? <><span style={{ fontSize: 14 }}>◈</span> {layerNames[selectedLayerIndex] ?? `Layer ${String(selectedLayerIndex)}`} — hold for menu</>
               : <span style={{ color: "var(--hud-muted)" }}>long-press for menu</span>}
         </div>
       )}

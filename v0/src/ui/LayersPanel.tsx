@@ -27,11 +27,14 @@ interface LayersPanelProps {
   onCommitOrder: (order: number[]) => void;
   onImportImage: () => void;
   onAiEdit: (prompt: string, strength?: number) => void;
-  aiRunning: boolean;
-  aiError: string | null;
+  aiEditingLayers: Set<number>;
+  aiErrors: Record<number, string>;
   onAddSlice: () => void;
+  onDeleteSlice: (index: number) => void;
   layerTextures: Record<number, string>;
   layerThumbnails: Record<number, string>;
+  layerNames: Record<number, string>;
+  onRenameLayer: (index: number, name: string) => void;
   aiEditModelId: string;
   onChangeAiEditModel: (id: string) => void;
   onGenerate3D: (index: number) => void;
@@ -86,11 +89,14 @@ export default function LayersPanel(props: LayersPanelProps): React.JSX.Element 
     onCommitOrder,
     onImportImage,
     onAiEdit,
-    aiRunning,
-    aiError,
+    aiEditingLayers,
+    aiErrors,
     onAddSlice,
+    onDeleteSlice,
     layerTextures,
     layerThumbnails,
+    layerNames,
+    onRenameLayer,
     aiEditModelId,
     onChangeAiEditModel,
     onGenerate3D,
@@ -139,6 +145,11 @@ export default function LayersPanel(props: LayersPanelProps): React.JSX.Element 
   const [historyPanelLayer, setHistoryPanelLayer] = useState<number | null>(null);
   /** Which seed path is selected in the history panel */
   const [selectedPathId, setSelectedPathId] = useState<string | null>(null);
+
+  // Inline rename state
+  const [renamingIdx, setRenamingIdx] = useState<number | null>(null);
+  const [renameText, setRenameText] = useState("");
+  const renameInputRef = useRef<HTMLInputElement>(null);
 
   const handleDragPointerDown = useCallback(
     (viewIdx: number, e: React.PointerEvent<HTMLSpanElement>) => {
@@ -331,6 +342,7 @@ export default function LayersPanel(props: LayersPanelProps): React.JSX.Element 
                       height: 36,
                       borderRadius: 4,
                       objectFit: "cover",
+                      background: "var(--hud-active)",
                       opacity: hidden ? 0.3 : 1,
                       border: isSelected
                         ? "1.5px solid var(--scrubber-active)"
@@ -375,7 +387,47 @@ export default function LayersPanel(props: LayersPanelProps): React.JSX.Element 
               <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column", gap: 2 }}>
                 {/* Top: label + opacity */}
                 <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                  {renamingIdx === layerIdx ? (
+                    <input
+                      ref={renameInputRef}
+                      type="text"
+                      value={renameText}
+                      onClick={(e) => { e.stopPropagation(); }}
+                      onChange={(e) => { setRenameText(e.target.value); }}
+                      onBlur={() => {
+                        onRenameLayer(layerIdx, renameText);
+                        setRenamingIdx(null);
+                      }}
+                      onKeyDown={(e) => {
+                        e.stopPropagation();
+                        if (e.key === "Enter") {
+                          onRenameLayer(layerIdx, renameText);
+                          setRenamingIdx(null);
+                        } else if (e.key === "Escape") {
+                          setRenamingIdx(null);
+                        }
+                      }}
+                      style={{
+                        fontSize: 12,
+                        flex: 1,
+                        minWidth: 0,
+                        background: "var(--hud-active)",
+                        border: "1px solid var(--scrubber-active)",
+                        borderRadius: 3,
+                        padding: "1px 4px",
+                        color: "var(--hud-text)",
+                        outline: "none",
+                      }}
+                    />
+                  ) : (
                   <span
+                    onDoubleClick={(e) => {
+                      e.stopPropagation();
+                      setRenamingIdx(layerIdx);
+                      setRenameText(layerNames[layerIdx] ?? `Layer ${String(layerIdx)}`);
+                      setTimeout(() => { renameInputRef.current?.select(); }, 0);
+                    }}
+                    title="Double-click to rename"
                     style={{
                       fontSize: 12,
                       color: isSelected ? "var(--scrubber-active)" : "var(--hud-text)",
@@ -386,10 +438,12 @@ export default function LayersPanel(props: LayersPanelProps): React.JSX.Element 
                       textOverflow: "ellipsis",
                       whiteSpace: "nowrap",
                       opacity: hidden ? 0.4 : 1,
+                      cursor: "default",
                     }}
                   >
-                    Layer {layerIdx}
+                    {layerNames[layerIdx] ?? `Layer ${String(layerIdx)}`}
                   </span>
+                  )}
                   {/* AI History ops badge */}
                   {(() => {
                     const graph = getSliceHistoryProp?.(layerIdx);
@@ -567,6 +621,28 @@ export default function LayersPanel(props: LayersPanelProps): React.JSX.Element 
                       }}
                     >
                       🖼
+                    </button>
+                  )}
+
+                  {/* Delete layer */}
+                  {layerCount > 1 && (
+                    <button
+                      type="button"
+                      onClick={(e) => { e.stopPropagation(); onDeleteSlice(layerIdx); }}
+                      title="Delete layer"
+                      style={{
+                        background: "none",
+                        border: "none",
+                        color: "var(--hud-muted)",
+                        cursor: "pointer",
+                        fontSize: 10,
+                        padding: "1px 3px",
+                        borderRadius: 3,
+                        flexShrink: 0,
+                        opacity: 0.6,
+                      }}
+                    >
+                      🗑
                     </button>
                   )}
                 </div>
@@ -795,7 +871,7 @@ export default function LayersPanel(props: LayersPanelProps): React.JSX.Element 
                     if (rootNode) onSetDisplayCursorProp?.(historyPanelLayer, rootNode.stateId);
                   }}
                   style={{
-                    width: 36, height: 36, borderRadius: 4, overflow: "hidden",
+                    width: 36, height: 36, borderRadius: "50%", overflow: "hidden",
                     border: graph.displayStateId === graph.rootStateId ? "2px solid var(--scrubber-active)" : "1px solid var(--hud-border-btn)",
                     cursor: "pointer",
                     position: "relative",
@@ -803,7 +879,7 @@ export default function LayersPanel(props: LayersPanelProps): React.JSX.Element 
                   }}
                 >
                   {thumbUrl(rootNode) && (
-                    <img src={thumbUrl(rootNode)!} alt="Root" style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+                    <img src={thumbUrl(rootNode)!} alt="Root" style={{ width: "100%", height: "100%", objectFit: "contain", background: "var(--hud-active)" }} />
                   )}
                   {graph.displayStateId === graph.rootStateId && (
                     <span style={{ position: "absolute", top: 0, right: 1, fontSize: 8 }}>👁</span>
@@ -820,13 +896,13 @@ export default function LayersPanel(props: LayersPanelProps): React.JSX.Element 
               {/* Current (display) thumbnail */}
               <div style={{ textAlign: "center" }}>
                 <div style={{
-                  width: 36, height: 36, borderRadius: 4, overflow: "hidden",
+                  width: 36, height: 36, borderRadius: "50%", overflow: "hidden",
                   border: "2px solid var(--scrubber-active)",
                   background: "var(--hud-active)",
                   position: "relative",
                 }}>
                   {thumbUrl(displayNode) && (
-                    <img src={thumbUrl(displayNode)!} alt="Current" style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+                    <img src={thumbUrl(displayNode)!} alt="Current" style={{ width: "100%", height: "100%", objectFit: "contain", background: "var(--hud-active)" }} />
                   )}
                   <span style={{ position: "absolute", top: 0, right: 1, fontSize: 8 }}>👁</span>
                   {graph.operationStateId === graph.displayStateId && (
@@ -871,7 +947,7 @@ export default function LayersPanel(props: LayersPanelProps): React.JSX.Element 
                           if (headNode) onSetDisplayCursorProp?.(historyPanelLayer, headId);
                         }}
                         style={{
-                          width: 40, height: 40, borderRadius: 4, overflow: "hidden",
+                          width: 40, height: 40, borderRadius: "50%", overflow: "hidden",
                           border: isCurrentPath
                             ? "2px solid var(--scrubber-active)"
                             : displayInPath
@@ -885,7 +961,7 @@ export default function LayersPanel(props: LayersPanelProps): React.JSX.Element 
                         title={`Path ${pathId.slice(0, 8)}${displayInPath ? " (current)" : ""}`}
                       >
                         {thumbUrl(headNode) && (
-                          <img src={thumbUrl(headNode)!} alt="Head" style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+                          <img src={thumbUrl(headNode)!} alt="Head" style={{ width: "100%", height: "100%", objectFit: "contain", background: "var(--hud-active)" }} />
                         )}
                         {displayInPath && (
                           <span style={{ position: "absolute", top: 0, right: 1, fontSize: 7 }}>👁</span>
@@ -936,13 +1012,13 @@ export default function LayersPanel(props: LayersPanelProps): React.JSX.Element 
                         }}
                       >
                         <div style={{
-                          width: 28, height: 28, borderRadius: 3, overflow: "hidden", flexShrink: 0,
+                          width: 28, height: 28, borderRadius: "50%", overflow: "hidden", flexShrink: 0,
                           border: isDisplay ? "1.5px solid var(--scrubber-active)" : "1px solid var(--hud-border-btn)",
                           background: "var(--hud-active)",
                           position: "relative",
                         }}>
                           {thumbUrl(node) && (
-                            <img src={thumbUrl(node)!} alt="" style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+                            <img src={thumbUrl(node)!} alt="" style={{ width: "100%", height: "100%", objectFit: "contain", background: "var(--hud-active)" }} />
                           )}
                           {isDisplay && <span style={{ position: "absolute", top: -1, right: 0, fontSize: 7 }}>👁</span>}
                           {isOp && <span style={{ position: "absolute", bottom: -1, right: 0, fontSize: 7 }}>⚙</span>}
@@ -1002,7 +1078,7 @@ export default function LayersPanel(props: LayersPanelProps): React.JSX.Element 
           }}
         >
           <span style={{ fontSize: 11, color: "var(--hud-muted)" }}>
-            L{editingOpacityLayer} opacity
+            {layerNames[editingOpacityLayer] ?? `L${String(editingOpacityLayer)}`} opacity
           </span>
           <input
             type="range"
@@ -1136,7 +1212,7 @@ export default function LayersPanel(props: LayersPanelProps): React.JSX.Element 
             <button
               type="button"
               onClick={() => { setShowAiPromptLayer(showAiPromptLayer === selectedLayerIndex ? null : selectedLayerIndex); }}
-              disabled={aiRunning}
+              disabled={false}
               title="AI Edit (img2img)"
               style={{
                 width: 36,
@@ -1149,13 +1225,13 @@ export default function LayersPanel(props: LayersPanelProps): React.JSX.Element 
                 border: showAiPromptLayer === selectedLayerIndex
                   ? "1px solid var(--scrubber-active)"
                   : "1px solid var(--hud-border)",
-                color: aiRunning ? "var(--hud-muted)" : "var(--scrubber-active)",
-                cursor: aiRunning ? "wait" : "pointer",
+                color: aiEditingLayers.has(selectedLayerIndex) ? "var(--hud-muted)" : "var(--scrubber-active)",
+                cursor: "pointer",
                 fontSize: 16,
                 backdropFilter: "blur(8px)",
               }}
             >
-              {aiRunning ? "⏳" : "✨"}
+              {aiEditingLayers.has(selectedLayerIndex) ? "⏳" : "✨"}
             </button>
           )}
         </div>
@@ -1199,14 +1275,14 @@ export default function LayersPanel(props: LayersPanelProps): React.JSX.Element 
               </select>
             </label>
             <label style={{ display: "flex", flexDirection: "column", gap: 2 }}>
-              <span style={{ opacity: 0.6, fontSize: 11 }}>Prompt (L{showAiPromptLayer})</span>
+              <span style={{ opacity: 0.6, fontSize: 11 }}>Prompt ({layerNames[showAiPromptLayer] ?? `L${String(showAiPromptLayer)}`})</span>
               <input
                 type="text"
                 value={promptText}
                 onChange={(e) => { setPromptText(e.target.value); }}
                 onKeyDown={(e) => {
                   e.stopPropagation();
-                  if (e.key === "Enter" && promptText.trim() && !aiRunning) {
+                  if (e.key === "Enter" && promptText.trim() && !aiEditingLayers.has(showAiPromptLayer)) {
                     onAiEdit(promptText.trim(), strength);
                   }
                 }}
@@ -1242,26 +1318,26 @@ export default function LayersPanel(props: LayersPanelProps): React.JSX.Element 
             )}
             <button
               type="button"
-              disabled={!promptText.trim() || aiRunning}
+              disabled={!promptText.trim() || aiEditingLayers.has(showAiPromptLayer)}
               onClick={() => {
                 if (promptText.trim()) onAiEdit(promptText.trim(), strength);
               }}
               style={{
-                background: aiRunning ? "var(--hud-muted)" : "var(--scrubber-active)",
+                background: aiEditingLayers.has(showAiPromptLayer) ? "var(--hud-muted)" : "var(--scrubber-active)",
                 border: "none",
                 borderRadius: 4,
                 padding: "5px 10px",
                 color: "var(--btn-primary-text)",
-                cursor: aiRunning ? "wait" : "pointer",
+                cursor: aiEditingLayers.has(showAiPromptLayer) ? "wait" : "pointer",
                 fontWeight: 600,
                 fontSize: 12,
               }}
             >
-              {aiRunning ? "Running…" : "Run AI Edit"}
+              {aiEditingLayers.has(showAiPromptLayer) ? "Running…" : "Run AI Edit"}
             </button>
-            {aiError && (
+            {aiErrors[showAiPromptLayer] && (
               <div style={{ color: "var(--color-error)", fontSize: 11, wordBreak: "break-word" }}>
-                {aiError}
+                {aiErrors[showAiPromptLayer]}
               </div>
             )}
           </div>

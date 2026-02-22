@@ -9,7 +9,7 @@ function posToPct(posIdx, layerCount) {
     return layerCount > 1 ? ((layerCount - 1 - posIdx) / (layerCount - 1)) * 100 : 50;
 }
 export default function LayerScrubber(props) {
-    const { layerCount, selectedIndex, layerOrder, onPreview, onCommit, onPreviewOrder, onCommitOrder, layerThumbnails, layerGlbUrls, } = props;
+    const { layerCount, selectedIndex, layerOrder, onPreview, onCommit, onPreviewOrder, onCommitOrder, layerThumbnails, layerGlbUrls, layerNames, onRenameLayer, getSliceHistory, } = props;
     const railRef = useRef(null);
     // Hover state: which tick is being hovered (by posIdx)
     const [hoveredPosIdx, setHoveredPosIdx] = useState(null);
@@ -25,6 +25,10 @@ export default function LayerScrubber(props) {
     const activePointerId = useRef(null);
     // Suppress the rail click that fires after a drag-release
     const justFinishedDrag = useRef(false);
+    // Inline rename state
+    const [renamingIdx, setRenamingIdx] = useState(null);
+    const [renameText, setRenameText] = useState("");
+    const renameInputRef = useRef(null);
     // Sync ref with prop only when idle (no drag in progress).
     // Using useEffect avoids overwriting with a stale prop during the
     // render triggered by setDragPosIdx(null) — at that point the
@@ -191,21 +195,52 @@ export default function LayerScrubber(props) {
                                 opacity: isDragging ? 1 : (isSelected ? 0.9 : 0.5),
                                 transition: isDragging ? "none" : "all 0.15s",
                                 boxShadow: isDragging ? "0 0 8px var(--shadow-medium)" : "none",
-                            } }), _jsxs("div", { style: {
+                            } }), (() => {
+                            const graph = getSliceHistory?.(logicalIdx);
+                            if (!graph)
+                                return null;
+                            const opsCount = Object.keys(graph.ops).length;
+                            if (opsCount === 0)
+                                return null;
+                            return (_jsx("div", { style: {
+                                    position: "absolute",
+                                    left: "100%",
+                                    marginLeft: 4,
+                                    fontSize: 8,
+                                    fontWeight: 700,
+                                    lineHeight: "14px",
+                                    minWidth: 14,
+                                    height: 14,
+                                    padding: "0 3px",
+                                    borderRadius: 7,
+                                    background: "var(--scrubber-active)",
+                                    color: "var(--btn-primary-text)",
+                                    textAlign: "center",
+                                    pointerEvents: "none",
+                                    opacity: isDragging || isSelected || posIdx === hoveredPosIdx ? 1 : 0.6,
+                                    transition: "opacity 0.15s",
+                                }, title: `${String(opsCount)} AI op${opsCount > 1 ? "s" : ""}`, children: opsCount }));
+                        })(), _jsxs("div", { onDoubleClick: (e) => {
+                                e.stopPropagation();
+                                setRenamingIdx(logicalIdx);
+                                setRenameText(layerNames[logicalIdx] ?? `Layer ${String(logicalIdx)}`);
+                                setTimeout(() => { renameInputRef.current?.select(); }, 0);
+                            }, style: {
                                 position: "absolute",
                                 right: "100%",
                                 marginRight: 4,
                                 display: "flex",
                                 alignItems: "center",
                                 gap: 4,
-                                pointerEvents: "none",
+                                pointerEvents: isDragging || isSelected || posIdx === hoveredPosIdx ? "auto" : "none",
                                 opacity: isDragging || isSelected || posIdx === hoveredPosIdx ? 1 : 0,
                                 transition: "opacity 0.15s",
                             }, children: [layerThumbnails[logicalIdx] && (_jsxs("div", { style: { position: "relative", flexShrink: 0 }, children: [_jsx("img", { src: layerThumbnails[logicalIdx], alt: "", style: {
                                                 width: 24,
                                                 height: 24,
-                                                borderRadius: 3,
-                                                objectFit: "cover",
+                                                borderRadius: "50%",
+                                                objectFit: "contain",
+                                                background: "var(--hud-active)",
                                                 border: isSelected
                                                     ? "1px solid var(--scrubber-active)"
                                                     : `1px solid ${color}`,
@@ -220,11 +255,34 @@ export default function LayerScrubber(props) {
                                                 borderRadius: 2,
                                                 background: "var(--scrubber-active)",
                                                 color: "var(--btn-primary-text)",
-                                            }, children: "3D" }))] })), _jsxs("span", { style: {
+                                            }, children: "3D" }))] })), renamingIdx === logicalIdx ? (_jsx("input", { ref: renameInputRef, type: "text", value: renameText, onChange: (e) => { setRenameText(e.target.value); }, onBlur: () => {
+                                        onRenameLayer(logicalIdx, renameText);
+                                        setRenamingIdx(null);
+                                    }, onKeyDown: (e) => {
+                                        e.stopPropagation();
+                                        if (e.key === "Enter") {
+                                            onRenameLayer(logicalIdx, renameText);
+                                            setRenamingIdx(null);
+                                        }
+                                        else if (e.key === "Escape") {
+                                            setRenamingIdx(null);
+                                        }
+                                    }, style: {
+                                        fontSize: 10,
+                                        width: 64,
+                                        background: "var(--hud-active)",
+                                        border: "1px solid var(--scrubber-active)",
+                                        borderRadius: 3,
+                                        padding: "1px 4px",
+                                        color: "var(--hud-text)",
+                                        outline: "none",
+                                        textAlign: "right",
+                                    } })) : (_jsxs("span", { style: {
                                         fontSize: 10,
                                         color: isSelected ? "var(--scrubber-active)" : "var(--hud-muted)",
                                         fontWeight: isSelected ? 600 : 400,
                                         whiteSpace: "nowrap",
-                                    }, children: ["L", logicalIdx, !layerThumbnails[logicalIdx] && logicalIdx in layerGlbUrls ? " 3D" : ""] })] })] }, logicalIdx));
+                                        cursor: "default",
+                                    }, title: "Double-click to rename", children: [layerNames[logicalIdx] ?? `L${String(logicalIdx)}`, !layerThumbnails[logicalIdx] && logicalIdx in layerGlbUrls ? " 3D" : ""] }))] })] }, logicalIdx));
             })] }));
 }
