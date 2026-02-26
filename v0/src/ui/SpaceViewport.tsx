@@ -114,10 +114,59 @@ interface SpacePrismProps {
   appliedTransform?: Object3DTransform | undefined;
   /** Current model transform state (for grid alignment). */
   modelTransform?: Object3DTransform | undefined;
+  /** Per-layer XZ image translation offsets (from user drag). */
+  layerImageOffsets?: Record<number, [number, number]> | undefined;
+  /** Called when user drags a layer image with the new absolute [x, z] offset. */
+  onLayerImageOffsetChange?: ((layerIdx: number, x: number, z: number) => void) | undefined;
+  /** Set of layer indices in the multi-selection (shift+click). */
+  multiSelectedLayers?: Set<number> | undefined;
+  /** Called when user shift+clicks a layer (for multi-select). */
+  onMultiSelect?: ((layerIdx: number) => void) | undefined;
 }
 
 /** Shared TextureLoader — one instance for the whole module. */
 const sharedTextureLoader = new TextureLoader();
+
+/**
+ * Alpha-sampling cache: maps texture uuid → 2D canvas context so we can read
+ * per-pixel alpha without creating a new canvas on every pointer event.
+ */
+const _alphaSampleCtx = new Map<string, CanvasRenderingContext2D | null>();
+
+/**
+ * Returns the alpha (0–1) of a texture at the given UV coordinate.
+ * Returns 1 (fully opaque) if the texture image isn't readable (CORS, not loaded, etc.).
+ * Coordinates: uv.x in [0,1] left→right, uv.y in [0,1] bottom→top (Three.js convention).
+ */
+function sampleTextureAlpha(tex: Texture, uv: { x: number; y: number }): number {
+  if (!tex) return 1;
+  let ctx = _alphaSampleCtx.get(tex.uuid);
+  if (ctx === undefined) {
+    // First access — build the sample canvas from the texture's source image
+    const src = tex.source?.data as (HTMLImageElement | HTMLCanvasElement | ImageBitmap) | null;
+    if (!src) { _alphaSampleCtx.set(tex.uuid, null); return 1; }
+    const w = (src as HTMLImageElement).naturalWidth ?? (src as HTMLCanvasElement).width ?? 256;
+    const h = (src as HTMLImageElement).naturalHeight ?? (src as HTMLCanvasElement).height ?? 256;
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.min(w, 512); // cap at 512 for performance
+    canvas.height = Math.min(h, 512);
+    const c = canvas.getContext("2d", { willReadFrequently: true });
+    if (!c) { _alphaSampleCtx.set(tex.uuid, null); return 1; }
+    c.drawImage(src as CanvasImageSource, 0, 0, canvas.width, canvas.height);
+    _alphaSampleCtx.set(tex.uuid, c);
+    ctx = c;
+  }
+  if (!ctx) return 1;
+  const px = Math.round(Math.max(0, Math.min(1, uv.x)) * (ctx.canvas.width - 1));
+  // Three.js UV: y=0 is bottom of image, y=1 is top → flip for canvas
+  const py = Math.round(Math.max(0, Math.min(1, 1 - uv.y)) * (ctx.canvas.height - 1));
+  try {
+    const d = ctx.getImageData(px, py, 1, 1).data;
+    return (d[3] ?? 255) / 255;
+  } catch {
+    return 1; // CORS / security error — treat as opaque
+  }
+}
 
 /** Cache of canvas-based number textures for layer labels. */
 const labelTextureCache = new Map<string, CanvasTexture>();
@@ -235,7 +284,7 @@ function useLayerTexture(uri: string | undefined): Texture | null {
   return texture;
 }
 
-/** A single textured layer plane. Handles crop offset, AI pulse glow, and fade-in. */
+/** A single textured layer plane. Handles crop offset, AI pulse glow, fade-in, and drag-translate. */
 function TexturedLayerPlane({
   uri,
   width,
@@ -247,7 +296,11 @@ function TexturedLayerPlane({
   generating3D,
   positionIndex,
   selected,
+  multiSelected,
   onSelect,
+  onSelectShift,
+  imageOffset,
+  onImageOffsetChange,
 }: {
   uri: string | undefined;
   width: number;
@@ -260,21 +313,42 @@ function TexturedLayerPlane({
   /** Visual stack position (0 = bottom) for correct render ordering. */
   positionIndex?: number | undefined;
   selected?: boolean | undefined;
-  onSelect?: (() => void) | undefined;
+  /** Part of a multi-selection (shift+click). */
+  multiSelected?: boolean | undefined;
+  onSelect?: ((shiftKey: boolean) => void) | undefined;
+  /** Called when shift+clicking to add/remove from multi-selection. */
+  onSelectShift?: (() => void) | undefined;
+  /** Additional XZ offset applied on top of crop (for user-driven image translation). */
+  imageOffset?: [number, number] | undefined;
+  /** Called during drag with cumulative delta [dx, dz] in world space. */
+  onImageOffsetChange?: ((dx: number, dz: number) => void) | undefined;
 }): React.JSX.Element | null {
   const texture = useLayerTexture(uri);
   const matRef = useRef<import("three").MeshBasicMaterial>(null);
   const glowRef = useRef<import("three").MeshBasicMaterial>(null);
+  const selectionRingRef = useRef<import("three").MeshBasicMaterial>(null);
   // Track URI changes for fade-in
   const prevUri = useRef(uri);
   const fadeProgress = useRef(1); // 1 = fully visible
   // Track AI editing state to trigger fade-in when it stops
   const wasEditing = useRef(false);
   const glowColor = useUIStyle((s) => s.template.colors.glowAi);
+  const selectionColor = useUIStyle((s) => s.template.colors.selectionWireframe);
+  const accentColor = useUIStyle((s) => s.template.colors.accent);
+
+  // ── Drag-translate state ──────────────────────────────────────────────
+  const { camera, controls } = useThree();
+  const dragging = useRef(false);
+  const hasMoved = useRef(false);
+  const dragHPlane = useRef(new Plane(new Vector3(0, 1, 0), 0));
+  const dragHitStart = useRef(new Vector3());
+  const dragOffsetStart = useRef<[number, number]>([0, 0]);
+  const _tmpVec = useRef(new Vector3());
+  const _translateRay = useRef(new Raycaster());
+  const meshRef = useRef<import("three").Mesh>(null);
 
   useEffect(() => {
     if (uri !== prevUri.current) {
-      // If the URI changed while (or just after) AI editing, fade in
       if (wasEditing.current) {
         fadeProgress.current = 0;
       }
@@ -290,18 +364,24 @@ function TexturedLayerPlane({
     let needsInvalidate = false;
     // Fade-in animation
     if (fadeProgress.current < 1 && matRef.current) {
-      fadeProgress.current = Math.min(1, fadeProgress.current + delta * 2.0); // ~0.5s
+      fadeProgress.current = Math.min(1, fadeProgress.current + delta * 2.0);
       matRef.current.opacity = opacity * fadeProgress.current;
       needsInvalidate = true;
+    }
+    // Selection ring pulse for multi-selected
+    if (selectionRingRef.current) {
+      const target = multiSelected ? 0.55 : selected ? 0.35 : 0;
+      if (Math.abs(selectionRingRef.current.opacity - target) > 0.01) {
+        selectionRingRef.current.opacity = selectionRingRef.current.opacity + (target - selectionRingRef.current.opacity) * 0.15;
+        needsInvalidate = true;
+      }
     }
     // Organic glow while AI is editing or generating 3D
     if (glowRef.current) {
       if (aiEditing || generating3D) {
         const t = performance.now() / 1000;
-        // Multi-frequency breathing for organic feel
         const breath = 0.5 + 0.5 * Math.sin(t * 1.8) * Math.sin(t * 0.7 + 0.3);
         glowRef.current.opacity = 0.15 + 0.35 * breath;
-        // Shift hue: cyan→violet for 3D, soft blue for AI edit
         if (generating3D && !aiEditing) {
           const hue = 190 + 30 * Math.sin(t * 0.5);
           glowRef.current.color.setHSL(hue / 360, 0.85, 0.55);
@@ -335,13 +415,98 @@ function TexturedLayerPlane({
     offZ = ((crop.cropY + crop.cropH / 2) / crop.origH - 0.5) * fullD;
   }
 
+  // Add user-driven translation offset on top of crop offset
+  const finalOffX = offX + (imageOffset?.[0] ?? 0);
+  const finalOffZ = offZ + (imageOffset?.[1] ?? 0);
+
   // Use position in stack for render ordering so upper layers draw on top
   const baseOrder = (positionIndex ?? 0) * 10;
 
+  // ── Pointer handlers for alpha-aware selection and drag-translate ──
+  const handlePointerDown = useCallback((e: ThreeEvent<PointerEvent>) => {
+    // Alpha-aware: skip transparent pixels so click passes through to layers below
+    if (e.uv && texture) {
+      const alpha = sampleTextureAlpha(texture, e.uv);
+      if (alpha < 0.05) return; // transparent — don't stop, let event propagate
+    }
+    e.stopPropagation();
+
+    dragging.current = false;
+    hasMoved.current = false;
+
+    // Start potential drag (only if this layer is already selected)
+    if (selected && onImageOffsetChange) {
+      const target = e.eventObject as unknown as { setPointerCapture: (id: number) => void };
+      target.setPointerCapture(e.pointerId);
+      dragging.current = true;
+      // Set up horizontal drag plane at hit point
+      dragHPlane.current.set(new Vector3(0, 1, 0), -e.point.y);
+      dragHitStart.current.copy(e.point);
+      dragOffsetStart.current = [...(imageOffset ?? [0, 0])] as [number, number];
+      if (controls) (controls as unknown as { enabled: boolean }).enabled = false;
+    }
+  }, [selected, texture, imageOffset, onImageOffsetChange, controls]);
+
+  const handlePointerMove = useCallback((e: ThreeEvent<PointerEvent>) => {
+    if (!dragging.current || !onImageOffsetChange) return;
+    e.stopPropagation();
+    // Raycast against the horizontal drag plane using the cached raycaster
+    _translateRay.current.setFromCamera(e.pointer, camera);
+    if (_translateRay.current.ray.intersectPlane(dragHPlane.current, _tmpVec.current)) {
+      const dx = _tmpVec.current.x - dragHitStart.current.x;
+      const dz = _tmpVec.current.z - dragHitStart.current.z;
+      if (Math.abs(dx) > 0.005 || Math.abs(dz) > 0.005) {
+        hasMoved.current = true;
+      }
+      onImageOffsetChange(
+        dragOffsetStart.current[0] + dx,
+        dragOffsetStart.current[1] + dz,
+      );
+      invalidate();
+    }
+  }, [camera, onImageOffsetChange]);
+
+  const handlePointerUp = useCallback((e: ThreeEvent<PointerEvent>) => {
+    const wasDragging = dragging.current && hasMoved.current;
+    dragging.current = false;
+    hasMoved.current = false;
+    if (controls) (controls as unknown as { enabled: boolean }).enabled = true;
+
+    if (!wasDragging) {
+      // It was a click — handle selection
+      if (e.uv && texture) {
+        const alpha = sampleTextureAlpha(texture, e.uv);
+        if (alpha < 0.05) return; // transparent area — skip
+      }
+      e.stopPropagation();
+      if (e.shiftKey) {
+        onSelectShift?.();
+      } else {
+        onSelect?.(false);
+      }
+    }
+  }, [controls, texture, onSelect, onSelectShift]);
+
+  const handlePointerOver = useCallback(() => {
+    if (selected) document.body.style.cursor = "move";
+  }, [selected]);
+
+  const handlePointerOut = useCallback(() => {
+    document.body.style.cursor = "";
+  }, []);
+
   return (
     <group>
-      <mesh rotation={[-Math.PI / 2, 0, 0]} position={[offX, 0.04, offZ]} renderOrder={baseOrder + 2}
-        {...(onSelect ? { onClick: (e: import("@react-three/fiber").ThreeEvent<MouseEvent>) => { e.stopPropagation(); onSelect(); } } : {})}
+      <mesh
+        ref={meshRef}
+        rotation={[-Math.PI / 2, 0, 0]}
+        position={[finalOffX, 0.04, finalOffZ]}
+        renderOrder={baseOrder + 2}
+        onPointerDown={handlePointerDown}
+        onPointerMove={handlePointerMove}
+        onPointerUp={handlePointerUp}
+        onPointerOver={handlePointerOver}
+        onPointerOut={handlePointerOut}
       >
         <planeGeometry args={[planeW, planeD]} />
         <meshBasicMaterial
@@ -356,8 +521,23 @@ function TexturedLayerPlane({
           polygonOffsetUnits={-1}
         />
       </mesh>
+      {/* Selection / multi-selection ring overlay */}
+      {(selected || multiSelected) && (
+        <mesh rotation={[-Math.PI / 2, 0, 0]} position={[finalOffX, 0.05, finalOffZ]} renderOrder={baseOrder + 5}>
+          <planeGeometry args={[planeW + 0.04, planeD + 0.04]} />
+          <meshBasicMaterial
+            ref={selectionRingRef}
+            transparent
+            opacity={0}
+            color={multiSelected ? accentColor : selectionColor}
+            depthWrite={false}
+            side={DoubleSide}
+            wireframe
+          />
+        </mesh>
+      )}
       {/* Glow overlay for AI editing pulse */}
-      <mesh rotation={[-Math.PI / 2, 0, 0]} position={[offX, 0.06, offZ]} renderOrder={baseOrder + 3}>
+      <mesh rotation={[-Math.PI / 2, 0, 0]} position={[finalOffX, 0.06, finalOffZ]} renderOrder={baseOrder + 3}>
         <planeGeometry args={[planeW, planeD]} />
         <meshBasicMaterial
           ref={glowRef}
@@ -371,6 +551,19 @@ function TexturedLayerPlane({
           polygonOffsetUnits={-2}
         />
       </mesh>
+      {/* Drag handle indicator — small cross shown when selected and translatable */}
+      {selected && onImageOffsetChange && (
+        <mesh rotation={[-Math.PI / 2, 0, 0]} position={[finalOffX, 0.07, finalOffZ]} renderOrder={baseOrder + 6}>
+          <planeGeometry args={[0.12, 0.12]} />
+          <meshBasicMaterial
+            transparent
+            opacity={0.7}
+            color={selectionColor}
+            depthWrite={false}
+            wireframe
+          />
+        </mesh>
+      )}
     </group>
   );
 }
@@ -1178,7 +1371,7 @@ function GizmoChildSnapHelpers({
 }
 
 function SpacePrism(props: SpacePrismProps): React.JSX.Element {
-  const { layerCount, selectedLayerIndex, layerVisibility, layerOrder, onSelectLayer, dragOverride, suppressClicks, layerTextures, layerCropInfo, imageAspect, layerSpread: spreadProp, threeDSourceHidden, revealActive, onRevealDone, aiEditingLayers, layerGlbUrls, generating3DLayer, transformPivot, transformMode, snapTranslation, snapRotation, snapScale, snapEnabled, onSetTransformPivot, onTransformChange, appliedTransform, modelTransform } = props;
+  const { layerCount, selectedLayerIndex, layerVisibility, layerOrder, onSelectLayer, dragOverride, suppressClicks, layerTextures, layerCropInfo, imageAspect, layerSpread: spreadProp, threeDSourceHidden, revealActive, onRevealDone, aiEditingLayers, layerGlbUrls, generating3DLayer, transformPivot, transformMode, snapTranslation, snapRotation, snapScale, snapEnabled, onSetTransformPivot, onTransformChange, appliedTransform, modelTransform, layerImageOffsets, onLayerImageOffsetChange, multiSelectedLayers, onMultiSelect } = props;
   const spread = spreadProp ?? 1;
   const { prismW, prismD } = prismDims(imageAspect);
   const hiddenSlideX = -(prismW + 0.5);
@@ -1296,6 +1489,13 @@ function SpacePrism(props: SpacePrismProps): React.JSX.Element {
               rotation={[Math.PI / 2, 0, 0]}
               scale={scale}
               renderOrder={baseOrder}
+  {...(suppressClicks ? {} : {
+              onClick: (e: ThreeEvent<MouseEvent>) => {
+                e.stopPropagation();
+                if (e.shiftKey) { onMultiSelect?.(layerIdx); }
+                else { onSelectLayer(layerIdx); }
+              }
+            })}
             >
               <meshBasicMaterial
                 transparent
@@ -1309,18 +1509,18 @@ function SpacePrism(props: SpacePrismProps): React.JSX.Element {
               />
 
             </mesh>
-            {/* Slice border outline — subtle when idle, vivid when selected */}
+            {/* Slice border outline — subtle when idle, vivid when selected or multi-selected */}
             <Line
               points={sliceEdgePoints}
-              color={selected ? template.colors.selectionWireframe : template.colors.foreground}
-              lineWidth={selected ? 2.5 : 1}
+              color={(multiSelectedLayers?.has(layerIdx) || selected) ? template.colors.selectionWireframe : template.colors.foreground}
+              lineWidth={(multiSelectedLayers?.has(layerIdx) || selected) ? 2.5 : 1}
               rotation={[Math.PI / 2, 0, 0]}
               scale={scale}
               position={[0, 0.08, 0]}
               renderOrder={baseOrder + 4}
               depthWrite={false}
               transparent
-              opacity={selected ? 1 : 0.25}
+              opacity={(multiSelectedLayers?.has(layerIdx) || selected) ? 1 : 0.25}
             />
             {/* Texture overlay if this layer has an image — hidden when 3D source toggle is on */}
             {layerTextures[layerIdx] && !threeDSourceHidden?.has(layerIdx) && (
@@ -1335,7 +1535,16 @@ function SpacePrism(props: SpacePrismProps): React.JSX.Element {
                 generating3D={generating3DLayer === layerIdx}
                 positionIndex={positionIndex}
                 selected={selected}
-                onSelect={suppressClicks ? undefined : () => onSelectLayer(layerIdx)}
+                multiSelected={multiSelectedLayers?.has(layerIdx) ?? false}
+                onSelect={suppressClicks ? undefined : (shiftKey) => {
+                  if (shiftKey) { onMultiSelect?.(layerIdx); }
+                  else { onSelectLayer(layerIdx); }
+                }}
+                onSelectShift={suppressClicks ? undefined : () => onMultiSelect?.(layerIdx)}
+                imageOffset={layerImageOffsets?.[layerIdx]}
+                onImageOffsetChange={selected && onLayerImageOffsetChange
+                  ? (x, z) => onLayerImageOffsetChange(layerIdx, x, z)
+                  : undefined}
               />
             )}
             {/* GLB 3D model — only shown when source image is toggled hidden */}
@@ -1638,6 +1847,7 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
     layerGlbUrls,
     threeDSourceHidden,
     onToggle3DSourceImage,
+    onClearSelection,
     getSliceHistory,
     onSetDisplayCursor,
     onSetOperationCursor,
@@ -1692,14 +1902,58 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
     setModelTransform(t);
   }, []);
 
-  // Keyboard shortcuts for transform modes (T/R/S) when a 3D model layer is selected
+  // ── Per-layer 2D image translation offsets (XZ world-space) ──
+  const [layerImageOffsets, setLayerImageOffsets] = useState<Record<number, [number, number]>>({});
+  const handleLayerImageOffsetChange = useCallback((layerIdx: number, x: number, z: number) => {
+    setLayerImageOffsets((prev) => ({ ...prev, [layerIdx]: [x, z] }));
+  }, []);
+
+  // ── Multi-selection (shift+click adds/removes layers) ──
+  const [multiSelectedLayers, setMultiSelectedLayers] = useState<Set<number>>(new Set());
+  const handleMultiSelect = useCallback((layerIdx: number) => {
+    setMultiSelectedLayers((prev) => {
+      const next = new Set(prev);
+      if (next.has(layerIdx)) { next.delete(layerIdx); }
+      else { next.add(layerIdx); }
+      return next;
+    });
+    invalidate();
+  }, []);
+
+  // Clear multi-select when primary selection changes (non-shift click)
+  const handleSelectLayer = useCallback((idx: number) => {
+    setMultiSelectedLayers(new Set());
+    onSelectLayer(idx);
+  }, [onSelectLayer]);
+
+  // Also clear image offset cache when layer count changes to avoid stale offsets
+  useEffect(() => {
+    setLayerImageOffsets({});
+  }, [layerCount]);
+
+  // Keyboard shortcuts for transform modes (T/R/S) when a 3D model layer is selected,
+  // and Escape to clear multi-selection or deselect.
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent): void => {
       // Skip when typing in text fields
       const tag = (e.target as HTMLElement)?.tagName;
       if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
       if ((e.target as HTMLElement)?.isContentEditable) return;
-      // Only active when a 3D model layer is selected
+
+      // Escape: clear multi-selection first; if already empty, deselect primary
+      if (e.key === "Escape") {
+        if (multiSelectedLayers.size > 0) {
+          e.preventDefault();
+          setMultiSelectedLayers(new Set());
+          invalidate();
+        } else {
+          e.preventDefault();
+          onClearSelection();
+        }
+        return;
+      }
+
+      // Only T/R/S active when a 3D model layer is selected
       if (selectedLayerIndex === null || !(selectedLayerIndex in layerGlbUrls)) return;
 
       switch (e.key.toLowerCase()) {
@@ -1719,7 +1973,7 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
     };
     window.addEventListener("keydown", handleKeyDown);
     return () => { window.removeEventListener("keydown", handleKeyDown); };
-  }, [selectedLayerIndex, layerGlbUrls]);
+  }, [selectedLayerIndex, layerGlbUrls, multiSelectedLayers, onClearSelection]);
 
   /* ── Way-of-Code style template ─────────────── */
   const template = useUIStyle((s) => s.template);
@@ -1944,7 +2198,20 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
       onPointerUp={handleCanvasPointerUp}
       onPointerMove={handleCanvasPointerMove}
     >
-      <Canvas frameloop="demand" camera={{ position: [0, 10, 0.01], fov: 50 }} style={{ background: template.colors.background }}>
+      <Canvas
+        frameloop="demand"
+        camera={{ position: [0, 10, 0.01], fov: 50 }}
+        style={{ background: template.colors.background }}
+        onPointerMissed={() => {
+          // Click on empty 3D space → clear multi-selection or deselect primary
+          if (multiSelectedLayers.size > 0) {
+            setMultiSelectedLayers(new Set());
+            invalidate();
+          } else {
+            onClearSelection();
+          }
+        }}
+      >
         <ambientLight intensity={1.0} />
         <directionalLight position={[10, 10, 5]} intensity={0.8} castShadow={false} />
         <directionalLight position={[-5, -3, -5]} intensity={0.3} />
@@ -1953,7 +2220,7 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
           selectedLayerIndex={selectedLayerIndex}
           layerVisibility={layerVisibility}
           layerOrder={layerOrder}
-          onSelectLayer={onSelectLayer}
+          onSelectLayer={handleSelectLayer}
           dragOverride={dragOverride}
           suppressClicks={longPressSelected || dragReorder}
           layerTextures={segmentDisplayMode === "colored" ? colorLayerTextures : layerTextures}
@@ -1976,6 +2243,10 @@ export default function SpaceViewport(props: SpaceViewportProps): React.JSX.Elem
           onTransformChange={setModelTransform}
           appliedTransform={appliedTransform}
           modelTransform={modelTransform}
+          layerImageOffsets={layerImageOffsets}
+          onLayerImageOffsetChange={handleLayerImageOffsetChange}
+          multiSelectedLayers={multiSelectedLayers}
+          onMultiSelect={handleMultiSelect}
         />
         <ScrubberPlane
           layerCount={layerCount}
